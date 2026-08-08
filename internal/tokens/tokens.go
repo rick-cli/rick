@@ -30,17 +30,89 @@ var engines sync.Map
 // Unicode-safe estimate for unknown encodings. It never downloads assets or
 // invokes an external process on the request path.
 func Count(text string, encoding Encoding) Result {
+	if count, ok := memoLookup(text, encoding); ok {
+		return Result{Count: count, Encoding: encoding, Exact: true}
+	}
 	if engine, ok := engines.Load(string(encoding)); ok {
-		return Result{Count: engine.(omnitoken.ModelEngine).CountTokens(text), Encoding: encoding, Exact: true}
+		count := engine.(omnitoken.ModelEngine).CountTokens(text)
+		memoStore(text, encoding, count)
+		return Result{Count: count, Encoding: encoding, Exact: true}
 	}
 
 	engine, err := omnitoken.ForEncoding(string(encoding))
 	if err == nil {
 		engines.Store(string(encoding), engine)
-		return Result{Count: engine.CountTokens(text), Encoding: encoding, Exact: true}
+		count := engine.CountTokens(text)
+		memoStore(text, encoding, count)
+		return Result{Count: count, Encoding: encoding, Exact: true}
 	}
 
 	return Result{Count: conservativeFallback(text), Encoding: encoding}
+}
+
+// ---------- exact-count memo ----------
+
+// The agent BPE-counts the same stable prefix several times per turn — once
+// per pass in countMessages, history.Retain and ChooseBoundaries — so the
+// exact count for repeated texts is memoized here. The key is the counted
+// text itself (no copying); entries are bounded by count and by total text
+// bytes with FIFO eviction, so a long session cannot grow the cache past its
+// budget. Small texts are skipped: counting them is cheap and they would
+// only churn the FIFO.
+type countMemo struct {
+	entries map[string]int
+	order   []string
+	bytes   int
+}
+
+const (
+	memoMaxEntries = 4096
+	memoMaxBytes   = 32 << 20 // 32 MiB of cached text
+	memoMinText    = 32
+)
+
+var (
+	memoMu sync.Mutex
+	memos  = map[Encoding]*countMemo{}
+)
+
+func memoLookup(text string, encoding Encoding) (int, bool) {
+	if len(text) < memoMinText {
+		return 0, false
+	}
+	memoMu.Lock()
+	defer memoMu.Unlock()
+	memo := memos[encoding]
+	if memo == nil {
+		return 0, false
+	}
+	count, ok := memo.entries[text]
+	return count, ok
+}
+
+func memoStore(text string, encoding Encoding, count int) {
+	if len(text) < memoMinText {
+		return
+	}
+	memoMu.Lock()
+	defer memoMu.Unlock()
+	memo := memos[encoding]
+	if memo == nil {
+		memo = &countMemo{entries: map[string]int{}}
+		memos[encoding] = memo
+	}
+	if _, exists := memo.entries[text]; exists {
+		return
+	}
+	memo.entries[text] = count
+	memo.order = append(memo.order, text)
+	memo.bytes += len(text)
+	for memo.bytes > memoMaxBytes || len(memo.order) > memoMaxEntries {
+		oldest := memo.order[0]
+		memo.order = memo.order[1:]
+		memo.bytes -= len(oldest)
+		delete(memo.entries, oldest)
+	}
 }
 
 // EncodingForModel selects the exact BPE vocabulary that matches the tokenizer

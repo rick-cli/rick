@@ -2,7 +2,42 @@
 
 ## Unreleased
 
+#### Performance (CPU / allocations)
+
+- **Per-message token counts are memoized inside `tokens.Count`** (bounded
+  FIFO, 32 MiB / 4096 entries): the agent BPE-counts the same stable prefix
+  several times per turn (budget planning, `history.Retain`, cache-boundary
+  selection), and steady turns now pay the tokenizer once per new message
+  instead of once per pass. Measured 2.0× on the boundary pass
+  (`BenchmarkChooseBoundariesSteadyTurn`: 1.61 ms → 0.80 ms per steady turn).
+- **Cache-boundary selection reuses the previous pass's per-message
+  analysis** for the verified shared prefix: byte lengths come from the same
+  marshal that produced the hash (no second `json.Marshal`), token lengths
+  and cumulative prefix bytes/tokens/hashes are cached and only the appended
+  tail is recomputed. Byte identity is proven by re-hashing, never assumed;
+  a head rewrite resets stability as before.
+- **`rick maintenance prune-snapshots`** deletes stale shadow-repo trees
+  (`--max-age`, default 30 days) and can cap the total footprint
+  (`--max-bytes`, oldest first); a stat-only variant runs once per start in
+  the background. Snapshotting is refused wholesale for well-known personal
+  folders (Downloads/Documents/Desktop/… or the profile root) so a session
+  started there can never shadow-repo the user tree again.
+- **`rick sessions prune --older-than <dur>`** deletes sessions not updated
+  recently and drops their `current.json` pointers.
+- **`rick doctor`** now reports stale snapshot trees and leftover executables
+  (`rick.before-*`, `*.test.exe`) next to the running binary.
+
 #### Performance (prefix-cache stability)
+
+- **Warm/stream cache-routing parity:** the warm request no longer forces
+  `prompt_cache_retention=24h` or strips the cache key on its own — the
+  shared wire-body builder is the only source of truth, so a warm primes
+  exactly the cache entry the stream will read for every retention mode
+  (`auto`/`long`/`none`), pinned by a parity test matrix.
+- **Per-vendor cache TTL** (`provider.DefaultCacheTTL`): DeepSeek-line
+  endpoints keep their prefix cache for a day, Anthropic's ephemeral cache
+  lives ~5 minutes (1 h with long retention), so idle-gap re-warms and
+  miss labels match the vendor instead of a fixed 5-minute default.
 
 - **Phase C.2 — deep-reasoning echo cap is now a true one-shot head rewrite.**
   `cache_max_reasoning_turns` (> 0, opt-in) no longer strips reasoning on the

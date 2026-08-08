@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -19,6 +20,7 @@ import (
 	"rick/internal/doctor"
 	"rick/internal/goal"
 	"rick/internal/headless"
+	"rick/internal/maintenance"
 	"rick/internal/mcp"
 	"rick/internal/permission"
 	"rick/internal/plugin"
@@ -112,6 +114,7 @@ func main() {
 		applyCmd(),
 		updateCmd(),
 		uninstallCmd(),
+		maintenanceCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -364,6 +367,13 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	}
 	snaps, _ := session.NewSnapshotter(loaded.ProjectRoot, config.DataDir())
 
+	// Snapshot retention runs once per start, off the startup path: stale
+	// shadow-repo trees (e.g. a session that shadow-repo'd a personal folder
+	// before the guard existed) are pruned in the background.
+	go func() {
+		_, _ = maintenance.PruneSnapshotDirs(config.DataDir(), maintenance.SnapshotRetentionMaxAge)
+	}()
+
 	provs := buildProviders(loaded.Config)
 
 	resume := o.resume
@@ -564,6 +574,28 @@ func sessionsCmd() *cobra.Command {
 	c.AddCommand(
 		sessionsImportCmd(),
 	)
+
+	var pruneAge time.Duration
+	prune := &cobra.Command{
+		Use:   "prune",
+		Short: "Delete sessions not updated recently",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := session.NewStore(filepath.Join(config.DataDir(), "sessions"))
+			if err != nil {
+				return err
+			}
+			removed, err := store.PruneOlderThan(pruneAge)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("removed %d session(s) last updated more than %s ago\n", removed, pruneAge)
+			return nil
+		},
+	}
+	prune.Flags().DurationVar(&pruneAge, "older-than", 30*24*time.Hour,
+		"delete sessions whose Updated timestamp is older than this")
+	c.AddCommand(prune)
 
 	return c
 }
@@ -994,6 +1026,58 @@ func doctorCmd() *cobra.Command {
 	c.Flags().BoolVar(&network, "network", false,
 		"probe provider endpoints for connectivity (makes network calls)")
 	return c
+}
+
+// ---------- maintenance ----------
+
+func maintenanceCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "maintenance",
+		Short: "Disk hygiene tasks (snapshot retention)",
+	}
+	var maxAge time.Duration
+	var maxBytes int64
+	prune := &cobra.Command{
+		Use:   "prune-snapshots",
+		Short: "Delete stale shadow-repo snapshot trees",
+		Long: "Remove snapshot trees under the rick data directory that have been\n" +
+			"untouched for --max-age (default 720h), then keep the remaining total\n" +
+			"under --max-bytes by deleting the oldest trees first. A tree's mtime\n" +
+			"is its last snapshot activity, so age is a reliable last-use signal.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			removed, freed, err := maintenance.PruneSnapshots(config.DataDir(), maxAge, maxBytes)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("removed %d snapshot tree(s), freed %s\n", removed, humanBytes(freed))
+			return nil
+		},
+	}
+	prune.Flags().DurationVar(&maxAge, "max-age", maintenance.SnapshotRetentionMaxAge,
+		"remove trees untouched for longer than this")
+	prune.Flags().Int64Var(&maxBytes, "max-bytes", 0,
+		"keep the total snapshot footprint under this ceiling (0 = age-only prune)")
+	c.AddCommand(prune)
+	return c
+}
+
+func humanBytes(n int64) string {
+	const (
+		kb = 1 << 10
+		mb = 1 << 20
+		gb = 1 << 30
+	)
+	switch {
+	case n >= gb:
+		return fmt.Sprintf("%.1f GiB", float64(n)/gb)
+	case n >= mb:
+		return fmt.Sprintf("%.1f MiB", float64(n)/mb)
+	case n >= kb:
+		return fmt.Sprintf("%.1f KiB", float64(n)/kb)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // ---------- security ----------

@@ -23,3 +23,6 @@ zz_*.go.bak
 
 # Benchmark run logs and throwaway analysis scripts
 tmp/
+# Python bytecode
+__pycache__/
+*.pyc

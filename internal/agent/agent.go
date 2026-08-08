@@ -1683,14 +1683,15 @@ func oneLine(s string) string {
 }
 
 // cacheTTL bounds how long a warm prefix is assumed to survive at the
-// provider before an idle gap forces a re-warm. Long retention is treated as
-// a generous hour (matching the UI's cacheTTL); the default ephemeral TTL is
-// five minutes (Anthropic/DeepSeek-style automatic caching).
+// provider before an idle gap forces a re-warm. The vendor table replaces
+// the old fixed 5-minute default: DeepSeek-line endpoints keep their prefix
+// cache for a day, so re-warming after every idle gap was pure waste.
 func (r *Runner) cacheTTL() time.Duration {
-	if r.cfg.CacheRetention == provider.CacheRetentionLong {
-		return time.Hour
+	name := ""
+	if r.cfg.Provider != nil {
+		name = r.cfg.Provider.Name()
 	}
-	return 5 * time.Minute
+	return provider.DefaultCacheTTL(name, r.cfg.CacheRetention)
 }
 
 // warnWarmOnce surfaces a warm failure once per distinct error message per

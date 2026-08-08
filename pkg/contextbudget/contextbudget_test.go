@@ -177,6 +177,38 @@ func TestChooseBoundariesNeverSplitsToolPair(t *testing.T) {
 	}
 }
 
+// TestChooseBoundariesInvalidatesSharedPrefixOnHeadChange pins the incremental
+// prefix reuse (C3): when the view's head changes, the cached per-message
+// analysis must be discarded from the divergence point on, so the stability
+// counters reset instead of reusing stale prefix bytes.
+func TestChooseBoundariesInvalidatesSharedPrefixOnHeadChange(t *testing.T) {
+	budget := New(Options{MinStableTurns: 2, LiveZoneTurns: 1, MaxStableBytes: 64, MinCacheTokens: 1})
+	history := []provider.Message{
+		provider.UserText(strings.Repeat("stable old context ", 20)),
+		provider.UserText(strings.Repeat("more stable context ", 20)),
+		provider.UserText(strings.Repeat("even more stable ", 20)),
+		provider.UserText("current request"),
+	}
+	budget.ChooseBoundaries(history) // observation 1
+	stable := budget.ChooseBoundaries(history)
+	if len(stable) == 0 {
+		t.Fatal("expected boundaries after two identical observations")
+	}
+
+	// Change the head: the old prefix bytes are gone, so no boundary may
+	// survive until the new head has stabilized on its own.
+	changed := append([]provider.Message(nil), history...)
+	changed[0] = provider.UserText(strings.Repeat("rewritten head context ", 20))
+	first := budget.ChooseBoundaries(changed)
+	if len(first) != 0 {
+		t.Fatalf("head change kept stale boundaries: %v", first)
+	}
+	second := budget.ChooseBoundaries(changed)
+	if len(second) == 0 {
+		t.Fatal("new head never stabilized after the rewrite")
+	}
+}
+
 func TestCompressLiveIsReversible(t *testing.T) {
 	budget := New(Options{})
 	payload := `{"items":[` + strings.Repeat(`"value",`, 50) + `"last"],"note":"x"}`

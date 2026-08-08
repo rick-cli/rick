@@ -109,6 +109,19 @@ type Budget struct {
 	// once, so a repeated payload collapses to a pointer even after the
 	// original copy is trimmed from the view.
 	verbatim map[string]bool
+	// Per-message analysis of the previous ChooseBoundaries input, valid for
+	// the shared prefix of the next call: message hashes, serialized byte
+	// lengths, token lengths, cumulative prefix bytes/tokens, and the
+	// combined prefix hash at each boundary index. Steady turns only append
+	// at the tail, so the byte/token/prefix work for the stable head is
+	// reused instead of recomputed; byte identity is proven by re-hashing
+	// the prefix, never assumed.
+	lastHashes     []string
+	lastByteLen    []int
+	lastTokenLen   []int
+	lastPrefixByte []int
+	lastPrefixTok  []int
+	lastPrefixHash []string
 }
 
 type prefixState struct {
@@ -285,6 +298,17 @@ func messageHash(message provider.Message) string {
 	return Hash(string(raw))
 }
 
+// messageHashBytes returns the stable per-message fingerprint together with
+// the raw serialized bytes that produced it, so the boundary pass never
+// marshals a message twice (once for the hash, once for its byte length).
+func messageHashBytes(message provider.Message) (string, []byte) {
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return Hash(message.Text()), nil
+	}
+	return Hash(string(raw)), raw
+}
+
 // ChooseBoundaries returns message indices that delimit a stable history
 // prefix worth caching. A boundary at index i means "cache everything before
 // message i"; the returned map has true at those indices.
@@ -298,18 +322,69 @@ func (b *Budget) ChooseBoundaries(messages []provider.Message) map[int]bool {
 		return out
 	}
 
-	hashes := make([]string, len(messages))
-	byteLen := make([]int, len(messages))
-	tokenLen := make([]int, len(messages))
-	for i, message := range messages {
-		hashes[i] = messageHash(message)
-		raw, _ := json.Marshal(message)
+	n := len(messages)
+	hashes := make([]string, n)
+	byteLen := make([]int, n)
+	tokenLen := make([]int, n)
+	prefixByte := make([]int, n)
+	prefixTok := make([]int, n)
+	prefixHash := make([]string, n)
+
+	b.mu.Lock()
+	lastHashes, lastByteLen, lastTokenLen, lastPrefixByte, lastPrefixTok, lastPrefixHash :=
+		b.lastHashes, b.lastByteLen, b.lastTokenLen, b.lastPrefixByte, b.lastPrefixTok, b.lastPrefixHash
+	b.mu.Unlock()
+
+	// Reuse the previous call's per-message analysis for the shared prefix:
+	// steady turns only append at the tail, so the stable head is re-hashed
+	// (byte identity is proven, not assumed) but its byte/token/prefix work
+	// is not repeated. The first divergent message invalidates the cache
+	// from that point on.
+	shared := len(lastHashes)
+	if shared > n {
+		shared = n
+	}
+	for i := 0; i < shared; i++ {
+		hashes[i] = messageHash(messages[i])
+		if hashes[i] != lastHashes[i] {
+			shared = i
+			break
+		}
+	}
+	for i := 0; i < shared; i++ {
+		byteLen[i] = lastByteLen[i]
+		tokenLen[i] = lastTokenLen[i]
+		prefixByte[i] = lastPrefixByte[i]
+		prefixTok[i] = lastPrefixTok[i]
+		prefixHash[i] = lastPrefixHash[i]
+	}
+
+	prefixBytes := 0
+	prefixTokens := 0
+	if shared > 0 {
+		prefixBytes = lastPrefixByte[shared-1]
+		prefixTokens = lastPrefixTok[shared-1]
+	}
+	encoding := b.opts.Encoding
+	for i := shared; i < n; i++ {
+		hash, raw := messageHashBytes(messages[i])
+		hashes[i] = hash
+		if raw == nil {
+			raw, _ = json.Marshal(messages[i])
+		}
 		byteLen[i] = len(raw)
-		if b.opts.Encoding != "" {
-			tokenLen[i] = tokens.Count(string(raw), b.opts.Encoding).Count + 4
+		if encoding != "" {
+			tokenLen[i] = tokens.Count(string(raw), encoding).Count + 4
 		} else {
 			tokenLen[i] = len(raw) / 4
 		}
+		prefixBytes += byteLen[i]
+		prefixTokens += tokenLen[i]
+		prefixByte[i] = prefixBytes
+		prefixTok[i] = prefixTokens
+	}
+	for i := shared; i < n; i++ {
+		prefixHash[i] = combineHashes(hashes[:i])
 	}
 
 	candidates := boundaryCandidates(messages, b.opts.LiveZoneTurns)
@@ -320,16 +395,15 @@ func (b *Budget) ChooseBoundaries(messages []provider.Message) map[int]bool {
 	lastChosen := -1
 	lastChosenBytes := 0
 	for _, index := range candidates {
-		prefixBytes := 0
-		prefixTokens := 0
-		for i := 0; i < index; i++ {
-			prefixBytes += byteLen[i]
-			prefixTokens += tokenLen[i]
+		if index >= n {
+			continue
 		}
+		prefixBytes := prefixByte[index-1]
+		prefixTokens := prefixTok[index-1]
 		if prefixBytes < b.opts.MaxStableBytes || prefixTokens < b.opts.MinCacheTokens {
 			continue
 		}
-		state := b.observePrefix(index, hashes[:index])
+		state := b.observePrefixHash(index, prefixHash[index])
 		if state.count < b.opts.MinStableTurns {
 			continue
 		}
@@ -348,6 +422,15 @@ func (b *Budget) ChooseBoundaries(messages []provider.Message) map[int]bool {
 	for _, index := range chosen {
 		out[index] = true
 	}
+
+	b.mu.Lock()
+	b.lastHashes = hashes
+	b.lastByteLen = byteLen
+	b.lastTokenLen = tokenLen
+	b.lastPrefixByte = prefixByte
+	b.lastPrefixTok = prefixTok
+	b.lastPrefixHash = prefixHash
+	b.mu.Unlock()
 	return out
 }
 
@@ -384,10 +467,10 @@ func (b *Budget) SeedStability(messages []provider.Message) {
 	}
 }
 
-// observePrefix records one observation of the prefix ending at index and
-// returns the running stability state for it.
-func (b *Budget) observePrefix(index int, prefixHashes []string) *prefixState {
-	hash := combineHashes(prefixHashes)
+// observePrefixHash records one observation of the prefix ending at index
+// (its combined hash is supplied by the caller, which already computed it
+// for the boundary pass) and returns the running stability state for it.
+func (b *Budget) observePrefixHash(index int, hash string) *prefixState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	state := b.stability[index]

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"rick/internal/config"
+	"rick/internal/maintenance"
 	"rick/internal/plugin"
 	"rick/internal/theme"
 )
@@ -50,6 +51,8 @@ func RunChecks() []Check {
 		mkArg("config", "mcp servers", func() (string, string) { return checkMCPServers(loaded) }),
 		mk("storage", "data directory", checkDataDir),
 		mk("storage", "themes", checkThemes),
+		mk("storage", "snapshots", checkSnapshots),
+		mk("storage", "stale executables", checkStaleBinaries),
 		mkArg("storage", "plugins", func() (string, string) { return checkPlugins(loaded) }),
 		mk("network", "connectivity", checkConnectivity),
 	}
@@ -259,6 +262,68 @@ func checkDataDir() (string, string) {
 	}
 	_ = os.Remove(probe)
 	return StatusPass, dir + " (writable)"
+}
+
+// checkSnapshots warns when shadow-repo snapshot trees are stale or
+// numerous: a tree older than the retention window means rick once
+// shadow-repo'd a folder it no longer touches, and every GB of it is waste.
+func checkSnapshots() (string, string) {
+	root := filepath.Join(config.DataDir(), "snapshots")
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return StatusPass, "no snapshot trees"
+	}
+	if err != nil {
+		return StatusWarn, fmt.Sprintf("snapshots: %v", err)
+	}
+	cutoff := time.Now().Add(-maintenance.SnapshotRetentionMaxAge)
+	stale := 0
+	total := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		total++
+		if info, err := entry.Info(); err == nil && info.ModTime().Before(cutoff) {
+			stale++
+		}
+	}
+	if stale > 0 {
+		return StatusWarn, fmt.Sprintf("%d tree(s), %d stale (untouched >%s) — run `rick maintenance prune-snapshots`", total, stale, maintenance.SnapshotRetentionMaxAge)
+	}
+	return StatusPass, fmt.Sprintf("%d tree(s), none stale", total)
+}
+
+// checkStaleBinaries warns about leftover executables next to the running
+// rick binary (deploy backups, benchmark builds, renamed test images) that
+// are not part of the install and only waste disk.
+func checkStaleBinaries() (string, string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return StatusWarn, fmt.Sprintf("cannot resolve executable: %v", err)
+	}
+	dir := filepath.Dir(exe)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return StatusWarn, fmt.Sprintf("cannot list %s: %v", dir, err)
+	}
+	self := strings.ToLower(filepath.Base(exe))
+	var stale []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		lower := strings.ToLower(name)
+		if (strings.HasPrefix(lower, "rick.before-") || strings.HasSuffix(lower, ".test.exe")) &&
+			lower != self {
+			stale = append(stale, name)
+		}
+	}
+	if len(stale) > 0 {
+		return StatusWarn, fmt.Sprintf("stale executables in %s: %s", dir, strings.Join(stale, ", "))
+	}
+	return StatusPass, dir + " (clean)"
 }
 
 func checkThemes() (string, string) {

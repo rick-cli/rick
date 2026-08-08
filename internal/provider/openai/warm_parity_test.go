@@ -12,6 +12,29 @@ import (
 )
 
 func TestWarmAndStreamBodiesMatchDeepseekReasoning(t *testing.T) {
+	runParity(t, "deepseek", provider.CacheRetentionLong)
+}
+
+// TestWarmAndStreamCacheFieldsMatchEveryRetention pins the warm/stream parity
+// contract for every retention mode (D2): the warm body must carry exactly
+// the same cache-routing fields (prompt_cache_key, prompt_cache_retention) as
+// the stream body. A warm that adds a retention hint or key the stream would
+// not send primes a different cache entry and the prefix re-bills cold.
+func TestWarmAndStreamCacheFieldsMatchEveryRetention(t *testing.T) {
+	for _, providerID := range []string{"openai", "deepseek"} {
+		for _, retention := range []provider.CacheRetention{
+			provider.CacheRetentionAuto,
+			provider.CacheRetentionLong,
+			provider.CacheRetentionNone,
+		} {
+			name := providerID + "/" + string(retention)
+			t.Run(name, func(t *testing.T) { runParity(t, providerID, retention) })
+		}
+	}
+}
+
+func runParity(t *testing.T, providerID string, retention provider.CacheRetention) {
+	t.Helper()
 	var warmBody, streamBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -30,7 +53,7 @@ func TestWarmAndStreamBodiesMatchDeepseekReasoning(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := New("deepseek", "test-key", server.URL)
+	client := New(providerID, "test-key", server.URL)
 	client.HTTP = server.Client()
 
 	msgs := []provider.Message{
@@ -41,14 +64,13 @@ func TestWarmAndStreamBodiesMatchDeepseekReasoning(t *testing.T) {
 		}},
 	}
 	req := provider.Request{
-		Model:             "deepseek-v4-flash",
-		System:            "stable system",
-		Messages:          msgs,
-		Reasoning:         provider.ReasoningOn,
-		MaxReasoningTurns: 0,
-		SessionID:         "sess-1",
-		CacheRetention:    provider.CacheRetentionLong,
-		MaxTokens:         2048,
+		Model:          "test-model",
+		System:         "stable system",
+		Messages:       msgs,
+		Reasoning:      provider.ReasoningOn,
+		SessionID:      "sess-1",
+		CacheRetention: retention,
+		MaxTokens:      2048,
 	}
 
 	if cw, ok := interface{}(client).(provider.CacheWarmber); ok {

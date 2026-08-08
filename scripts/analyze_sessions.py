@@ -37,6 +37,7 @@ def analyze(path):
 
     prev_prompt = None
     resets = 0
+    unexpected = 0
     divergences = []
     for r in requests:
         read = r.get("cache_read", 0)
@@ -48,7 +49,14 @@ def analyze(path):
         window = max(prev_prompt, prompt) if prev_prompt is not None else 0
         if prev_prompt is not None and window > 0 and read < window - 1024:
             resets += 1
-            divergences.append((r.get("index"), r.get("divergence", "?")))
+            reason = r.get("divergence") or "?"
+            divergences.append((r.get("index"), reason))
+            # A divergence the runner cannot attribute to its own one-shot
+            # rewrites (head-trim/distill/reasoning-cut/dedup/compact) is a
+            # fail-closed "unexpected" — a regression that silently re-bills
+            # the provider cache every turn. It must trip the analyzer.
+            if "unexpected" in reason:
+                unexpected += 1
         if prompt > 0:
             prev_prompt = prompt
 
@@ -62,6 +70,7 @@ def analyze(path):
         "read": total_read,
         "write": total_write,
         "resets": resets,
+        "unexpected": unexpected,
         "divergences": divergences,
     }
 
@@ -77,14 +86,19 @@ def main():
     rows = [analyze(p) for p in paths]
     rows = [r for r in rows if r]
     rows.sort(key=lambda r: r["hit"])
-    print(f"{'hit%':>6} {'reqs':>5} {'input':>9} {'read':>9} {'write':>9} {'resets':>6}  model / title")
+    print(f"{'hit%':>6} {'reqs':>5} {'input':>9} {'read':>9} {'write':>9} {'resets':>6} {'unexp':>5}  model / title")
     for r in rows:
         print(
             f"{r['hit']:6.1f}% {r['requests']:5d} {r['input']:9d} {r['read']:9d} "
-            f"{r['write']:9d} {r['resets']:6d}  {r['model'] or '?'} / {r['title']}"
+            f"{r['write']:9d} {r['resets']:6d} {r['unexpected']:5d}  {r['model'] or '?'} / {r['title']}"
         )
         for index, reason in r["divergences"]:
             print(f"          reset req {index}: {reason}")
+    total_unexpected = sum(r["unexpected"] for r in rows)
+    if total_unexpected:
+        print("\n*** %d unexpected divergence(s) across %d sessions - "
+              "mid-prefix rewrites the runner cannot attribute; "
+              "investigate before trusting hit rates ***" % (total_unexpected, len(rows)))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,13 @@ func NewSnapshotter(workTree, dataDir string) (*Snapshotter, error) {
 	}
 	s.workTree = absWork
 
+	// Never shadow-repo a well-known personal folder wholesale: starting rick
+	// in Downloads (or the profile root itself) would snapshot the entire user
+	// tree into <data>/snapshots — multi-GB growth with no undo value.
+	if isWellKnownUserDir(absWork) {
+		return s, fmt.Errorf("snapshots disabled: %s is a well-known user folder", absWork)
+	}
+
 	absData, err := filepath.Abs(dataDir)
 	if err != nil {
 		return s, err
@@ -98,6 +105,35 @@ func sanitize(p string) string {
 		out = out[len(out)-80:]
 	}
 	return strings.Trim(out, "_")
+}
+
+// wellKnownUserDirNames are personal folders that rick must never shadow-repo
+// wholesale. Subfolders inside them (a real project under ~/Desktop/work) are
+// still snapshotted normally; only the personal roots themselves are refused.
+var wellKnownUserDirNames = []string{"Downloads", "Documents", "Desktop", "Pictures", "Videos", "Music"}
+
+func isWellKnownUserDir(absWork string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	absHome, err := filepath.Abs(home)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(absWork, absHome) {
+		return true
+	}
+	if !strings.EqualFold(filepath.Dir(absWork), absHome) {
+		return false
+	}
+	base := filepath.Base(absWork)
+	for _, name := range wellKnownUserDirNames {
+		if strings.EqualFold(base, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Snapshotter) git(args ...string) (string, error) {

@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
+	"time"
 )
 
 // Role constants for Message.Role.
@@ -153,6 +155,32 @@ const (
 	// (distillation, compaction) that would pollute the session cache.
 	CacheRetentionNone CacheRetention = "none"
 )
+
+// DefaultCacheTTL is how long a provider's automatic prompt cache is assumed
+// to survive an idle gap, per vendor. It drives the pre-warm decision and the
+// cache-miss labels: a turn after a gap longer than the TTL is expected to
+// re-bill cold and gets re-primed first.
+//
+// DeepSeek-line endpoints (deepseek, opencode-zen, opencode-go) keep their
+// prefix cache for a day; Anthropic's ephemeral cache lives ~5 minutes (1h
+// with explicit long retention); OpenAI's requested retention is 24h. The
+// unknown-provider default is the conservative 5 minutes — re-warming is
+// cheap, a surprise cold re-bill is not.
+func DefaultCacheTTL(providerName string, retention CacheRetention) time.Duration {
+	switch retention {
+	case CacheRetentionLong:
+		if strings.Contains(providerName, "anthropic") {
+			return time.Hour
+		}
+		return 24 * time.Hour
+	default:
+		if strings.Contains(providerName, "deepseek") ||
+			providerName == "opencode-zen" || providerName == "opencode-go" {
+			return 24 * time.Hour
+		}
+		return 5 * time.Minute
+	}
+}
 
 // Request is a single completion request.
 type Request struct {

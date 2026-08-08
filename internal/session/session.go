@@ -467,6 +467,58 @@ func Title(msgs []provider.Message) string {
 	return "untitled"
 }
 
+// PruneOlderThan deletes sessions whose Updated timestamp is older than
+// maxAge, across every working directory. current.json pointers to removed
+// sessions are dropped. Returns the number of sessions removed.
+func (s *Store) PruneOlderThan(maxAge time.Duration) (int, error) {
+	metas, err := s.List("")
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, m := range metas {
+		if !m.Updated.Before(cutoff) {
+			continue
+		}
+		if err := s.Delete(m.ID); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	if removed > 0 {
+		s.dropCurrentRefs()
+	}
+	return removed, nil
+}
+
+// dropCurrentRefs rewrites current.json without pointers to sessions that no
+// longer exist, so a resumed session never resurrects a removed id.
+func (s *Store) dropCurrentRefs() {
+	m, err := s.currentMap()
+	if err != nil || len(m) == 0 {
+		return
+	}
+	kept := make(map[string]string, len(m))
+	for cwd, id := range m {
+		if _, err := os.Stat(s.path(id)); err == nil {
+			kept[cwd] = id
+		}
+	}
+	if len(kept) == len(m) {
+		return
+	}
+	data, err := json.MarshalIndent(kept, "", "  ")
+	if err != nil {
+		return
+	}
+	p := filepath.Join(s.dir, "current.json")
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err == nil {
+		_ = os.Rename(tmp, p)
+	}
+}
+
 // Fork deep-copies a session with a new ID, sets Parent to the original, and
 // appends "(fork)" to the title.
 func (s *Store) Fork(id string) (*Session, error) {

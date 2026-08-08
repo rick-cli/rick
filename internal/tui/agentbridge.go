@@ -383,15 +383,17 @@ func (m *Model) observeCacheUsage(u *provider.Usage) {
 	m.cachePrevPrompt = promptTokens
 }
 
-// cacheTTL returns the provider cache TTL for the configured retention.
-// Long retention (Anthropic 1h / OpenAI 24h) is capped at an hour here; the
-// default 5-minute Anthropic ephemeral TTL is otherwise assumed.
+// cacheTTL returns the provider cache TTL for the configured retention and
+// vendor (per-vendor table in provider.DefaultCacheTTL): DeepSeek-line
+// endpoints keep their prefix cache for a day, Anthropic's ephemeral cache
+// lives ~5 minutes (1h with long retention), everything else 5m by default.
 func (m *Model) cacheTTL() time.Duration {
-	if m.deps.Loaded != nil &&
-		provider.CacheRetention(m.deps.Loaded.Config.CacheRetention) == provider.CacheRetentionLong {
-		return time.Hour
+	retention := provider.CacheRetentionAuto
+	if m.deps.Loaded != nil {
+		retention = provider.CacheRetention(m.deps.Loaded.Config.CacheRetention)
 	}
-	return 5 * time.Minute
+	provID, _ := config.SplitModel(m.modelID)
+	return provider.DefaultCacheTTL(provID, retention)
 }
 
 // cacheMissReason tells apart an idle-gap timeout from a prefix change, so

@@ -546,6 +546,9 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 	// Prime the exact bytes the real stream will send: the same reasoning
 	// retention decision as Stream, so the warm's prefix matches the
 	// append-only prompt that follows and the automatic cache actually hits.
+	// Cache-routing hints and keys come from the shared builder unchanged —
+	// a warm that sends a retention hint the stream would not send primes a
+	// different cache entry and misses.
 	req.Messages = msgs
 	body := c.buildWireBody(req, false, false)
 	if deepseekWire(c.ID) {
@@ -553,13 +556,6 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 		body.MaxTokensLegacy = 1
 	} else {
 		body.MaxTokens = 1
-	}
-	if c.ID == "openai" {
-		body.PromptCacheRetention = "24h"
-	} else {
-		// Gateways reject OpenAI's cache-routing hint; DeepSeek-line
-		// endpoints cache automatically and need no retention hint.
-		body.PromptCacheKey = ""
 	}
 
 	raw, err := json.Marshal(body)
