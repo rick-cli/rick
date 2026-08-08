@@ -26,7 +26,9 @@ func TestObserveCacheUsageCountsOnlyTrueRebillsWithoutCacheFields(t *testing.T) 
 	// fields reported at all (read=0, input covers the previous span). This
 	// is a genuine full re-bill and must be counted — it is exactly what
 	// the analysed sessions showed (read=0, input ~= the entire prompt).
-	m.observeCacheUsage(&provider.Usage{InputTokens: 10100})
+	if cause := m.observeCacheUsage(&provider.Usage{InputTokens: 10100}); cause == "" {
+		t.Fatal("full-rebroadcast turn returned no eviction cause")
+	}
 	if m.cacheMissCount != 1 {
 		t.Fatalf("full-rebroadcast turn miss count = %d, want 1", m.cacheMissCount)
 	}

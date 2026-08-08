@@ -49,7 +49,10 @@ def analyze(path):
         window = max(prev_prompt, prompt) if prev_prompt is not None else 0
         if prev_prompt is not None and window > 0 and read < window - 1024:
             resets += 1
-            reason = r.get("divergence") or "?"
+            # divergence is a client-side byte rewrite; eviction is the
+            # second opinion when no rewrite was detected (idle gap vs
+            # provider eviction). Prefer the rewrite, fall back to eviction.
+            reason = r.get("divergence") or r.get("eviction") or "?"
             divergences.append((r.get("index"), reason))
             # A divergence the runner cannot attribute to its own one-shot
             # rewrites (head-trim/distill/reasoning-cut/dedup/compact) is a

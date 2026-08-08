@@ -122,6 +122,22 @@ func (a *artImage) sample(x0, y0, x1, y1 int) uint8 {
 // millisecond for a byte-identical result.
 var artCache = map[int][]string{}
 
+// artCacheOrder is the FIFO of cached widths; a pathological resize loop must
+// not grow the cache without limit.
+var artCacheOrder []int
+
+const artCacheMaxWidths = 64
+
+func cacheArt(cols int, lines []string) {
+	if len(artCacheOrder) >= artCacheMaxWidths {
+		oldest := artCacheOrder[0]
+		artCacheOrder = artCacheOrder[1:]
+		delete(artCache, oldest)
+	}
+	artCacheOrder = append(artCacheOrder, cols)
+	artCache[cols] = lines
+}
+
 // renderArt draws the mascot at the given cell width. Height is derived from
 // the source aspect ratio; half-blocks mean one cell spans two pixels.
 func renderArt(cols int) []string {
@@ -170,7 +186,7 @@ func renderArt(cols int) []string {
 		}
 		lines = append(lines, b.String())
 	}
-	artCache[cols] = lines
+	cacheArt(cols, lines)
 	return lines
 }
 

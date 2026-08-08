@@ -280,7 +280,7 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			m.billed.Output += ev.Usage.OutputTokens
 			m.billed.CacheRead += ev.Usage.CacheReadTokens
 			m.billed.CacheWrite += ev.Usage.CacheWriteTokens
-			m.observeCacheUsage(ev.Usage)
+			eviction := m.observeCacheUsage(ev.Usage)
 			// Persist one telemetry entry per provider request so per-turn
 			// cache-hit/miss behavior can be measured from the session file.
 			if m.sess != nil {
@@ -293,6 +293,7 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 					CacheRead:       ev.Usage.CacheReadTokens,
 					CacheWrite:      ev.Usage.CacheWriteTokens,
 					Divergence:      m.pendingDivergence,
+					Eviction:        eviction,
 					ReasoningTokens: ev.ReasoningTokens,
 				})
 				m.pendingDivergence = ""
@@ -351,10 +352,13 @@ func (m *Model) flushTurnBoundary() {
 // misses get a one-line system notice so cache regressions are visible. The
 // notice distinguishes the two causes: an idle gap that outlived the
 // provider's cache TTL (a timeout) versus a genuine prompt prefix change.
-func (m *Model) observeCacheUsage(u *provider.Usage) {
+// The miss cause is returned so the request's telemetry row can be labelled
+// ("eviction") — the analyzer then tells a provider eviction apart from a
+// client rewrite even when no byte divergence was detected.
+func (m *Model) observeCacheUsage(u *provider.Usage) string {
 	promptTokens := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
 	if promptTokens <= 0 {
-		return
+		return ""
 	}
 	reported := u.CacheReadTokens+u.CacheWriteTokens > 0
 	// A turn that reports no cache tokens is still a full re-bill when its
@@ -375,12 +379,13 @@ func (m *Model) observeCacheUsage(u *provider.Usage) {
 					Text: fmt.Sprintf("cache miss: ~%s tokens re-billed (%s)",
 						humanTokens(missed), missCause), Time: time.Now()})
 			}
-		} else {
-			m.cacheMissStreak = 0
+			return missCause
 		}
+		m.cacheMissStreak = 0
 	}
 	m.cacheLastUsage = time.Now()
 	m.cachePrevPrompt = promptTokens
+	return ""
 }
 
 // cacheTTL returns the provider cache TTL for the configured retention and

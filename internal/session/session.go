@@ -69,6 +69,12 @@ type RequestUsage struct {
 	// request ("message@7;dedup"): where the provider-facing bytes stopped
 	// matching the previous turn and the inferred cause.
 	Divergence string `json:"divergence,omitempty"`
+	// Eviction, when set, labels why this request re-billed tokens the
+	// previous request had already sent, when no client-side byte divergence
+	// was detected ("idle gap (cache expired)", "provider served no prefix
+	// cache"). It is the analyzer's second opinion that tells a provider
+	// eviction apart from a client rewrite.
+	Eviction string `json:"eviction,omitempty"`
 	// ReasoningTokens is the client-side token size of the deep-reasoning
 	// echo sent with this request (all `thinking` blocks in the message
 	// view). It makes the reasoning-echo fresh-tail cost measurable per
