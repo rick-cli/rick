@@ -48,6 +48,7 @@ const (
 	EvAgentBackground                  // background agent started
 	EvAgentReattached                  // result surfaced to a parent
 	EvAgentMessage                     // live chat or steering message injected
+	EvCacheDivergence                  // provider-prefix byte divergence vs the previous turn
 )
 
 // ToolEvent describes a tool execution.
@@ -76,13 +77,29 @@ type OptimizationStats struct {
 	Truncated        bool
 }
 
+// CacheDivergence describes where the provider-facing prefix of this request
+// stopped matching the previous request's bytes — the event that forces a
+// full or partial re-bill. Kind is "system", "tools", or "message"; Index is
+// the first divergent message position (Kind "message"), else -1. Reason is
+// the best-effort cause inferred from the runner's own transforms.
+type CacheDivergence struct {
+	Kind   string `json:"kind,omitempty"`
+	Index  int    `json:"index,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // Event is one item on the agent's output stream.
 type Event struct {
-	Kind  EventKind
-	Text  string
-	Tool  *ToolEvent
-	Usage *provider.Usage
-	Err   error
+	Kind       EventKind
+	Text       string
+	Tool       *ToolEvent
+	Usage      *provider.Usage
+	Divergence *CacheDivergence
+	// ReasoningTokens is the token size of the reasoning echo sent with this
+	// request; it rides the EvUsage event so telemetry rows can measure the
+	// deep-reasoning fresh-tail cost per request.
+	ReasoningTokens int
+	Err             error
 }
 
 // PermissionDecision is the user's answer to an approval prompt.
@@ -168,10 +185,27 @@ type Config struct {
 	// CacheRetention is the prompt-cache policy for every request of this
 	// run: "" = provider default, "long" = extended TTL, "none" = disabled.
 	CacheRetention provider.CacheRetention
+	// WarmCache, when true and the provider supports provider.CacheWarmber,
+	// submits a small warm request once at session start so the provider
+	// populates its prompt cache for the frozen prefix before the first real
+	// turn. A cache-warm provider call in this package must remain optional;
+	// a provider that doesn't implement CacheWarmber is skipped.
+	WarmCache bool
+	// MaxReasoningTurns caps the prior-turn reasoning echoed back to
+	// DeepSeek-line providers (0 = keep all, byte-stable prefix).
+	MaxReasoningTurns int
+	// MaxToolResultBytes caps each tool_result payload sent to the model
+	// (0 = default 16 KiB) so a single turn's fresh tail stays small and the
+	// provider prefix cache stays hot.
+	MaxToolResultBytes int
 	// PinnedToolSchemas fixes the provider-facing tool list for the whole
 	// run, so mid-session tool toggles or plugin churn never change the
 	// cached prefix bytes. When nil the registry + ToolFilter are used.
 	PinnedToolSchemas []provider.ToolSchema
+	// ArchiveDir, when non-empty, is where trimmed/dropped originals are
+	// written as JSONL (one line per message) so folded context stays
+	// traceable without ever touching the provider-facing view bytes.
+	ArchiveDir string
 }
 
 // Runner executes the loop.
@@ -186,6 +220,48 @@ type Runner struct {
 	// not disturb the provider prompt cache.
 	repoMapOnce  sync.Once
 	repoMapBlock string
+
+	// Stable-head trimming state: once the conversation first exceeds the
+	// context budget, the oldest logical groups are pinned behind a
+	// byte-stable sentinel so the provider view only ever grows at the tail
+	// (the provider prefix cache stays warm) instead of silently dropping
+	// from the front every turn.
+	trimEngaged bool
+	trimStart   int
+	trimHead    provider.Message
+
+	// systemOnce/pinnedSystem freeze the full volatile system block (env +
+	// RepoMap + tool manifest) after the first request, so the system prompt
+	// bytes can never drift between turns and cold-start the prefix cache.
+	systemOnce   sync.Once
+	pinnedSystem string
+
+	// Prefix-divergence tracking: hashes of the last sent view, used to
+	// detect (and attribute) any byte change before the previous tail.
+	prevSystemHash string
+	prevToolsHash  string
+	prevMsgHashes  []string
+	// lastMutation names the runner's own transform that fired on the
+	// current turn ("head-trim", "distill"), to attribute divergences.
+	lastMutation string
+
+	// Reasoning-cap one-shot state (Phase C2): when
+	// cfg.MaxReasoningTurns > 0 the stale deep-reasoning echo is stripped
+	// exactly once at the first request and then byte-pinned, so the prefix
+	// changes once and stays append-only instead of rotating a moving window
+	// that re-bills the tail every turn.
+	reasoningCutSet   bool
+	reasoningCutIndex int
+	// lastReasoningTokens is the most recent request's client-side reasoning
+	// echo size; it rides the EvUsage event for per-request telemetry.
+	lastReasoningTokens int
+	// lastRequest is when the most recent provider request (stream or warm)
+	// was dispatched, used to spot idle gaps past the provider cache TTL so
+	// the next turn can re-prime the full prefix before streaming (P1c).
+	lastRequest time.Time
+	// warmErrWarned dedupes warming-failure notices to one per distinct
+	// error message per run, so a broken warm is surfaced without spamming.
+	warmErrWarned string
 }
 
 // New builds a Runner.
@@ -260,13 +336,50 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		schemas = r.cfg.Tools.Schemas(r.cfg.ToolFilter)
 	}
 
+	// P1: session-start prompt-cache warm. Submit a small best-effort request
+	// so the provider populates its cache for the frozen system+tools prefix
+	// before the first real turn. Only providers that implement
+	// provider.CacheWarmber are warmed; failures are never fatal.
+	if r.cfg.WarmCache {
+		if warmer, ok := r.cfg.Provider.(provider.CacheWarmber); ok {
+			warmReq := r.buildRequest(msgs, schemas)
+			// D1: prime only the stable prefix. The system prompt + tool
+			// list are frozen per run, so warming that head is byte-exact
+			// and costs a handful of tokens instead of the whole transcript;
+			// the volatile message tail differs every turn anyway. Keep a
+			// single head message so OpenAI-style endpoints accept a
+			// non-empty messages array.
+			warmReq.Messages = stableWarmHead(warmReq.Messages)
+			warmReq.CacheBoundaries = nil
+			if warmReq.CacheRetention == "" {
+				warmReq.CacheRetention = provider.CacheRetentionLong
+			}
+			// A silent warm failure would leave the whole first turn cold
+			// without the user knowing why; surface it once per run.
+			if err := warmer.Warm(ctx, warmReq); err != nil {
+				r.warnWarmOnce(emit, err)
+			}
+			r.lastRequest = time.Now()
+		}
+	}
+
 	// MaxTurns caps the loop; <= 0 disables the cap so long tasks can run to
 	// completion. Pathological loops are still caught by the repeated-call
 	// guard below and by the goal token budget.
+	//
+	// cacheEvicted latches a provider prefix eviction observed on the previous
+	// turn (an idle gap outliving the cache TTL) so the next turn re-primes
+	// before it pays a full uncached re-bill.
+	var (
+		cacheEvicted  bool
+		prevPrompt    int
+		prevCacheRead int
+	)
 	for turn := 0; r.cfg.MaxTurns <= 0 || turn < r.cfg.MaxTurns; turn++ {
 		if ctx.Err() != nil {
 			return appended, ctx.Err()
 		}
+		r.lastMutation = ""
 		r.injectControlMessages(&msgs, &appended, emit)
 
 		// Lifecycle hook: turn start.
@@ -280,9 +393,45 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		}
 
 		req := r.buildRequest(msgs, schemas)
+		r.lastReasoningTokens = countThinkingTokens(req.Messages, r.requestEncoding())
+		if div := r.trackPrefix(req); div != nil {
+			if !emit(Event{Kind: EvCacheDivergence, Divergence: div}) {
+				return appended, ctx.Err()
+			}
+		}
+
+		// P1c: full-prefix re-warm before this request. The provider's
+		// prefix cache is expected to miss this turn when a previous turn
+		// observed an eviction (P1b), the view head was just rewritten
+		// (head-trim), a long transcript was resumed (turn 0 with a tail), or
+		// the gap since the last request outlived the cache TTL. The warm
+		// carries the exact bytes this stream will send, so the stream reads
+		// the prefix back from cache instead of re-billing it cold. Errors
+		// are surfaced once instead of swallowed.
+		if r.cfg.WarmCache {
+			if warmer, ok := r.cfg.Provider.(provider.CacheWarmber); ok {
+				warmNeeded := cacheEvicted || r.lastMutation == "head-trim" ||
+					(turn == 0 && len(req.Messages) > 1) ||
+					(!r.lastRequest.IsZero() && time.Since(r.lastRequest) > r.cacheTTL())
+				if warmNeeded {
+					warmReq := req
+					if warmReq.CacheRetention == "" {
+						warmReq.CacheRetention = provider.CacheRetentionLong
+					}
+					if err := warmer.Warm(ctx, warmReq); err != nil {
+						r.warnWarmOnce(emit, err)
+					} else {
+						r.warmErrWarned = ""
+					}
+					r.lastRequest = time.Now()
+				}
+			}
+		}
+		cacheEvicted = false
 
 		ch := make(chan provider.Event, 256)
 		streamCtx, cancelStream := context.WithCancel(ctx)
+		r.lastRequest = time.Now()
 		go r.cfg.Provider.Stream(streamCtx, req, ch)
 
 		var (
@@ -317,7 +466,21 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 				}
 			case provider.EventUsage:
 				if ev.Usage != nil {
-					emit(Event{Kind: EvUsage, Usage: ev.Usage})
+					emit(Event{Kind: EvUsage, Usage: ev.Usage, ReasoningTokens: r.lastReasoningTokens})
+					// Detect a prefix eviction for the mid-session re-warm
+					// (P1b): if the first turn read a large cached prefix but
+					// this turn reads far less than what was previously sent,
+					// the provider dropped the prefix cache (idle-gap TTL).
+					// Latched so the next request re-primes before streaming.
+					prompt := ev.Usage.InputTokens + ev.Usage.CacheReadTokens + ev.Usage.CacheWriteTokens
+					if prevCacheRead > 0 && prompt > 0 &&
+						ev.Usage.CacheReadTokens < min(prevPrompt, prompt)-cacheMissNoiseFloor {
+						cacheEvicted = true
+					}
+					prevPrompt = prompt
+					if ev.Usage.CacheReadTokens+ev.Usage.CacheWriteTokens > 0 {
+						prevCacheRead = ev.Usage.CacheReadTokens + ev.Usage.CacheWriteTokens
+					}
 					// Enforce the active goal's token budget, if any.
 					if r.cfg.Goals != nil {
 						if g, _ := r.cfg.Goals.GetActive(); g != nil && g.Status == "active" {
@@ -646,13 +809,7 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		reservedOutput = 4096
 	}
 
-	system := r.cfg.System
-	if block := r.repoMap(lastUserText(messages)); block != "" {
-		system += "\n\n" + block
-	}
-	if manifest := toolManifest(schemas); manifest != "" {
-		system += "\n\n" + manifest
-	}
+	system := r.systemBlock(messages, schemas)
 	stableSystem := r.cfg.SystemStable
 	volatileSystem := system
 	if stableSystem != "" && strings.HasPrefix(volatileSystem, stableSystem) {
@@ -671,11 +828,11 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 	// Content-addressed dedup runs before trimming: the replacement set is
 	// persistent across turns, so the surviving bytes stay stable even when
 	// trimming later moves a payload's first occurrence out of the view.
-	view := messages
+	view := r.cappedMessages(messages, encoding)
 	if r.budget.Enabled() {
 		view = r.budget.ApplyDedup(view).View
 	}
-	retained := retainMessages(view, plan.RetainedMessageTokens, encoding)
+	retained := r.retainStable(view, plan.RetainedMessageTokens, encoding)
 	boundaries := r.budget.ChooseBoundaries(retained)
 
 	// State distillation: when the transcript approaches the context budget,
@@ -685,22 +842,262 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		if result := distill.Distill(retained, boundaries, r.distillOptions()); result.Replaced {
 			retained = result.Messages
 			boundaries = r.budget.ChooseBoundaries(retained)
+			r.lastMutation = "distill"
+			// Distillation rebuilds the head (the one deliberate, whole-prefix
+			// cache invalidation). Reset the stable-head sentinel so the new
+			// head stays fixed and the view resumes append-only growth.
+			r.trimEngaged = false
+			r.trimStart = 0
+			r.trimHead = provider.Message{}
 		}
 	}
 
 	return provider.Request{
-		Model:           r.cfg.Model,
-		System:          system,
-		SystemStable:    r.cfg.SystemStable,
-		Messages:        retained,
-		Tools:           schemas,
-		MaxTokens:       r.cfg.MaxTokens,
-		Temperature:     r.cfg.Temperature,
-		Reasoning:       r.cfg.Reasoning,
-		CacheBoundaries: boundaries,
-		CacheRetention:  r.cfg.CacheRetention,
-		SessionID:       r.cfg.SessionID,
+		Model:             r.cfg.Model,
+		System:            system,
+		SystemStable:      r.cfg.SystemStable,
+		Messages:          retained,
+		Tools:             schemas,
+		MaxTokens:         r.cfg.MaxTokens,
+		Temperature:       r.cfg.Temperature,
+		Reasoning:         r.cfg.Reasoning,
+		CacheBoundaries:   boundaries,
+		CacheRetention:    r.cfg.CacheRetention,
+		MaxReasoningTurns: r.wireReasoningTurns(),
+		SessionID:         r.cfg.SessionID,
 	}
+}
+
+// wireReasoningTurns is what the provider adapter sees. The one-shot cap
+// already rewritten the message list structurally (cappedMessages), so the
+// wire must retain everything it now holds: a rotating strip would slide the
+// kept window every turn and re-bill the provider cache. 0 = the adapter's
+// retain-all behaviour.
+func (r *Runner) wireReasoningTurns() int {
+	if r.cfg.MaxReasoningTurns > 0 {
+		return 0
+	}
+	return r.cfg.MaxReasoningTurns
+}
+
+// cappedMessages returns the provider-visible message list after applying the
+// optional one-shot deep-reasoning cap. When cfg.MaxReasoningTurns > 0, stale
+// reasoning echo is stripped exactly once at the first request and then
+// byte-pinned: the prefix changes once and afterwards only grows, so the
+// provider cache is never re-billed by a rotating reasoning window.
+func (r *Runner) cappedMessages(messages []provider.Message, encoding tokens.Encoding) []provider.Message {
+	if r.cfg.MaxReasoningTurns <= 0 {
+		return messages
+	}
+	if !r.reasoningCutSet {
+		r.reasoningCutSet = true
+		r.reasoningCutIndex = reasoningCutIndex(messages, r.cfg.MaxReasoningTurns)
+		r.lastMutation = "reasoning-cut"
+	}
+	cut := r.reasoningCutIndex
+	if cut <= 0 {
+		return messages
+	}
+	out := append([]provider.Message(nil), messages...)
+	for i := 0; i < cut && i < len(out); i++ {
+		if !containsBlock(messages[i], "thinking") {
+			continue
+		}
+		replaced := messages[i]
+		replaced.Content = stripThinking(messages[i].Content)
+		out[i] = replaced
+	}
+	return out
+}
+
+// stripThinking returns the content blocks without their "thinking" blocks.
+func stripThinking(blocks []provider.ContentBlock) []provider.ContentBlock {
+	kept := make([]provider.ContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == "thinking" {
+			continue
+		}
+		kept = append(kept, block)
+	}
+	return kept
+}
+
+// reasoningCutIndex returns the first message index at which the one-shot
+// reasoning cap starts stripping: everything strictly before the oldest of the
+// newest `keep` assistant reasoning turns loses its thinking blocks. It
+// returns 0 when there are at most `keep` reasoning turns (nothing to strip).
+func reasoningCutIndex(messages []provider.Message, keep int) int {
+	if keep <= 0 {
+		return 0
+	}
+	var thinking []int
+	for i := 0; i < len(messages); i++ {
+		if !containsBlock(messages[i], "thinking") {
+			continue
+		}
+		thinking = append(thinking, i)
+	}
+	if len(thinking) <= keep {
+		return 0
+	}
+	return thinking[len(thinking)-keep]
+}
+
+// countThinkingTokens sums the token size of every deep-reasoning "thinking"
+// block across the view, i.e. the client-side reasoning echo that rides the
+// fresh tail of each request.
+func countThinkingTokens(messages []provider.Message, encoding tokens.Encoding) int {
+	total := 0
+	for _, message := range messages {
+		for _, block := range message.Content {
+			if block.Type == "thinking" {
+				total += countTokens(block.Text, encoding)
+			}
+		}
+	}
+	return total
+}
+
+// systemBlock returns the full system prompt for the run, frozen after the
+// first build: env block, Repo map, and tool manifest are computed once so
+// their bytes can never drift between turns and cold-start the prefix cache.
+func (r *Runner) systemBlock(messages []provider.Message, schemas []provider.ToolSchema) string {
+	r.systemOnce.Do(func() {
+		system := r.cfg.System
+		if block := r.repoMap(lastUserText(messages)); block != "" {
+			system += "\n\n" + block
+		}
+		if manifest := toolManifest(schemas); manifest != "" {
+			system += "\n\n" + manifest
+		}
+		r.pinnedSystem = system
+	})
+	return r.pinnedSystem
+}
+
+// stableWarmHead keeps only the oldest message of a warm request: the stable
+// prologue that every later request repeats verbatim. Empty input keeps
+// system+tools alone.
+func stableWarmHead(messages []provider.Message) []provider.Message {
+	if len(messages) <= 1 {
+		return messages
+	}
+	return messages[:1]
+}
+
+// trackPrefix compares this request's serialized view with the previous
+// one and reports the first byte that failed to match before the previous
+// tail. A nil result means the prefix is append-only (cache kept warm).
+func (r *Runner) trackPrefix(req provider.Request) *CacheDivergence {
+	sysHash := hashBytes([]byte(req.System))
+	toolsHash := hashBytes(marshalBytes(req.Tools))
+
+	if r.prevSystemHash != "" || len(r.prevMsgHashes) > 0 {
+		d := &CacheDivergence{Index: -1}
+		switch {
+		case sysHash != r.prevSystemHash:
+			d.Kind = "system"
+			d.Reason = "system-prompt"
+		case toolsHash != r.prevToolsHash:
+			d.Kind = "tools"
+			d.Reason = "tool-schema"
+		default:
+			cur := make([]string, len(req.Messages))
+			for i := range req.Messages {
+				cur[i] = hashBytes(marshalBytes(req.Messages[i]))
+			}
+			prev := r.prevMsgHashes
+			mismatch := -1
+			for i := 0; i < len(cur) && i < len(prev); i++ {
+				if cur[i] != prev[i] {
+					mismatch = i
+					break
+				}
+			}
+			switch {
+			case mismatch >= 0:
+				d.Kind = "message"
+				d.Index = mismatch
+				d.Reason = r.inferReason(req, mismatch)
+			case len(cur) < len(prev):
+				d.Kind = "message"
+				d.Index = len(cur)
+				d.Reason = r.inferReason(req, -1)
+			}
+		}
+		// Refresh the previous view regardless of the outcome.
+		r.capturePrefix(sysHash, toolsHash, &req)
+		if d.Kind == "" {
+			return nil
+		}
+		return d
+	}
+	r.capturePrefix(sysHash, toolsHash, &req)
+	return nil
+}
+
+func (r *Runner) capturePrefix(sysHash, toolsHash string, req *provider.Request) {
+	r.prevSystemHash = sysHash
+	r.prevToolsHash = toolsHash
+	hashes := make([]string, len(req.Messages))
+	for i := range req.Messages {
+		hashes[i] = hashBytes(marshalBytes(req.Messages[i]))
+	}
+	r.prevMsgHashes = hashes
+}
+
+// inferReason attributes a divergence to the runner's own one-shot
+// transforms, or to visible content produced by them. Anything else is a
+// fail-closed "unexpected" — a mid-prefix rewrite we cannot account for, so
+// it shows up in telemetry/regression instead of silently re-billing the
+// provider cache. The deliberate, at-most-once rewrites the runner is
+// allowed to make are the head-trim sentinel, the one-shot distill fold,
+// and the one-shot reasoning cap cut.
+func (r *Runner) inferReason(req provider.Request, index int) string {
+	switch {
+	case r.lastMutation == "head-trim" || strings.HasPrefix(r.lastMutation, "head-trim+"):
+		return "head-trim"
+	case r.lastMutation == "distill" || r.lastMutation == "reasoning-cut":
+		return r.lastMutation
+	}
+	if index >= 0 && index < len(req.Messages) {
+		text := ""
+		for _, block := range req.Messages[index].Content {
+			if block.Type == "text" {
+				text = block.Text
+				break
+			}
+			if block.Type == "tool_result" {
+				text = block.Content
+				break
+			}
+		}
+		switch {
+		case strings.HasPrefix(text, "[duplicate payload sha256:"):
+			return "dedup"
+		case strings.HasPrefix(text, "[Internal: the earliest"):
+			return "head-trim"
+		case strings.HasPrefix(text, "Summary of the conversation so far:") ||
+			strings.HasPrefix(text, "Earlier conversation compacted:"):
+			return "compact-summary"
+		}
+	}
+	if r.lastMutation == "" {
+		return "unexpected"
+	}
+	return r.lastMutation
+}
+
+func hashBytes(b []byte) string {
+	return contextbudget.Hash(string(b))
+}
+
+func marshalBytes(v any) []byte {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return []byte("{}")
+	}
+	return raw
 }
 
 // repoMap renders the repository skeleton once per run, keyed to the active
@@ -746,6 +1143,14 @@ func lastUserText(messages []provider.Message) string {
 	return ""
 }
 
+// requestEncoding resolves the tokenizer for this run, matching buildRequest.
+func (r *Runner) requestEncoding() tokens.Encoding {
+	if r.cfg.TokenEncoding != "" {
+		return r.cfg.TokenEncoding
+	}
+	return tokens.EncodingForModel(r.cfg.Model)
+}
+
 func countTokens(text string, encoding tokens.Encoding) int {
 	return tokens.Count(text, encoding).Count
 }
@@ -766,9 +1171,80 @@ func countMessages(messages []provider.Message, encoding tokens.Encoding) int {
 	return total
 }
 
-func retainMessages(messages []provider.Message, maxTokens int, encoding tokens.Encoding) []provider.Message {
-	retained, _ := history.Retain(messages, maxTokens, encoding)
-	return retained
+// retainStable returns the token-bounded provider view, applying the
+// stable-head trim (P2). The first time the conversation exceeds budget the
+// oldest logical groups are dropped once and pinned behind a byte-identical
+// sentinel; afterwards the tail only grows, so the provider prefix cache is
+// never invalidated again by trimming. Prior to the first trim it is exactly
+// history.Retain's behaviour.
+func (r *Runner) retainStable(messages []provider.Message, maxTokens int, encoding tokens.Encoding) []provider.Message {
+	retained, omitted := history.Retain(messages, maxTokens, encoding)
+	if omitted <= 0 {
+		return retained
+	}
+	if !r.trimEngaged {
+		r.trimEngaged = true
+		r.trimStart = omitted
+		r.lastMutation = "head-trim"
+		r.trimHead = provider.Message{Role: provider.RoleUser, Content: []provider.ContentBlock{{
+			Type: "text",
+			Text: fmt.Sprintf("[Internal: the earliest %d message%s were trimmed to fit the context window; subsequent messages remain authoritative.]",
+				omitted, pluralS(omitted)),
+		}}}
+		// Archive the folded originals so dropped context stays traceable;
+		// the provider-facing view bytes are untouched.
+		if dropped := history.TakeFirstGroups(messages, omitted, encoding); len(dropped) > 0 {
+			if err := ArchiveTrimmed(r.cfg.ArchiveDir, r.cfg.SessionID, "head-trim", dropped); err == nil {
+				r.lastMutation += "+archive"
+			}
+		}
+	}
+	head := []provider.Message{r.trimHead}
+	// Pin the first small user turn next to the sentinel: it is the original
+	// task/goal, and keeping it verbatim keeps the fold boundary stable while
+	// the model retains the instruction that started the session.
+	if pinned := r.pinnedFirstTurn(messages, maxTokens, encoding); pinned.Role != "" {
+		head = append([]provider.Message{pinned}, head...)
+	}
+	kept := history.DropFirstGroups(messages, r.trimStart, encoding)
+	return append(append([]provider.Message(nil), head...), kept...)
+}
+
+const (
+	// pinnedFirstTurnTokenCap is the ceiling for pinning the first user turn
+	// verbatim next to the trim sentinel (reasonix pins its first small
+	// user turn the same way; without the cap a giant first paste would push
+	// the pinned prefix well past the budget).
+	pinnedFirstTurnTokenCap = 1500
+	// pinnedFirstTurnCapFrac bounds the pin by a fraction of the trim budget
+	// so small windows never pin more than they retain.
+	pinnedFirstTurnCapFrac = 0.15
+	// pinnedFirstTurnFloor keeps the pin useful even at tiny budgets.
+	pinnedFirstTurnFloor = 64
+)
+
+// pinnedFirstTurn returns the first user message when it is small enough to
+// pin verbatim at the trim boundary; an empty message means "don't pin".
+func (r *Runner) pinnedFirstTurn(messages []provider.Message, budget int, encoding tokens.Encoding) provider.Message {
+	if len(messages) == 0 || messages[0].Role != provider.RoleUser {
+		return provider.Message{}
+	}
+	cost := countTokens(messages[0].Text(), encoding)
+	cap := pinnedFirstTurnTokenCap
+	if frac := maxInt(int(float64(budget)*pinnedFirstTurnCapFrac), 0); frac > 0 && frac < cap {
+		cap = maxInt(frac, pinnedFirstTurnFloor)
+	}
+	if cost > cap {
+		return provider.Message{}
+	}
+	return messages[0]
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func containsBlock(message provider.Message, blockType string) bool {
@@ -906,11 +1382,26 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 
 const maxModelToolResultBytes = 32 << 10
 
+// cacheMissNoiseFloor is the smallest cache-read shortfall (in prompt tokens)
+// treated as a genuine prefix eviction, matching the TUI's miss detector. A
+// turn that reads most of the previously sent prompt within this margin is
+// just a small fresh tail, not an expired-idle-gap re-bill.
+const cacheMissNoiseFloor = 1024
+
+// toolResultMaxBytes returns the per-tool_result cap for this run, falling
+// back to the built-in default when the config leaves it at 0.
+func (r *Runner) toolResultMaxBytes() int {
+	if r.cfg.MaxToolResultBytes > 0 {
+		return r.cfg.MaxToolResultBytes
+	}
+	return maxModelToolResultBytes
+}
+
 // capToolOutput applies the deterministic command-aware reducer and then the
 // reversible live-zone pass. The pre-live-zone payload is stored under the
 // call id so the model can retrieve it via retrieve_uncompressed_context.
 func (r *Runner) capToolOutput(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
-	modelOutput, stats := capToolOutputStatic(call, output, isError)
+	modelOutput, stats := capToolOutputStatic(call, output, isError, r.toolResultMaxBytes())
 	if r.budget != nil && r.budget.Enabled() && !isError && len(modelOutput) > 0 {
 		key := call.ID
 		if key == "" {
@@ -934,11 +1425,11 @@ func (r *Runner) capToolOutput(call provider.ToolCall, output string, isError bo
 	return modelOutput, stats
 }
 
-func capToolOutputStatic(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
+func capToolOutputStatic(call provider.ToolCall, output string, isError bool, maxBytes int) (string, *OptimizationStats) {
 	compressed := compress.ForTool(compress.Input{
 		Text:     output,
 		Command:  compressionCommand(call),
-		MaxBytes: maxModelToolResultBytes,
+		MaxBytes: maxBytes,
 		IsError:  isError,
 	})
 	modelOutput := compressed.Text
@@ -1189,4 +1680,26 @@ func oneLine(s string) string {
 		s = s[:160] + "…"
 	}
 	return s
+}
+
+// cacheTTL bounds how long a warm prefix is assumed to survive at the
+// provider before an idle gap forces a re-warm. Long retention is treated as
+// a generous hour (matching the UI's cacheTTL); the default ephemeral TTL is
+// five minutes (Anthropic/DeepSeek-style automatic caching).
+func (r *Runner) cacheTTL() time.Duration {
+	if r.cfg.CacheRetention == provider.CacheRetentionLong {
+		return time.Hour
+	}
+	return 5 * time.Minute
+}
+
+// warnWarmOnce surfaces a warm failure once per distinct error message per
+// run. A silently swallowed warm would hide the full cold re-bill that is
+// about to happen.
+func (r *Runner) warnWarmOnce(emit func(Event) bool, err error) {
+	if err == nil || r.warmErrWarned == err.Error() {
+		return
+	}
+	r.warmErrWarned = err.Error()
+	emit(Event{Kind: EvAgentMessage, Text: "cache warm failed (this request may re-bill cold): " + err.Error()})
 }

@@ -10,11 +10,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"rick/internal/provider"
@@ -69,6 +72,18 @@ func defaultModels(id string) []provider.ModelInfo {
 			{ID: "deepseek/deepseek-chat", Name: "DeepSeek Chat", ContextWindow: 128000, MaxOutput: 8192},
 			{ID: "qwen/qwen3-coder", Name: "Qwen3 Coder", ContextWindow: 256000, MaxOutput: 32000},
 		}
+	case "deepseek":
+		return []provider.ModelInfo{
+			{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextWindow: 1_000_000, MaxOutput: 384_000},
+			{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextWindow: 1_000_000, MaxOutput: 384_000},
+			{ID: "deepseek-chat", Name: "DeepSeek Chat", ContextWindow: 128000, MaxOutput: 8192},
+			{ID: "deepseek-reasoner", Name: "DeepSeek Reasoner", ContextWindow: 128000, MaxOutput: 8192},
+		}
+	case "opencode-zen", "opencode-go":
+		return []provider.ModelInfo{
+			{ID: "deepseek-v4-flash-free", Name: "DeepSeek V4 Flash Free", ContextWindow: 200_000, MaxOutput: 32_000},
+			{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextWindow: 1_000_000, MaxOutput: 384_000},
+		}
 	default:
 		return []provider.ModelInfo{
 			{ID: "gpt-5", Name: "GPT-5", ContextWindow: 400000, MaxOutput: 128000},
@@ -103,6 +118,13 @@ func (c *Client) modelInfo(id string) *provider.ModelInfo {
 }
 
 // SetAPIKey updates the API key for this client.
+// deepseekWire reports whether the endpoint speaks DeepSeek's wire dialect,
+// which reads max_tokens (and thinking switches) rather than OpenAI's
+// max_completion_tokens. Zen's free-tier engines are DeepSeek-line.
+func deepseekWire(id string) bool {
+	return id == "opencode-zen" || id == "opencode-go" || id == "deepseek"
+}
+
 func (c *Client) SetAPIKey(key string) {
 	c.APIKey = key
 }
@@ -147,14 +169,17 @@ type wireTool struct {
 }
 
 type wireRequest struct {
-	Model          string        `json:"model"`
-	Messages       []wireMessage `json:"messages"`
-	Tools          []wireTool    `json:"tools,omitempty"`
-	Stream         bool          `json:"stream"`
-	StreamOpts     *streamOpts   `json:"stream_options,omitempty"`
-	MaxTokens      int           `json:"max_completion_tokens,omitempty"`
-	Temperature    *float64      `json:"temperature,omitempty"`
-	PromptCacheKey string        `json:"prompt_cache_key,omitempty"`
+	Model      string        `json:"model"`
+	Messages   []wireMessage `json:"messages"`
+	Tools      []wireTool    `json:"tools,omitempty"`
+	Stream     bool          `json:"stream"`
+	StreamOpts *streamOpts   `json:"stream_options,omitempty"`
+	MaxTokens  int           `json:"max_completion_tokens,omitempty"`
+	// MaxTokensLegacy is the output budget for endpoints that read
+	// DeepSeek's max_tokens instead of OpenAI's max_completion_tokens.
+	MaxTokensLegacy int      `json:"max_tokens,omitempty"`
+	Temperature     *float64 `json:"temperature,omitempty"`
+	PromptCacheKey  string   `json:"prompt_cache_key,omitempty"`
 	// PromptCacheRetention is the OpenAI chat-completions cache-retention
 	// hint ("24h" for long retention). Gateway providers ignore it.
 	PromptCacheRetention string `json:"prompt_cache_retention,omitempty"`
@@ -218,6 +243,51 @@ func hasThinkingBlocks(msgs []provider.Message) bool {
 		}
 	}
 	return false
+}
+
+// wireReasoning decides whether the wire serializer preserves and retains
+// reasoning_content for the given request. Stream and Warm must use the same
+// decision: a warm request that strips reasoning primes different bytes than
+// the real append-only stream, so the provider's automatic prefix cache would
+// never hit on the reasoning turns that follow.
+func (c *Client) wireReasoning(req provider.Request) (style provider.ReasoningStyle, preserveReasoning, retainAllReasoning bool) {
+	style, _ = provider.DetectReasoningForProvider(c.ID, req.Model)
+	advertised := c.modelInfo(req.Model)
+	preserve := style == provider.ReasoningStyleGLM || style == provider.ReasoningStyleDeepSeek ||
+		style == provider.ReasoningStyleAlways || style == provider.ReasoningStyleQwen ||
+		style == provider.ReasoningStyleUnknown
+	if c.ID == "openrouter" && advertised != nil && advertised.ReasoningKnown {
+		preserve = true
+	}
+	// OpenCode Zen/Go serve OpenAI-compatible reasoning models built on
+	// DeepSeek-style thinking, which require the provider to echo the prior
+	// turn's reasoning_content back in the next request. A model name here
+	// rarely maps to a DeepSeek dialect (names cluster around gpt/gemini), so
+	// force preservation so the endpoint never rejects the exchange with a
+	// "reasoning_content must be passed back" 400.
+	if c.ID == "opencode-zen" || c.ID == "opencode-go" {
+		preserve = true
+	}
+	// Deciding to strip reasoning from the wire must never depend on guessing
+	// the provider or model dialect. If any prior turn produced thinking, the
+	// DeepSeek-style endpoint requires that reasoning_content be echoed back
+	// verbatim on the next request — otherwise it rejects the exchange with a
+	// "reasoning_content must be passed back" 400. Check the actual history so
+	// we only ever preserve what genuinely exists.
+	if hasThinkingBlocks(req.Messages) {
+		preserve = true
+	}
+	// DeepSeek-line endpoints (Zen/Go gateways build on DeepSeek-style thinking)
+	// get an append-only prompt: every turn keeps all of its reasoning instead
+	// of stripping to the most-recent window. That keeps the serialized prefix
+	// byte-identical across turns so the provider's automatic prefix cache hits,
+	// instead of re-billing the whole tail every turn. Other reasoning
+	// providers keep the token-saving strip.
+	retainAll := req.MaxReasoningTurns <= 0 &&
+		(c.ID == "opencode-zen" || c.ID == "opencode-go" ||
+			style == provider.ReasoningStyleDeepSeek ||
+			(hasThinkingBlocks(req.Messages) && (c.ID == "deepseek" || c.ID == "openrouter")))
+	return style, preserve, retainAll
 }
 
 // toWireWithStable keeps the stable prompt in an earlier message than the
@@ -318,6 +388,16 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 				value := reasoning.String()
 				wm.ReasoningContent = &value
 			}
+			// OpenAI-compatible endpoints (OpenCode/Zen, GLM, DeepSeek) reject
+			// an assistant message with neither "content" nor "tool_calls"
+			// set. A turn that produced only thinking (e.g. a truncated
+			// "continue" exchange) would otherwise serialize to an empty
+			// assistant block and fail the whole request with a 400, forcing
+			// an uncached retry. If we have nothing else, fall back to the
+			// echoed reasoning as content so the message is always sendable.
+			if len(calls) == 0 && wm.Content == nil && wm.ReasoningContent != nil {
+				wm.Content = *wm.ReasoningContent
+			}
 			out = append(out, wm)
 		} else if m.Role == provider.RoleUser && (text.Len() > 0 || len(imageBlocks) > 0) {
 			wm := wireMessage{Role: "user", Content: text.String()}
@@ -346,6 +426,7 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 }
 
 func toWireTools(ts []provider.ToolSchema) []wireTool {
+	ts = provider.CanonicalToolSchemas(ts)
 	out := make([]wireTool, 0, len(ts))
 	for _, t := range ts {
 		var wt wireTool
@@ -358,71 +439,183 @@ func toWireTools(ts []provider.ToolSchema) []wireTool {
 	return out
 }
 
-// Stream implements provider.Provider. It owns ch and closes it exactly once.
-func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- provider.Event) {
-	defer close(ch)
+// completionAttempts bounds how many times a request is retried before the
+// transport error is surfaced. Gateways such as OpenCode Zen/DeepSeek
+// intermittently drop keep-alive connections mid-request ("unexpected EOF")
+// under load; a fresh attempt usually succeeds and avoids aborting a turn.
+const completionAttempts = 3
 
-	emit := func(ev provider.Event) bool {
-		select {
-		case ch <- ev:
+// retryableTransportError reports whether a request failed in a way that is
+// safe to retry. TLS/authorization failures, cancellations and deadline
+// exceedances are never retried.
+func retryableTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	for _, target := range []error{
+		syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNREFUSED,
+		syscall.ETIMEDOUT, syscall.ENETDOWN, syscall.EHOSTUNREACH,
+	} {
+		if errors.Is(err, target) {
 			return true
-		case <-ctx.Done():
-			return false
 		}
 	}
+	// Some wrappers lose the error identity; fall back on the message.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "server closed idle connection")
+}
 
+func retryBackoff(attempt int) time.Duration {
+	// 250ms then 1s: short enough not to stall turns, long enough to let a
+	// flaky gateway settle.
+	if attempt == 1 {
+		return 250 * time.Millisecond
+	}
+	return time.Second
+}
+
+// doCompletions POSTs raw to the chat/completions endpoint, rebuilding the
+// request on every attempt (a dropped connection may have consumed the body)
+// and retrying transient failures before the response starts.
+func (c *Client) doCompletions(ctx context.Context, raw []byte, extraHeaders http.Header) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < completionAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(retryBackoff(attempt)):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.BaseURL+"/chat/completions", bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("content-type", "application/json")
+		if c.APIKey != "" {
+			httpReq.Header.Set("authorization", "Bearer "+c.APIKey)
+		}
+		for k, v := range c.Headers {
+			httpReq.Header.Set(k, v)
+		}
+		for k, vs := range extraHeaders {
+			for _, v := range vs {
+				httpReq.Header.Add(k, v)
+			}
+		}
+		resp, err := c.HTTP.Do(httpReq)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !retryableTransportError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// Warm implements provider.CacheWarmber. It submits a tiny non-streaming
+// request carrying the same stable system + tools + prior transcript so the
+// provider populates its automatic prefix cache before the first real turn.
+// The body is built by the same builder as Stream (including the reasoning
+// dialect and cache-control fields) so the warm primes byte-identical prefix
+// bytes; only the output budget differs (1 token). The response is discarded.
+// Any error is returned but treated as best-effort by the caller — a failed
+// warm simply means the first turn stays cold.
+func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 	if c.APIKey == "" && !isLocal(c.BaseURL) {
-		emit(provider.Event{Kind: provider.EventError,
-			Err: fmt.Errorf("%s: no API key configured", c.ID)})
-		return
+		return fmt.Errorf("%s: no API key configured", c.ID)
+	}
+	msgs := req.Messages
+	if len(msgs) == 0 {
+		msgs = []provider.Message{provider.UserText("ack")}
+	}
+	// Prime the exact bytes the real stream will send: the same reasoning
+	// retention decision as Stream, so the warm's prefix matches the
+	// append-only prompt that follows and the automatic cache actually hits.
+	req.Messages = msgs
+	body := c.buildWireBody(req, false, false)
+	if deepseekWire(c.ID) {
+		body.MaxTokens = 0
+		body.MaxTokensLegacy = 1
+	} else {
+		body.MaxTokens = 1
+	}
+	if c.ID == "openai" {
+		body.PromptCacheRetention = "24h"
+	} else {
+		// Gateways reject OpenAI's cache-routing hint; DeepSeek-line
+		// endpoints cache automatically and need no retention hint.
+		body.PromptCacheKey = ""
 	}
 
-	style, _ := provider.DetectReasoningForProvider(c.ID, req.Model)
-	advertised := c.modelInfo(req.Model)
-	preserveReasoning := style == provider.ReasoningStyleGLM || style == provider.ReasoningStyleDeepSeek ||
-		style == provider.ReasoningStyleAlways || style == provider.ReasoningStyleQwen ||
-		style == provider.ReasoningStyleUnknown
-	if c.ID == "openrouter" && advertised != nil && advertised.ReasoningKnown {
-		preserveReasoning = true
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
 	}
-	// OpenCode Zen/Go serve OpenAI-compatible reasoning models built on
-	// DeepSeek-style thinking, which require the provider to echo the prior
-	// turn's reasoning_content back in the next request. A model name here
-	// rarely maps to a DeepSeek dialect (names cluster around gpt/gemini), so
-	// force preservation so the endpoint never rejects the exchange with a
-	// "reasoning_content must be passed back" 400.
-	if c.ID == "opencode-zen" || c.ID == "opencode-go" {
-		preserveReasoning = true
+	extraHeaders := http.Header{}
+	if req.SessionID != "" {
+		switch {
+		case c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai"):
+			extraHeaders.Set("x-session-id", req.SessionID)
+		case c.ID == "openai" || strings.Contains(c.BaseURL, "api.openai.com"):
+			extraHeaders.Set("session_id", req.SessionID)
+			extraHeaders.Set("x-client-request-id", req.SessionID)
+			extraHeaders.Set("x-session-affinity", req.SessionID)
+		}
 	}
-	// Deciding to strip reasoning from the wire must never depend on guessing
-	// the provider or model dialect. If any prior turn produced thinking, the
-	// DeepSeek-style endpoint requires that reasoning_content be echoed back
-	// verbatim on the next request — otherwise it rejects the exchange with a
-	// "reasoning_content must be passed back" 400. Check the actual history so
-	// we only ever preserve what genuinely exists.
-	if hasThinkingBlocks(req.Messages) {
-		preserveReasoning = true
+	resp, err := c.doCompletions(ctx, raw, extraHeaders)
+	if err != nil {
+		return err
 	}
-	// DeepSeek-line endpoints (Zen/Go gateways build on DeepSeek-style thinking)
-	// get an append-only prompt: every turn keeps all of its reasoning instead
-	// of stripping to the most-recent window. That keeps the serialized prefix
-	// byte-identical across turns so the provider's automatic prefix cache hits,
-	// instead of re-billing the whole tail every turn. Other reasoning
-	// providers keep the token-saving strip.
-	retainAllReasoning := c.ID == "opencode-zen" || c.ID == "opencode-go" ||
-		style == provider.ReasoningStyleDeepSeek ||
-		(hasThinkingBlocks(req.Messages) && (c.ID == "deepseek" || c.ID == "openrouter"))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return fmt.Errorf("%s: warm http %d: %s", c.ID, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+// Stream implements provider.Provider. It owns ch and closes it exactly once.
+// buildWireBody assembles the provider request body. Warm and Stream must
+// produce byte-identical prefixes — a warm that primes a different request
+// than the stream sends cannot serve the automatic prefix cache, so every
+// turn start would re-bill cold. The only permitted differences are the
+// streaming flag, the output budget, and the usage callback flag.
+func (c *Client) buildWireBody(req provider.Request, streaming, includeUsage bool) wireRequest {
+	style, preserveReasoning, retainAllReasoning := c.wireReasoning(req)
 	body := wireRequest{
 		Model:          req.Model,
 		Messages:       toWireWithReasoning(req.System, req.Messages, preserveReasoning, retainAllReasoning),
 		Tools:          toWireTools(req.Tools),
-		Stream:         true,
-		StreamOpts:     &streamOpts{IncludeUsage: true},
-		MaxTokens:      req.MaxTokens,
+		Stream:         streaming,
 		Temperature:    req.Temperature,
 		PromptCacheKey: promptCacheKey(req.Model, req.SessionID),
 	}
-	if c.ID == "openai" {
+	if streaming {
+		body.StreamOpts = &streamOpts{IncludeUsage: includeUsage}
+	}
+	if deepseekWire(c.ID) {
+		// DeepSeek-line endpoints read max_tokens, not max_completion_tokens.
+		body.MaxTokens = 0
+		body.MaxTokensLegacy = req.MaxTokens
+	} else {
+		body.MaxTokens = req.MaxTokens
+	}
+	if c.ID == "openai" || deepseekWire(c.ID) {
 		body.Messages = toWireWithStable(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning)
 	}
 	if c.ID != "openai" {
@@ -500,6 +693,28 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 			body.Temperature = nil
 		}
 	}
+	return body
+}
+
+func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- provider.Event) {
+	defer close(ch)
+
+	emit := func(ev provider.Event) bool {
+		select {
+		case ch <- ev:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	if c.APIKey == "" && !isLocal(c.BaseURL) {
+		emit(provider.Event{Kind: provider.EventError,
+			Err: fmt.Errorf("%s: no API key configured", c.ID)})
+		return
+	}
+
+	body := c.buildWireBody(req, true, true)
 
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -507,20 +722,7 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		return
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.BaseURL+"/chat/completions", bytes.NewReader(raw))
-	if err != nil {
-		emit(provider.Event{Kind: provider.EventError, Err: err})
-		return
-	}
-	httpReq.Header.Set("content-type", "application/json")
-	httpReq.Header.Set("accept", "text/event-stream")
-	if c.APIKey != "" {
-		httpReq.Header.Set("authorization", "Bearer "+c.APIKey)
-	}
-	for k, v := range c.Headers {
-		httpReq.Header.Set(k, v)
-	}
+	extraHeaders := http.Header{"accept": {"text/event-stream"}}
 	// Session-affinity hints keep the prompt cache warm on the provider's
 	// router: direct OpenAI uses session_id/x-client-request-id (plus the
 	// legacy x-session-affinity), OpenRouter uses x-session-id. One-off calls
@@ -528,15 +730,17 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	if req.CacheRetention != provider.CacheRetentionNone && req.SessionID != "" {
 		switch {
 		case c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai"):
-			httpReq.Header.Set("x-session-id", req.SessionID)
-		case c.ID == "openai" || strings.Contains(c.BaseURL, "api.openai.com"):
-			httpReq.Header.Set("session_id", req.SessionID)
-			httpReq.Header.Set("x-client-request-id", req.SessionID)
-			httpReq.Header.Set("x-session-affinity", req.SessionID)
+			extraHeaders.Set("x-session-id", req.SessionID)
+		case c.ID == "openai" || strings.Contains(c.BaseURL, "api.openai.com") ||
+			c.ID == "opencode-zen" || c.ID == "opencode-go" ||
+			strings.Contains(c.BaseURL, "opencode.ai"):
+			extraHeaders.Set("session_id", req.SessionID)
+			extraHeaders.Set("x-client-request-id", req.SessionID)
+			extraHeaders.Set("x-session-affinity", req.SessionID)
 		}
 	}
 
-	resp, err := c.HTTP.Do(httpReq)
+	resp, err := c.doCompletions(ctx, raw, extraHeaders)
 	if err != nil {
 		emit(provider.Event{Kind: provider.EventError, Err: err})
 		return

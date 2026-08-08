@@ -35,10 +35,11 @@ func (d Day) Total() int {
 }
 
 // CacheHitRate returns the share of input tokens served from the provider
-// prompt cache, as a percentage (0..100). Input is the uncached input, so
-// CacheRead/(Input+CacheRead) is the proportion of the prompt that was a hit.
+// prompt cache, as a percentage (0..100), matching the plan docs' definition
+// (docs/cache-hit-plan-2026-08-07.md): cache_read over the whole prompt
+// footprint (uncached input + cache reads + cache writes).
 func (d Day) CacheHitRate() float64 {
-	denom := d.Input + d.CacheRead
+	denom := d.Input + d.CacheRead + d.CacheWrite
 	if denom <= 0 {
 		return 0
 	}

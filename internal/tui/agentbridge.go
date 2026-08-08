@@ -24,6 +24,16 @@ import (
 	"rick/pkg/repomap"
 )
 
+// agentArchiveDir is where trimmed originals land for the TUI's runs:
+// <store dir>/archive. The store is always present in interactive mode, but
+// fall back to "" (no archiving) when running without one.
+func agentArchiveDir(store *session.Store) string {
+	if store == nil {
+		return ""
+	}
+	return filepath.Join(store.Dir(), "archive")
+}
+
 // startAgent kicks off a run and returns the drain command.
 //
 // The goroutine NEVER touches *Model — it only writes to m.agentCh, which the
@@ -113,7 +123,11 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			EnableDistillation: cfg.DistillEnabled != nil && *cfg.DistillEnabled,
 			DistillModel:       cfg.DistillModelFor(),
 			CacheRetention:     provider.CacheRetention(cfg.CacheRetention),
+			WarmCache:          cfg.WarmCache,
+			MaxReasoningTurns:  cfg.CacheMaxReasoningTurns,
+			MaxToolResultBytes: cfg.CacheMaxToolResultBytes,
 			PinnedToolSchemas:  schemas,
+			ArchiveDir:         agentArchiveDir(m.deps.Store),
 		})
 		appended, _ := runner.Run(ctx, history, ch)
 		// Results are delivered through the channel; the appended slice is
@@ -237,6 +251,15 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			}
 		}
 
+	case agent.EvCacheDivergence:
+		if ev.Divergence != nil {
+			if ev.Divergence.Index >= 0 {
+				m.pendingDivergence = fmt.Sprintf("%s@%d;%s", ev.Divergence.Kind, ev.Divergence.Index, ev.Divergence.Reason)
+			} else {
+				m.pendingDivergence = fmt.Sprintf("%s;%s", ev.Divergence.Kind, ev.Divergence.Reason)
+			}
+		}
+
 	case agent.EvUsage:
 		if ev.Usage != nil {
 			// Cumulative counters are for billing; the context gauge needs
@@ -258,6 +281,22 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			m.billed.CacheRead += ev.Usage.CacheReadTokens
 			m.billed.CacheWrite += ev.Usage.CacheWriteTokens
 			m.observeCacheUsage(ev.Usage)
+			// Persist one telemetry entry per provider request so per-turn
+			// cache-hit/miss behavior can be measured from the session file.
+			if m.sess != nil {
+				m.requestSeq++
+				m.sess.Requests = append(m.sess.Requests, session.RequestUsage{
+					Index:           m.requestSeq,
+					Agent:           m.agentName,
+					Input:           ev.Usage.InputTokens,
+					Output:          ev.Usage.OutputTokens,
+					CacheRead:       ev.Usage.CacheReadTokens,
+					CacheWrite:      ev.Usage.CacheWriteTokens,
+					Divergence:      m.pendingDivergence,
+					ReasoningTokens: ev.ReasoningTokens,
+				})
+				m.pendingDivergence = ""
+			}
 			if m.deps.Usage != nil {
 				_ = m.deps.Usage.Record(m.modelID,
 					ev.Usage.InputTokens, ev.Usage.OutputTokens,
@@ -318,19 +357,19 @@ func (m *Model) observeCacheUsage(u *provider.Usage) {
 		return
 	}
 	reported := u.CacheReadTokens+u.CacheWriteTokens > 0
-	// Only measure a miss when this turn actually reports cache tokens.
-	// Gateways that omit the cache fields on some turns (e.g. a usage chunk
-	// without cached_tokens) must not be read as "the whole history was
-	// re-billed": with the old latch, one cached turn made every later
-	// cache-less turn count a full-prompt miss, inflating the miss counter.
-	missCause := ""
-	if m.cachePrevPrompt > 0 && reported {
+	// A turn that reports no cache tokens is still a full re-bill when its
+	// fresh input alone covers the previously sent span — some gateways
+	// omit the cache fields on those turns. A normal growing turn whose
+	// input is only the new tail must not be counted as a miss, otherwise
+	// one cached turn would make every later cache-less turn a false alarm.
+	fullRebill := !reported && u.InputTokens >= m.cachePrevPrompt-cacheMissNoiseFloor
+	if m.cachePrevPrompt > 0 && (reported || fullRebill) {
 		missed := min(m.cachePrevPrompt, promptTokens) - u.CacheReadTokens
 		if missed > cacheMissNoiseFloor {
 			m.cacheMissTokens += missed
 			m.cacheMissCount++
 			m.cacheMissStreak++
-			missCause = m.cacheMissReason()
+			missCause := m.cacheMissReason(reported)
 			if m.cacheMissStreak == 2 {
 				m.appendMsg(ChatMsg{Kind: MsgSystem,
 					Text: fmt.Sprintf("cache miss: ~%s tokens re-billed (%s)",
@@ -358,9 +397,15 @@ func (m *Model) cacheTTL() time.Duration {
 // cacheMissReason tells apart an idle-gap timeout from a prefix change, so
 // cache regressions caused by conversation edits are distinguishable from
 // the cheap misses that come from simply waiting too long.
-func (m *Model) cacheMissReason() string {
+func (m *Model) cacheMissReason(reported bool) string {
+	if m.pendingDivergence != "" {
+		return "prefix change: " + m.pendingDivergence
+	}
 	if !m.cacheLastUsage.IsZero() && time.Since(m.cacheLastUsage) > m.cacheTTL() {
 		return "idle gap (cache expired)"
+	}
+	if !reported {
+		return "provider served no prefix cache"
 	}
 	return "prefix change"
 }
@@ -610,6 +655,12 @@ func (m *Model) capHistoryCacheAware(history []provider.Message) []provider.Mess
 	if m.deps.Budget != nil {
 		insert = lastBoundaryBefore(history, removed, m.deps.Budget.ChooseBoundaries(history))
 	}
+	// Reuse a previous summary's position so repeated compactions keep the
+	// summary at the same bytes; a moving summary would rewrite the
+	// canonical prefix and invalidate the provider prefix cache.
+	if existing := existingCompactSummaryAt(history); existing >= 0 && existing < removed {
+		insert = existing
+	}
 	if insert == 0 {
 		return plain
 	}
@@ -620,6 +671,30 @@ func (m *Model) capHistoryCacheAware(history []provider.Message) []provider.Mess
 		return plain
 	}
 	return kept
+}
+
+// existingCompactSummaryAt returns the message index of a previously
+// inserted compacted-history summary, or -1 when none exists.
+func existingCompactSummaryAt(history []provider.Message) int {
+	for i, msg := range history {
+		if len(msg.Content) == 1 && msg.Content[0].Type == "text" &&
+			strings.HasPrefix(msg.Content[0].Text, "Earlier conversation compacted:") {
+			return i
+		}
+	}
+	return -1
+}
+
+// summaryPairAt returns the message index of a previously inserted
+// user-requested compaction summary pair, or -1 when none exists.
+func summaryPairAt(history []provider.Message) int {
+	for i, msg := range history {
+		if len(msg.Content) == 1 && msg.Content[0].Type == "text" &&
+			strings.HasPrefix(msg.Content[0].Text, "Summary of the conversation so far:") {
+			return i
+		}
+	}
+	return -1
 }
 
 // lastBoundaryBefore returns the newest cache boundary index strictly before

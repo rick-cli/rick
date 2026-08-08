@@ -26,3 +26,18 @@ func TestOpenCodeZenContextOverrideIsProviderScoped(t *testing.T) {
 		t.Fatalf("non-Zen override = (%d, %t), want (0, false)", got, ok)
 	}
 }
+
+func TestDeepSeekV4ContextWindows(t *testing.T) {
+	tests := map[string]int{
+		"deepseek-v4-flash":      1_000_000,
+		"deepseek-v4-flash-free": 200_000,
+		"deepseek-v4-pro":        1_000_000,
+		"deepseek-chat":          128_000,
+		"deepseek-reasoner":      128_000,
+	}
+	for modelID, want := range tests {
+		if got := KnownContextWindow(modelID); got != want {
+			t.Errorf("KnownContextWindow(%q) = %d, want %d", modelID, got, want)
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"rick/internal/provider"
 	"rick/internal/tools"
@@ -312,5 +313,127 @@ func TestRunnerRespectsExplicitTurnCap(t *testing.T) {
 	}
 	if !sawError {
 		t.Fatal("turn-cap stop did not emit an error event")
+	}
+}
+
+// ewarmProvider streams two tool turns then a plain answer. The second turn's
+// usage reports a cache read far smaller than the first turn's prompt, the
+// signature of an idle-gap prefix eviction. It also implements CacheWarmber so
+// the runner can (re)prime it.
+type ewarmProvider struct {
+	warmCalls *int
+	turn      int
+}
+
+func (ewarmProvider) Name() string                 { return "ewarm-provider" }
+func (ewarmProvider) Models() []provider.ModelInfo { return nil }
+func (p *ewarmProvider) Warm(_ context.Context, _ provider.Request) error {
+	*p.warmCalls++
+	return nil
+}
+func (p *ewarmProvider) Stream(_ context.Context, _ provider.Request, ch chan<- provider.Event) {
+	defer close(ch)
+	p.turn++
+	if p.turn <= 2 {
+		input, _ := json.Marshal(map[string]any{"command": "x"})
+		// Turn 1 rides a large warm cache. Turn 2 lost it (idle eviction).
+		if p.turn == 1 {
+			ch <- provider.Event{Kind: provider.EventUsage, Usage: &provider.Usage{InputTokens: 100, CacheReadTokens: 9000}}
+		} else {
+			ch <- provider.Event{Kind: provider.EventUsage, Usage: &provider.Usage{InputTokens: 8900, CacheReadTokens: 200}}
+		}
+		ch <- provider.Event{Kind: provider.EventToolCall, ToolCall: &provider.ToolCall{ID: "c1", Name: "shell", Input: input}}
+		ch <- provider.Event{Kind: provider.EventDone, StopReason: "tool_use"}
+		return
+	}
+	ch <- provider.Event{Kind: provider.EventText, Text: "done"}
+	ch <- provider.Event{Kind: provider.EventDone, StopReason: "end_turn"}
+}
+
+// TestRunRewarmsAfterIdleEviction pins that a turn whose cache read collapses
+// below the previously warm prefix triggers one best-effort re-warm before the
+// next request, so the following turn rides the cache instead of re-billing the
+// whole history.
+func TestRunRewarmsAfterIdleEviction(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(repeatedCallTool{})
+	warmCalls := 0
+	prov := &ewarmProvider{warmCalls: &warmCalls}
+	runner := New(Config{
+		Provider:  prov,
+		Model:     "work-model",
+		Tools:     registry,
+		WarmCache: true,
+	})
+	events := make(chan Event, 256)
+	_, err := runner.Run(context.Background(), []provider.Message{provider.UserText("run it")}, events)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	// One warm at Run start + one re-warm after the idle eviction detected on
+	// turn 2. Without the re-warm latch only the start warm would fire.
+	if warmCalls < 2 {
+		t.Fatalf("warm calls = %d, want >= 2 (start + re-warm after eviction)", warmCalls)
+	}
+}
+
+// TestRunRewarmsAfterIdleGap pins the time-based pre-warm: a turn that follows
+// the previous request by more than the provider cache TTL re-primes the full
+// view before streaming, even when the provider never reported an eviction.
+func TestRunRewarmsAfterIdleGap(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(repeatedCallTool{})
+	warmCalls := 0
+	prov := &ewarmProvider{warmCalls: &warmCalls}
+	runner := New(Config{
+		Provider:  prov,
+		Model:     "work-model",
+		Tools:     registry,
+		WarmCache: true,
+	})
+	// Simulate the previous request having been dispatched long before this
+	// run's first turn (cache TTL is 5 minutes).
+	runner.lastRequest = time.Now().Add(-10 * time.Minute)
+	events := make(chan Event, 256)
+	if _, err := runner.Run(context.Background(), []provider.Message{provider.UserText("run it")}, events); err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	// Start warm + the idle-gap full-view warm before turn 1.
+	if warmCalls < 2 {
+		t.Fatalf("warm calls = %d, want >= 2 (start + idle-gap re-warm)", warmCalls)
+	}
+}
+
+// errWarmProvider streams one turn and fails every warm request.
+type errWarmProvider struct{ ewarmProvider }
+
+func (errWarmProvider) Warm(context.Context, provider.Request) error {
+	return errors.New("gateway refused warm (400)")
+}
+
+// TestRunSurfacesWarmFailure pins that a failed warm surfaces as a notice
+// instead of being silently swallowed, so a cold re-bill is diagnosable.
+func TestRunSurfacesWarmFailure(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(repeatedCallTool{})
+	prov := &errWarmProvider{}
+	runner := New(Config{
+		Provider:  prov,
+		Model:     "work-model",
+		Tools:     registry,
+		WarmCache: true,
+	})
+	events := make(chan Event, 256)
+	if _, err := runner.Run(context.Background(), []provider.Message{provider.UserText("run it")}, events); err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	saw := false
+	for event := range events {
+		if event.Kind == EvAgentMessage && strings.Contains(event.Text, "cache warm failed") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("warm failure did not surface an EvAgentMessage notice")
 	}
 }

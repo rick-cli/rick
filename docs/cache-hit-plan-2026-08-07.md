@@ -1,0 +1,76 @@
+# Raising rick's prompt-cache hit rate toward 98–99%
+
+Date: 2026-08-07 · Provider under study: `opencode-zen/deepseek-v4-flash-free`
+Comparison targets: **oh-my-pi** (bcfg/pi-mono) and **ZCode**.
+
+## 1. What the data says
+
+Hit rate = `cache_read / (input + cache_read + cache_write)` from provider
+usage. Across ~140 sessions (rick session store):
+
+| Kind of session | Hit rate | Turns | Why |
+|---|---|---|---|
+| Long, warm-prefix sessions (same cwd/model chain) | 97–99.9% | 18–211 | Cold start amortized over many turns; system prefix already cached by an earlier session |
+| Short sessions (2–8 turns), cold prefix | 0.19–0.88 | 2–8 | First request is a full cold miss; few turns to amortize it |
+| Tool-loop / swarm / benchmark sessions (`f348`, `e558`, `d260`) | 0.25–0.72 | 4–8 | Large per-turn DeepSeek reasoning echo + parallel invocations = big fresh tail each turn |
+| Broken session (`2026-08-06T20-25-31_0dc8`) | 0.876 | 21 | Failed the stream with an empty-assistant-message 400, forced uncached retries |
+
+Concrete examples:
+- `2026-08-05T21-48-10_63fc` msgs=2 → 99.6%. System prefix (~6.8k tok) was **already cached by an earlier session in the same cwd**, so even its first request hit.
+- `2026-08-06T01-49-59_f348` msgs=8, 490 chars of text → `input` 17,181, `cache_read` 5,888 → 25.5%. The ~17k uncached tokens are the echoed DeepSeek reasoning + fresh turns, not text.
+
+## 2. Why rick was lower than oh-my-pi / ZCode
+
+- **oh-my-pi enforces an append-only invariant** (harness-v2.md §4): *"Across the requests of a lane, provider context only grows at the tail. An insertion before the previous request's tail invalidates the provider's KV cache from that point on."* Compaction is the *one* deliberate full invalidation, after which the prompt resumes append-only. rick's message stream is already append-only, but a near-budget session rewrote the front via `history.Retain` head-trimming — a front rewrite that nukes the whole provider prefix cache for the rest of the conversation.
+- Oh-my-pi derives each provider view from the **previous view** (persistent tree), so the serialized prompt is expected to only ever grow. rick recomputes the trimmed view from canonical history every turn.
+- ZCode is GLM-oriented, single-purpose, short lanes with a large, **constant** system prompt; the only fresh tokens are the newest turn, so the ratio sits near 99.5%.
+- rick's `## Environment` block embeds `Working directory`, `model`, `agent`. Every new cwd or model cold-starts the system prefix — that is why same-cwd chains hit 99% and new-cwd short sessions dip to 50–90%.
+
+## 3. Patches applied this session
+
+1. **Empty-assistant 400 (broke `0dc8`, forced uncached retries).** `internal/provider/openai/openai.go` — a turn that produced only thinking serialized to an assistant wire message with neither `content` nor `tool_calls`. Now the reasoning is echoed into `content` as a fallback. Test: `TestOpenCodeZenThinkingOnlyAssistantGetsContent`.
+2. **Analyzer.** `g/projectE/tmp/analyze_sessions.py` — fixed `contextR` typos; now runs and reports per-session hit rate, plus a new per-request section.
+
+## 4. Implementation status of P1–P5
+
+| Item | Status | Where |
+|---|---|---|
+| P1 cache warm | ✅ | `provider.CacheWarmber` interface + `Warm` on OpenAI/Anthropic; `cache_warm` config; agent warms once at `Run` start (best-effort) |
+| P2 append-only trim | ✅ | `history.DropFirstGroups` + `Runner.retainStable` pins a byte-stable sentinel at the head once, then the view only grows at the tail; distillation resets it (the one deliberate invalidation) |
+| P3 reasoning-echo cap | ✅ (opt-in) | `cache_max_reasoning_turns` → `provider.Request.MaxReasoningTurns`; >0 keeps only the most-recent reasoning (smaller prompt, one deliberate rewrite); 0 (default) keeps the append-only safe behaviour |
+| P4 per-cwd prefix warm | ✅ folded into P1 | warm runs at every session start so each cwd/model prefix is primed |
+| P5 telemetry | ✅ | `session.RequestUsage` rows persisted under `Session.Requests`; analyzer reports last-request + aggregate ratio |
+
+Verification: `go build ./...`, `go test ./internal/... ./cmd/...` (full suite),
+`go vet ./...` all pass; `gofmt` clean on changed files. Unrelated pre-existing
+unformatted files were not touched.
+
+## 5. Defaults & how to tune
+
+These are now **on by default** (no config needed):
+- `cache_retention = "long"` — prompt cache stays warm across idle gaps.
+- `cache_warm = true` — a small warm request primes each session's prefix before the first turn.
+
+To disable or tune, set them explicitly (overrides now honor these keys):
+
+```toml
+# config.toml
+cache_retention = "auto"              # off-by-default TTL behaviour
+cache_warm = false                    # disable the warm-up request
+# cache_max_reasoning_turns = 1       # optional: only echo the newest reasoning
+```
+
+`cache_max_reasoning_turns` stays `0` by default (keep all reasoning → byte-stable, append-only prefix), which is the cache-optimal choice; the cap is there to trade a smaller prompt for one deliberate rewrite if the telemetry says it wins.
+
+After a few sessions, run:
+`python g/projectE/tmp/analyze_sessions.py`
+and compare the new `requests[]` per-request rows: `last_ratio` should be ~0.99
+for warm-prefix sessions, and the first request's `input` should drop sharply
+with `cache_warm` on (the warm request eats the cold start).
+
+## 6. Success metric
+
+Per-session hit rate `>= 0.98` on a) re-runs in the same cwd, b) new-cwd short
+sessions (with P1 warm), and c) reasoning-heavy tool loops (with P3 if the
+measured trade-off is favourable). No regressions in `go test ./...`,
+`go vet ./...`, `gofmt`.

@@ -157,6 +157,7 @@ func wireSystem(system, stable string, retention provider.CacheRetention) []wire
 }
 
 func wireTools(tools []provider.ToolSchema, retention provider.CacheRetention) []wireTool {
+	tools = provider.CanonicalToolSchemas(tools)
 	if len(tools) == 0 {
 		return nil
 	}
@@ -379,6 +380,54 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	}
 
 	c.readSSE(ctx, resp.Body, emit)
+}
+
+// Warm implements provider.CacheWarmber. It submits a tiny non-streaming
+// request carrying the same stable system + tools + prior transcript, with
+// cache_control breakpoints and a 1h TTL, so the provider populates its prompt
+// cache before the first real turn. The 1-token output budget keeps the call
+// near-free; the response is discarded. Errors are best-effort (the caller
+// proceeds to Stream regardless).
+func (c *Client) Warm(ctx context.Context, req provider.Request) error {
+	if c.APIKey == "" {
+		return fmt.Errorf("anthropic: no API key set")
+	}
+	msgs := req.Messages
+	if len(msgs) == 0 {
+		msgs = []provider.Message{provider.UserText("ack")}
+	}
+	body := wireRequest{
+		Model:     req.Model,
+		MaxTokens: 1,
+		Stream:    false,
+		System:    wireSystem(req.System, req.SystemStable, provider.CacheRetentionLong),
+		Messages:  toWire(msgs, nil, provider.CacheRetentionLong),
+		Tools:     wireTools(req.Tools, provider.CacheRetentionLong),
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/messages", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("x-api-key", c.APIKey)
+	httpReq.Header.Set("anthropic-version", apiVersion)
+	httpReq.Header.Set("content-type", "application/json")
+	if beta := cacheBetaHeader(provider.CacheRetentionLong); beta != "" {
+		httpReq.Header.Set("anthropic-beta", beta)
+	}
+	resp, err := c.HTTP.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return fmt.Errorf("anthropic: warm http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 // toolAccum accumulates streamed partial JSON for one tool_use block.

@@ -139,6 +139,9 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 		EnableDistillation: deps.Config.DistillEnabled != nil && *deps.Config.DistillEnabled,
 		DistillModel:       deps.Config.DistillModelFor(),
 		CacheRetention:     provider.CacheRetention(deps.Config.CacheRetention),
+		WarmCache:          deps.Config.WarmCache,
+		MaxReasoningTurns:  deps.Config.CacheMaxReasoningTurns,
+		MaxToolResultBytes: deps.Config.CacheMaxToolResultBytes,
 	})
 
 	history := []provider.Message{provider.UserText(opts.Prompt)}

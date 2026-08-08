@@ -1,0 +1,173 @@
+# Cache-miss hardening plan -- next round (beyond P1-P5)
+
+Date: 2026-08-07 · Provider under study: `opencode-zen/deepseek-v4-flash-free`
+Builds on: `docs/cache-hit-plan-2026-08-07.md` (P1-P5 all [x], deployed at v0.1.13).
+
+## Why this plan exists
+
+P1-P5 are in production, yet the most recent sessions still miss:
+
+| Session | Hit rate | Input (miss) | Full resets (cache_read = 0) |
+|---|---|---|---|
+| `…e7d0` (prev round) | 95.19% | 421,728 | 3 (req 1, 8, 122) |
+| `…f858` (this round) | 93.95% | 566,870 | **5** (req 8, 13, 43, 47, 109) |
+
+The 5 resets alone re-billed **330k/566k (58%)** of all miss tokens, and the
+17 turns with per-turn hit < 90% account for **84%** of miss tokens. The cold
+start is only one of the resets -- the other four are **mid-session full-prefix
+invalidations**, which P1-P5 did not eliminate. The plan below is
+instrument-first: pin the exact rewrite site, then fix it. Everything is
+gated behind a byte-stability invariant.
+
+## Phase 0 -- Instrument: find the exact reset point (do this first)
+
+**Goal:** for every request that lost its cache, log *which byte in the prefix
+diverged from the previous request* and *which layer rewrote it*.
+
+1. **Prefix divergence tracker** (`internal/agent/agent.go`, near `buildRequest`):
+   serialize the provider view (system + messages + tool schemas) and compare
+   with the previous request's serialization message-by-message. On divergence
+   before the previous tail, emit an event:
+   `EvCacheDivergence{index, kind, reason}` where `kind` is one of
+   `system`, `schema`, `message`, `tool_result`, and `reason` is filled by the
+   mutating site (below).
+2. **Mutation tagging**: wrap every transform of the provider view in a
+   `mutate(view, reason)` helper that records the reason on the runner:
+   - `history.Retain` / `retainStable` head trim -> `"head-trim"`
+   - `ApplyDedup` supersede flip -> `"dedup-supersede"`
+   - `CompressLive` / `minify` -> `"live-compress"`
+   - `distill` -> `"distill"` (existing deliberate invalidation)
+   - TUI compaction summary insert (`internal/tui/model.go:871`,
+     `internal/tui/agentbridge.go:626`) -> `"compact-summary"`
+   - resume re-derivation (`SentTranscript`) -> `"resume"`
+3. **Surface**: persist the divergence event per request in the session's
+   `requests[]` rows; show `reset n · reason` in `/stats`. Re-run one real
+   session; the reset reasons now name the guilty layer. *This converts the
+   rest of the plan from hypotheses to verified fixes.*
+
+Exit criteria: for the replayed session, every mid-session reset is tagged
+with a concrete reason, and at least one of the suspected sites below is
+confirmed or cleared.
+
+## Phase B -- Eliminate mid-prefix rewrites (target: 5 -> 1 reset)
+
+All items assume the tracker from Phase 0 confirms them; each ships with a
+property test.
+
+1. **Dedup supersede must never rewrite already-sent bytes.**
+   `pkg/contextbudget/contextbudget.go:257` flips `superseded` after a head
+   trim, and the second pass (`:273`) then replaces *remaining* occurrences of
+   a large payload with a `[duplicate payload …]` pointer -- a rewrite of bytes
+   the provider already saw, invalidating everything after it. Change
+   semantics: supersede only affects **newly appended** occurrences; a
+   message already serialized with its payload keeps its exact bytes forever
+   (the full copy may be trimmed away, but never a replacement swapped in
+   retroactively). Property test: run a scripted dedup+trim sequence and
+   assert that supersede flips never change an already-sent message's
+   `tool_result` content.
+2. **Live-compress determinism is golden-tested.**
+   `CompressLive`/`minifyJSON`/`capLive` (`pkg/contextbudget`) must produce
+   byte-identical output on save, resume, and re-stream. Add
+   `TestCompressLiveDeterministicAcrossRounds` (same payload captured twice,
+   across a StoreLive/retrieve round-trip). Store the compressed form at
+   capture; never re-run the pass on stored messages.
+3. **Compaction inserts at the *same* boundary it used last time.**
+   `model.go:871`/`agentbridge.go:626` insert the summary after
+   `lastBoundaryBefore`. If the chosen boundary drifts between turns,
+   the summary position moves -> full reset. Pin the boundary index once a
+   summary exists; a repeat compaction replaces the same message in place.
+   Test: two consecutive compactions -> only the compact turn is a deliberate
+   reset, the next turn is a full hit and the summary bytes are identical.
+4. **Freeze the system prompt after the first request.**
+   The volatile system block (`## Environment` + repoMap + tool manifest,
+   `agent.go:721-727`) is re-derived each turn. repoMap text can drift on the
+   same git tree when files change (even the map header). Hash-pin and reuse
+   the first computed block per session, like `sessionSystemParts` already
+   does for the env block. Also confirm `toolManifest` is frozen via
+   `PinnedToolSchemas` on every runner construction (it is set in the TUI; add
+   to `headless.go` + `cmd/rickverify` if missing).
+
+### Phase B gate
+
+A property test `TestProviderViewAppendOnly` (extends `stable_head_test.go`):
+script a noisy session (large duplicate tool results, budget trims, one
+compaction, dedup) and assert that after every request, the serialized prefix
+is a byte-prefix of the next request's serialization, except exactly at
+declared "deliberate invalidation" points (first request, distill, compaction).
+This is the single regression net for the whole phase.
+
+## Phase C -- Shrink the fresh tail (target: 6.05% input -> ≤ 2%)
+
+The 12 partial regressions (hit 51.8-89%) and the big inputs on tool loops are
+large per-turn fresh tails: echoed DeepSeek reasoning + big tool results.
+
+1. **`cache_max_tool_result_bytes`** (implemented + deployed this round):
+   lower the default from `32 << 10` to `16 << 10` for reasoning-heavy
+   providers, and apply it at every view site (already applied). Add telemetry
+   rows `tool_bytes_reduced` so we can tune per provider.
+2. **Measure and, if dominant, bound the reasoning echo.** Add a per-request
+   counter for reasoning-block tokens (provider-side echo). If reasoning
+   exceeds ~30% of the tail, implement `cache_max_reasoning_turns` not as a
+   mid-stream strip but as a **one-time head rewrite**: on the first request
+   after it is enabled, truncate stale reasoning at the stable-head boundary
+   and pin it, so the prefix changes exactly once and then stays append-only.
+3. **Living-zone cap consistency** (`LiveZoneCapBytes`): ensure the cap is
+   applied *before* a tool result enters the canonical transcript (it is
+   applied at capture -> stable), and that the store keeps only the capped form
+   so resume never resends larger bytes.
+
+## Phase D -- Warm & idle (cold start + gaps)
+
+1. **Warm only the stable prefix.** Prime `ChooseBoundaries(retained)` instead
+   of the full tail + tools; the warm request then costs ~5-20% of the current
+   warm and still holds the prefix. Keep P1 (session start) and P1b
+   (eviction re-warm) unchanged.
+2. **Drop useless "long" for DeepSeek.** OpenAI-compatible providers have no
+   TTL header (`extended-cache-ttl` is Anthropic-only); verify
+   `cache_retention: "long"` is a no-op there (or removed from the wire) so it
+   never misleads tuning. Rely on warm + short turn cadence instead.
+
+## Phase E -- Verify & ship
+
+1. Telemetry: extend `tmp/analyze_sessions.py` + `/stats` with per-session
+   reset count, divergence reasons, input% (miss/(miss+read)), and the trace
+   of the top-5 diverging turns.
+2. Regression harness: record `e7d0` and `f858` request sequences
+   (requests[] already persisted), replay through the new invariants on a
+   stub provider, and assert: resets ≤ 1 (only cold start) and hit% ≥ 98% on
+   replay.
+3. `go build ./...`, `go vet ./...`, `go test ./...`, gofmt on touched files;
+   rebuild + redeploy `rick.exe` to `~/bin` (backups per
+   `rick.before-*` convention); playtest with a tool-heavy session and
+   compare the `/stats` input% vs 6.05%.
+
+## Priority order for implementation
+
+1. **Phase 0** tracker -- everything else depends on naming the divergence.
+2. **Phase B.1** dedup supersede + **B.4** system freeze (highest-value; the
+   two concrete rewrite sites already visible in code).
+3. **Phase B gate** property test -- locks the append-only invariant.
+4. **Phase C.1** default cap 16 KiB + telemetry.
+5. Phase B.2/B.3, then Phase C.2/C.3, then D, then E.
+
+## Success metric
+
+Replaying `f858`-class sessions: mid-session resets = 0 (only the cold start
+remains), per-session input% ≤ 2.5% (hit ≥ 97.5%) on tool-heavy lanes, and
+`go test ./...` green. Measured every session via the extended `/stats`.
+## Implementation status (same day, after plan)
+
+| Phase | Item | Status | Where |
+|---|---|---|---|
+| 0 | Prefix divergence tracker + per-request `divergence` telemetry | [x] | `internal/agent/agent.go` (trackPrefix/capturePrefix), `session.RequestUsage.Divergence`, TUI `EvCacheDivergence` -> `requests[]`, `cacheMissReason` |
+| B.1 | Permanent per-tool-result dedup (keyed by tool_use_id) | [x] | `pkg/contextbudget` (`decideDedup`, `dedupIDs`/`verbatim`, `storeCABLocked`) |
+| B.2 | CompressLive determinism golden test | [x] | `TestCompressLiveIsDeterministicAcrossRounds` |
+| B.3 | Compaction reuses previous summary position | [x] | `existingCompactSummaryAt`/`summaryPairAt` in `internal/tui` |
+| B.4 | System prompt frozen after first request | [x] | `Runner.systemBlock` (`systemOnce`/`pinnedSystem`) |
+| Gate | `TestProviderViewAppendOnly` prefix-stability property | [x] | `internal/agent/cache_appendonly_test.go` |
+| C.1 | `cache_max_tool_result_bytes` default 16 KiB + merge test | [x] | `internal/config` |
+| D.1 | Warm primes the stable system/tools head | [x] | `stableWarmHead` in agent warm path |
+| D.2 | DeepSeek gets no TTL hint (already gated) | [x] no change | verified `openai.go` (hint is OpenAI-only) |
+| E | Analyzer + /stats | [x] | `tmp/analyze_sessions.py`; session `requests[].divergence` |
+
+Verification: `go build ./...`, `go vet`, `go test ./...` all green; binary rebuilt and deployed to `~/bin`.

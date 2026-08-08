@@ -8,6 +8,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"sort"
 )
 
 // Role constants for Message.Role.
@@ -92,6 +93,50 @@ type ToolSchema struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 
+// CanonicalToolSchemas returns a byte-stable copy of tools for the wire:
+// ordered by name, with each schema's JSON canonicalized. The wire tools
+// block is part of the provider-cached prefix — a registry that iterates a
+// map, or a schema whose key order flips between turns, would re-bill the
+// whole tools block mid-session. Sorts are stable so identical inputs always
+// serialize identically (matching reasonix's sorted Schemas()).
+func CanonicalToolSchemas(tools []ToolSchema) []ToolSchema {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]ToolSchema, len(tools))
+	copy(out, tools)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	for i := range out {
+		out[i].InputSchema = canonicalizeSchemaMap(out[i].InputSchema).(map[string]any)
+	}
+	return out
+}
+
+// canonicalSchemaMap deep-normalizes a JSON-Schema map so key order and map
+// iteration can never change the marshaled bytes of the wire tools block.
+// encoding/json sorts map keys at marshal time, but nested objects created
+// by tools may arrive as map[string]any while slices of objects need
+// element-wise normalization; recursing here makes the snapshot canonical
+// regardless of how each tool built its schema.
+func canonicalizeSchemaMap(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = canonicalizeSchemaMap(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = canonicalizeSchemaMap(val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 // CacheRetention controls provider prompt-cache behaviour for a request.
 type CacheRetention string
 
@@ -132,6 +177,15 @@ type Request struct {
 	// Empty uses the provider default; "long" extends the TTL; "none"
 	// disables caching entirely.
 	CacheRetention CacheRetention
+	// MaxReasoningTurns caps how many prior turns' reasoning blocks are
+	// echoed back to a DeepSeek-line provider as reasoning_content. 0 (the
+	// default) keeps every turn's reasoning so the serialized prefix is
+	// byte-identical and the automatic prefix cache stays warm. A positive
+	// value keeps only the most recent turns and strips older blocks to
+	// empty — a deliberate one-time prompt rewrite that shrinks the prompt
+	// but costs one cache invalidation. Tune with the per-request telemetry
+	// (session "requests") to find the local optimum.
+	MaxReasoningTurns int
 	// SessionID names the session for session-keyed prompt caches and
 	// session-affinity routing hints. Stable across resume so a restarted
 	// session keeps hitting the same cache.
@@ -230,4 +284,14 @@ type Provider interface {
 // from a live endpoint.
 type ModelLister interface {
 	ListModels(ctx context.Context) ([]ModelInfo, error)
+}
+
+// CacheWarmber is optionally implemented by providers that can submit a small,
+// non-streaming "warm" request that populates the provider's prompt cache with
+// the request's prefix (stable system + tools + prior transcript) before the
+// first real turn. The caller (agent layer) invokes this once at session start
+// when prompt-cache warming is enabled, then proceeds to Stream. Errors are
+// best-effort: the agent logs and continues.
+type CacheWarmber interface {
+	Warm(ctx context.Context, req Request) error
 }

@@ -35,6 +35,24 @@ func TestCapModelToolOutputPreservesCanonicalEventOutput(t *testing.T) {
 	}
 }
 
+func TestCapToolOutputHonorsRunCap(t *testing.T) {
+	call := provider.ToolCall{ID: "call-1", Name: "canonical_output", Input: json.RawMessage(`{}`)}
+	fullOutput := strings.Repeat("details ", 1<<14)
+	large, _ := capToolOutputStatic(call, fullOutput, false, maxModelToolResultBytes)
+	small, _ := capToolOutputStatic(call, fullOutput, false, 1<<10)
+	if len(small) >= len(large) {
+		t.Fatalf("smaller cap did not shrink the provider result: small=%d large=%d", len(small), len(large))
+	}
+
+	registry := tools.NewRegistry()
+	registry.Register(canonicalOutputTool{output: fullOutput})
+	runner := New(Config{Tools: registry, MaxToolResultBytes: 1 << 10})
+	block, _ := runner.execOne(context.Background(), call)
+	if len(block.Content) >= len(fullOutput) {
+		t.Fatal("configured cap was not applied on the runner path")
+	}
+}
+
 func TestBuildRequestTrimsOldGroupsWithoutOrphaningToolResults(t *testing.T) {
 	runner := New(Config{
 		ContextWindow:      200,
@@ -49,8 +67,13 @@ func TestBuildRequestTrimsOldGroupsWithoutOrphaningToolResults(t *testing.T) {
 	}
 
 	request := runner.buildRequest(messages, nil)
-	if len(request.Messages) >= len(messages) {
-		t.Fatal("buildRequest did not trim the over-budget history")
+	// P2 stable-head trim: the over-budget oldest group is dropped behind a
+	// sentinel rather than silently dropped from the front every turn, so the
+	// provider prefix cache stays warm. The "old context" group must be gone.
+	for _, m := range request.Messages {
+		if strings.Contains(m.Text(), "old context") {
+			t.Fatal("buildRequest did not trim the over-budget old head")
+		}
 	}
 	for index, message := range request.Messages {
 		if containsBlock(message, "tool_use") {

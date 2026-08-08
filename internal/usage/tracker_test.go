@@ -55,7 +55,9 @@ func TestDayCacheHitRate(t *testing.T) {
 		{Day{Input: 100, CacheRead: 0}, 0},
 		{Day{Input: 100, CacheRead: 900}, 90},
 		{Day{Input: 0, CacheRead: 500}, 100},
-		{Day{Input: 300, CacheRead: 700, CacheWrite: 50}, 70}, // writes are not input
+		// Cache writes were part of the prompt footprint (billed at miss
+		// price), so they belong in the denominator.
+		{Day{Input: 300, CacheRead: 700, CacheWrite: 50}, 200.0 / 3.0},
 	}
 	for _, c := range cases {
 		if got := c.day.CacheHitRate(); got != c.want {

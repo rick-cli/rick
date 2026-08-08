@@ -120,23 +120,27 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 		}
 
 		cfg := agent.Config{
-			Provider:       prov,
-			Model:          modelID,
-			System:         sys,
-			SystemStable:   stableSys,
-			MaxTokens:      m.deps.Loaded.Config.MaxTokens,
-			Tools:          m.deps.Registry,
-			ToolFilter:     agent.SubagentToolFilter(toolSpec, m.toolFilter()),
-			Perms:          perms,
-			Ask:            m.makeAsker(),
-			Cwd:            m.deps.Cwd,
-			SessionID:      m.sessionID(),
-			AgentName:      kind,
-			Depth:          depth,
-			MaxTurns:       0, // unlimited; the repeated-call guard still stops loops
-			Plugins:        m.deps.Plugins,
-			Parallel:       true,
-			CacheRetention: provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
+			Provider:           prov,
+			Model:              modelID,
+			System:             sys,
+			SystemStable:       stableSys,
+			MaxTokens:          m.deps.Loaded.Config.MaxTokens,
+			Tools:              m.deps.Registry,
+			ToolFilter:         agent.SubagentToolFilter(toolSpec, m.toolFilter()),
+			Perms:              perms,
+			Ask:                m.makeAsker(),
+			Cwd:                m.deps.Cwd,
+			SessionID:          m.sessionID(),
+			AgentName:          kind,
+			Depth:              depth,
+			MaxTurns:           0, // unlimited; the repeated-call guard still stops loops
+			Plugins:            m.deps.Plugins,
+			Parallel:           true,
+			CacheRetention:     provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
+			WarmCache:          m.deps.Loaded.Config.WarmCache,
+			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
+			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
+			ArchiveDir:         agentArchiveDir(m.deps.Store),
 		}
 
 		toolCount := 0
@@ -228,7 +232,11 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			Ask: m.makeAsker(), Cwd: m.deps.Cwd, SessionID: m.sessionID(),
 			AgentName: kind, AgentID: id, Depth: depth, MaxTurns: 0, // unlimited; the repeated-call guard still stops loops
 			Plugins: m.deps.Plugins, Parallel: true, Registry: m.deps.AgentRegistry,
-			CacheRetention: provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
+			CacheRetention:     provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
+			WarmCache:          m.deps.Loaded.Config.WarmCache,
+			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
+			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
+			ArchiveDir:         agentArchiveDir(m.deps.Store),
 		}
 		if p := m.program; p != nil {
 			p.Send(subagentEventMsg{kind: kind, description: description, phase: "start"})

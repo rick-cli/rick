@@ -322,7 +322,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.13"
+var rickVersion = "0.1.14"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {
@@ -1886,25 +1886,28 @@ func (s *server) handleRun(ctx context.Context, req Request, out responseEmitter
 	}()
 
 	runner := agent.New(agent.Config{
-		Provider:       prov,
-		Model:          modelID,
-		System:         system,
-		SystemStable:   stableSystem,
-		MaxTokens:      s.loaded.Config.MaxTokens,
-		Reasoning:      reasoning,
-		Tools:          s.sessionTools(sid, cwd, model, reasoning, ask, perms, runSandbox, reg, out),
-		Perms:          perms,
-		Ask:            ask,
-		Cwd:            cwd,
-		SessionID:      sid,
-		AgentName:      agentName,
-		AgentID:        agentID,
-		Registry:       reg,
-		MaxTurns:       maxTurns,
-		Plugins:        s.plugins,
-		Parallel:       true,
-		Snapshotter:    snapshotter,
-		CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
+		Provider:           prov,
+		Model:              modelID,
+		System:             system,
+		SystemStable:       stableSystem,
+		MaxTokens:          s.loaded.Config.MaxTokens,
+		Reasoning:          reasoning,
+		Tools:              s.sessionTools(sid, cwd, model, reasoning, ask, perms, runSandbox, reg, out),
+		Perms:              perms,
+		Ask:                ask,
+		Cwd:                cwd,
+		SessionID:          sid,
+		AgentName:          agentName,
+		AgentID:            agentID,
+		Registry:           reg,
+		MaxTurns:           maxTurns,
+		Plugins:            s.plugins,
+		Parallel:           true,
+		Snapshotter:        snapshotter,
+		CacheRetention:     provider.CacheRetention(s.loaded.Config.CacheRetention),
+		WarmCache:          s.loaded.Config.WarmCache,
+		MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
+		MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
 	})
 
 	ch := make(chan agent.Event, 256)
@@ -2138,25 +2141,28 @@ func (s *server) spawnSubagent(sid, cwd string, reasoning provider.ReasoningEffo
 		toolCount := 0
 		budgetAgentName := kind + "-" + session.NewID()
 		result, runErr := agent.RunSubagent(ctx, agent.Config{
-			Provider:       prov,
-			Model:          modelID,
-			System:         sys,
-			SystemStable:   stableSys,
-			MaxTokens:      s.loaded.Config.MaxTokens,
-			Reasoning:      reasoning,
-			Tools:          sessionTools,
-			ToolFilter:     agent.SubagentToolFilter(toolSpec, nil),
-			Perms:          subPerms,
-			Ask:            ask,
-			Cwd:            cwd,
-			SessionID:      sid,
-			AgentName:      budgetAgentName,
-			Depth:          depth,
-			MaxTurns:       0, // unlimited; the repeated-call guard still stops loops
-			Plugins:        s.plugins,
-			CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
-			Parallel:       true,
-			Registry:       reg,
+			Provider:           prov,
+			Model:              modelID,
+			System:             sys,
+			SystemStable:       stableSys,
+			MaxTokens:          s.loaded.Config.MaxTokens,
+			Reasoning:          reasoning,
+			Tools:              sessionTools,
+			ToolFilter:         agent.SubagentToolFilter(toolSpec, nil),
+			Perms:              subPerms,
+			Ask:                ask,
+			Cwd:                cwd,
+			SessionID:          sid,
+			AgentName:          budgetAgentName,
+			Depth:              depth,
+			MaxTurns:           0, // unlimited; the repeated-call guard still stops loops
+			Plugins:            s.plugins,
+			CacheRetention:     provider.CacheRetention(s.loaded.Config.CacheRetention),
+			WarmCache:          s.loaded.Config.WarmCache,
+			MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
+			MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
+			Parallel:           true,
+			Registry:           reg,
 		}, prompt, func(ev agent.Event) {
 			if ev.Kind == agent.EvUsage && ev.Usage != nil && s.usage != nil {
 				_ = s.usage.Record(modelRef, ev.Usage.InputTokens, ev.Usage.OutputTokens,
@@ -2273,23 +2279,26 @@ func (s *server) spawnSwarm(sid, cwd, model string, reasoning provider.Reasoning
 			workerTools.Register(agent.TeamTool{Swarm: team})
 			system := "You are an independent teammate reporting to the lead agent. Use the team tool to confirm your assigned task, inspect messages, share only useful findings, and complete or fail the task explicitly. Do not delegate or spawn agents. Return ONLY factual findings—no narration, no 'I'll research', and no 'Let me dig deeper'. Output clean, complete results with sources when applicable."
 			cfg := agent.Config{
-				Provider:       prov,
-				Model:          modelID,
-				System:         system,
-				MaxTokens:      s.loaded.Config.MaxTokens,
-				Reasoning:      reasoning,
-				Tools:          workerTools,
-				Perms:          perms,
-				Ask:            ask,
-				Cwd:            cwd,
-				SessionID:      sid,
-				AgentName:      spec.Name,
-				AgentID:        team.ID + "/" + spec.Name,
-				Depth:          1,
-				MaxTurns:       0, // unlimited; the repeated-call guard still stops loops
-				Plugins:        s.plugins,
-				Parallel:       true,
-				CacheRetention: provider.CacheRetention(s.loaded.Config.CacheRetention),
+				Provider:           prov,
+				Model:              modelID,
+				System:             system,
+				MaxTokens:          s.loaded.Config.MaxTokens,
+				Reasoning:          reasoning,
+				Tools:              workerTools,
+				Perms:              perms,
+				Ask:                ask,
+				Cwd:                cwd,
+				SessionID:          sid,
+				AgentName:          spec.Name,
+				AgentID:            team.ID + "/" + spec.Name,
+				Depth:              1,
+				MaxTurns:           0, // unlimited; the repeated-call guard still stops loops
+				Plugins:            s.plugins,
+				Parallel:           true,
+				CacheRetention:     provider.CacheRetention(s.loaded.Config.CacheRetention),
+				WarmCache:          s.loaded.Config.WarmCache,
+				MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
+				MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
 			}
 			taskID := spec.TaskID
 			if taskID == "" {

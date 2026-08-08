@@ -100,16 +100,15 @@ type Budget struct {
 	cab       map[string]string
 	cabOrd    []string
 	stability map[int]*prefixState
-	// dedup tracks the first-occurrence position of each collapsed payload
-	// and whether it has been superseded (its original was trimmed away).
-	// Persistent across calls so a payload's replaced status never
-	// flip-flops when trimming moves its first occurrence out of the view.
-	dedup map[string]*dedupState
-}
-
-type dedupState struct {
-	firstIdx   int
-	superseded bool
+	// dedupIDs records the persistent provider-facing decision per
+	// tool_result (keyed by tool_use_id): true means the result is
+	// serialized as a self-contained pointer. Deciding once and never
+	// re-evaluating keeps every message's bytes byte-identical across turns.
+	dedupIDs map[string]bool
+	// verbatim marks payload hashes that were serialized verbatim at least
+	// once, so a repeated payload collapses to a pointer even after the
+	// original copy is trimmed from the view.
+	verbatim map[string]bool
 }
 
 type prefixState struct {
@@ -124,7 +123,8 @@ func New(opts Options) *Budget {
 		live:      map[string]string{},
 		cab:       map[string]string{},
 		stability: map[int]*prefixState{},
-		dedup:     map[string]*dedupState{},
+		dedupIDs:  map[string]bool{},
+		verbatim:  map[string]bool{},
 	}
 }
 
@@ -189,24 +189,6 @@ func (b *Budget) StoredPayload(hash string) (string, bool) {
 	return payload, ok
 }
 
-// storeCAB records a payload under its content address with LRU eviction.
-func (b *Budget) storeCAB(payload string) string {
-	hash := Hash(payload)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, exists := b.cab[hash]; exists {
-		return hash
-	}
-	b.cab[hash] = payload
-	b.cabOrd = append(b.cabOrd, hash)
-	for len(b.cabOrd) > b.opts.MaxCABPayloads {
-		oldest := b.cabOrd[0]
-		b.cabOrd = b.cabOrd[1:]
-		delete(b.cab, oldest)
-	}
-	return hash
-}
-
 // DedupResult reports what ApplyDedup changed.
 type DedupResult struct {
 	View       []provider.Message
@@ -216,20 +198,21 @@ type DedupResult struct {
 
 // ApplyDedup replaces repeated large tool_result payloads within one
 // transcript with a self-contained reference. The replacement decision is
-// persistent and content-addressed: the first occurrence of a payload is
-// replaced only once trimming has removed its original (superseded state), so
-// the provider-facing bytes never flip-flop between turns. The original
-// payload stays retrievable from the content-addressed store.
+// persistent for each tool_result (keyed by its tool_use_id) and is made
+// exactly once, the first time the result enters the view: a message's bytes
+// are decided when it is first serialized and never change afterwards — even
+// when head trimming removes the payload's original copy — so the
+// provider-facing prefix stays byte-identical across turns and the automatic
+// cache keeps hitting. The original payload stays retrievable from the
+// content-addressed store.
 func (b *Budget) ApplyDedup(messages []provider.Message) DedupResult {
 	result := DedupResult{View: append([]provider.Message(nil), messages...)}
 	if !b.Enabled() {
 		return result
 	}
 
-	// First pass: locate the first occurrence position of every large
-	// payload and mark payloads whose original was trimmed since last call.
-	first := map[string]int{}
-	position := 0
+	// Freshly appearing duplicates within this one view (doesn't cross calls).
+	seenThisView := map[string]bool{}
 	for index := range result.View {
 		for blockIndex := range result.View[index].Content {
 			block := &result.View[index].Content[blockIndex]
@@ -237,58 +220,57 @@ func (b *Budget) ApplyDedup(messages []provider.Message) DedupResult {
 				continue
 			}
 			hash := Hash(block.Content)
-			if _, ok := first[hash]; !ok {
-				first[hash] = position
-			}
-			position++
-		}
-	}
-
-	b.mu.Lock()
-	for hash, firstPos := range first {
-		state := b.dedup[hash]
-		switch {
-		case state == nil:
-			b.dedup[hash] = &dedupState{firstIdx: firstPos}
-		case firstPos > state.firstIdx:
-			// The original occurrence was trimmed; collapse this payload
-			// everywhere from now on.
-			state.firstIdx = firstPos
-			state.superseded = true
-		}
-	}
-	b.mu.Unlock()
-
-	// Second pass: replace occurrences per the persistent state.
-	seen := map[string]bool{}
-	position = 0
-	for index := range result.View {
-		for blockIndex := range result.View[index].Content {
-			block := &result.View[index].Content[blockIndex]
-			if block.Type != "tool_result" || len(block.Content) < b.opts.MinDedupBytes {
-				continue
-			}
-			hash := Hash(block.Content)
-			state := b.dedup[hash]
-			replace := state != nil && state.superseded
+			replace := b.decideDedup(block.ToolUseID, block.Content, hash, seenThisView)
 			if !replace {
-				if seen[hash] {
-					replace = true
-				} else {
-					seen[hash] = true
-					b.storeCAB(block.Content)
-				}
+				continue
 			}
-			if replace {
-				originalLen := len(block.Content)
-				block.Content = fmt.Sprintf("[duplicate payload sha256:%s; identical to an earlier tool result — retrieve via retrieve_uncompressed_context key %s]", hash, hash)
-				result.SavedBytes += originalLen - len(block.Content)
-				result.Replaced++
-			}
-			position++
+			originalLen := len(block.Content)
+			block.Content = fmt.Sprintf("[duplicate payload sha256:%s; identical to an earlier tool result — retrieve via retrieve_uncompressed_context key %s]", hash, hash)
+			result.SavedBytes += originalLen - len(block.Content)
+			result.Replaced++
 		}
 	}
 	return result
+}
+
+// decideDedup returns whether the tool result must be serialized as a
+// degenerate pointer. The decision is permanent per tool_use_id: it is made
+// on the first occurrence and never re-evaluated, so the message's bytes
+// never change between turns (the prefix cache stays warm). Id-less results
+// fall back to the per-view duplicate rule.
+func (b *Budget) decideDedup(id, content, hash string, seenThisView map[string]bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if id != "" {
+		if replaced, ok := b.dedupIDs[id]; ok {
+			return replaced
+		}
+	}
+	replace := b.verbatim[hash] || seenThisView[hash]
+	if id != "" {
+		b.dedupIDs[id] = replace
+	}
+	if !replace {
+		seenThisView[hash] = true
+		b.verbatim[hash] = true
+		b.storeCABLocked(hash, content)
+	}
+	return replace
+}
+
+// storeCABLocked records a payload under its content address; callers must
+// hold b.mu.
+func (b *Budget) storeCABLocked(hash, payload string) {
+	if _, exists := b.cab[hash]; exists {
+		return
+	}
+	b.cab[hash] = payload
+	b.cabOrd = append(b.cabOrd, hash)
+	for len(b.cabOrd) > b.opts.MaxCABPayloads {
+		oldest := b.cabOrd[0]
+		b.cabOrd = b.cabOrd[1:]
+		delete(b.cab, oldest)
+	}
 }
 
 // Boundary selection ------------------------------------------------
@@ -496,7 +478,7 @@ func (b *Budget) CompressLive(key, text string) (string, bool) {
 	}
 	compressed := minifyJSON(text)
 	if compressed == text {
-		compressed = capLive(text, b.opts.LiveZoneCapBytes)
+		compressed = capLive(key, text, b.opts.LiveZoneCapBytes)
 	}
 	changed := compressed != text
 	if changed {
@@ -535,7 +517,10 @@ func maskJSON(value any, depth int) string {
 		return fmt.Sprintf("%v", value)
 	case string:
 		if len(value) > 160 {
-			truncated, _ := json.Marshal(value[:157])
+			// Truncate on a rune boundary so multi-byte characters are never
+			// sliced in half; json.Marshal would otherwise escape the broken
+			// tail as a U+FFFD replacement char and corrupt the value.
+			truncated, _ := json.Marshal(cutRunes(value, 157))
 			return string(truncated) + "…"
 		}
 		encoded, _ := json.Marshal(value)
@@ -581,12 +566,12 @@ func maskJSON(value any, depth int) string {
 	return "…"
 }
 
-func capLive(text string, limit int) string {
+func capLive(key, text string, limit int) string {
 	if len(text) <= limit {
 		return text
 	}
 	omitted := len(text) - limit
-	marker := fmt.Sprintf("\n… <live-zone compressed; %d bytes omitted; retrieve original via retrieve_uncompressed_context>", omitted)
+	marker := fmt.Sprintf("\n… <live-zone compressed; %d bytes omitted; retrieve original via retrieve_uncompressed_context key %s>", omitted, key)
 	if len(marker) >= limit {
 		return marker
 	}
@@ -617,4 +602,20 @@ func safeCut(text string, limit int, toEnd bool) string {
 		start++
 	}
 	return text[start:]
+}
+
+// cutRunes returns the longest rune-aligned prefix of text no longer than
+// limit bytes, walking back from the byte cut so a multi-byte character is
+// never sliced in half.
+func cutRunes(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if limit >= len(text) {
+		return text
+	}
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+	return text[:limit]
 }

@@ -1,11 +1,50 @@
 # Changelog
 
+## Unreleased
+
+#### Performance (prefix-cache stability)
+
+- **Phase C.2 — deep-reasoning echo cap is now a true one-shot head rewrite.**
+  `cache_max_reasoning_turns` (> 0, opt-in) no longer strips reasoning on the
+  wire with a moving window that re-billed the tail every turn; the agent
+  rewrites the message list once (keeps only the newest N reasoning turns),
+  byte-pins the cut, and the wire then retains everything — so the prefix
+  changes exactly once and afterwards only grows.
+- **Per-request reasoning telemetry:** each `requests[]` row now records
+  `reasoning_tokens` (the client-side size of the reasoning echo sent with
+  that request), so the deep-reasoning fresh-tail cost is measurable per
+  request for tuning `cache_max_reasoning_turns`.
+- The first (small) user turn is now pinned verbatim beside the head-trim
+  sentinel, so the original task/goal survives head-trimming and stays visible
+  to the model; the fold boundary keeps one stable position per session
+  (mirrors reasonix's pinned-first-turn).
+- Messages dropped by head-trimming are archived to `<session>/archive/*.jsonl`
+  (one JSONL record per message) so folded originals stay traceable without
+  ever touching the provider-facing view bytes.
+- The distillation transcript now folds oversized `tool_use` inputs into a
+  deterministic key+size summary instead of re-broadcasting the full sub-task
+  prompt back into the session summary.
+- New `scripts/check-cache-guard.sh` + `cache-impact` workflow: a PR touching
+  cache-sensitive paths must declare `Cache-impact:` / `Cache-guard:` (plus
+  `System-prompt-review:` when the byte-stable prefix can change), mirroring
+  reasonix's cache-impact gate.
+- New byte-stability tests: identical builds must produce byte-identical
+  system prompts and tool-schema JSON, and the environment block must not
+  embed a rollover date.
+
 ## v0.1.13 — 2026-08-07
 
-### Performance
+#### Performance
 
+- Deduplication decisions are now permanent per tool result (keyed by `tool_use_id`): a message's provider-facing bytes are decided once and never re-evaluated, so head-trimming or repeated payloads can no longer rewrite an already-sent message — the mid-prefix rewrites that caused full prompt-cache resets mid-session are gone.
+- The system prompt (environment + Repo map + tool manifest) is frozen after the first request of each run, so it can never drift between turns and cold-start the prefix.
+- Compaction (user-triggered and fallback) reuses the previous summary's message position instead of moving it, keeping the cached prefix byte-identical across repeated compactions.
+- The session-start warm request now primes only the stable system/tools head (plus one prologue message) instead of the whole transcript — byte-exact for the primed prefix at a handful of tokens instead of the full history.
+- `cache_max_tool_result_bytes` default lowered to 16 KiB (from 32 KiB) to shrink per-turn fresh tails further.
+- New per-request `divergence` telemetry: the agent reports where the provider-facing prefix first stopped matching the previous turn and the inferred cause (`dedup`, `head-trim`, `compact-summary`, `distill`, `system-prompt`, `unknown`), persisted in each session's `requests[]` row and surfaced in the cache-miss notices.
 - Anthropic `cache_retention: "long"` now sends the `extended-cache-ttl` beta header, so 1h prompt-cache TTLs are honoured instead of silently degrading to the 5-minute default and re-writing the cache every turn.
 - DeepSeek-line providers (opencode-zen, deepseek, openrouter) echo reasoning for every assistant turn instead of stripping to the newest window. The serialized prompt is append-only, so the provider's automatic prefix cache hits the whole history each turn instead of re-billing the tail on every prefix change.
+- New `cache_max_tool_result_bytes` knob bounds each tool_result payload sent to the model (default 16 KiB), keeping the per-turn fresh tail small so tool-heavy turns stay within the warm prefix.
 - Disk-cache writes receive a deterministic monotonic modification order, so rapid Windows writes cannot evict a newer entry when filesystem timestamps collide.
 
 ### Reliability

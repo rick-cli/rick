@@ -123,6 +123,45 @@ func TestOpenCodeZenPreservesReasoningContent(t *testing.T) {
 	}
 }
 
+func TestOpenCodeZenThinkingOnlyAssistantGetsContent(t *testing.T) {
+	// A turn that produced only thinking (e.g. a truncated "continue"
+	// exchange) must still serialize with a non-empty "content" so
+	// OpenAI-compatible endpoints don't reject the assistant message with
+	// "content or tool_calls must be set". An empty assistant block would
+	// fail the request and force an uncached retry, dropping the provider
+	// prefix-cache hit rate for the whole session.
+	thinkingOnly := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{
+		Type: "thinking", Text: "deep reasoning with no text and no tool call",
+	}}}
+	wire := toWireWithReasoning("", []provider.Message{thinkingOnly}, true, false)
+	if len(wire) != 1 {
+		t.Fatalf("expected one assistant message, got %d", len(wire))
+	}
+	wm := wire[0]
+	if wm.Content == nil {
+		t.Fatalf("assistant message has nil content: %#v", wm)
+	}
+	if len(wm.ToolCalls) != 0 {
+		t.Fatalf("unexpected tool calls: %#v", wm.ToolCalls)
+	}
+	if got, ok := wm.Content.(string); !ok || got == "" {
+		t.Fatalf("assistant content is empty (%T %#v); want reasoning echoed as content", wm.Content, wm.Content)
+	}
+	if wm.ReasoningContent == nil || *wm.ReasoningContent == "" {
+		t.Fatalf("expected reasoning_content preserved")
+	}
+	encoded, err := json.Marshal(wm)
+	if err != nil {
+		t.Fatalf("encode assistant message: %v", err)
+	}
+	if !strings.Contains(string(encoded), "deep reasoning") {
+		t.Fatalf("serialized assistant message lost reasoning text: %s", encoded)
+	}
+	if strings.Contains(string(encoded), `"tool_calls"`) {
+		t.Fatalf("serialized assistant message carries tool_calls on a thinking-only turn: %s", encoded)
+	}
+}
+
 func TestOpenCodeZenKeepsEmptyReasoningFieldOnToolTurns(t *testing.T) {
 	toolTurn := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{
 		Type: "tool_use", ID: "call-1", Name: "read", Input: json.RawMessage(`{"path":"a"}`),
@@ -405,4 +444,71 @@ func TestOpenCodeZenRequestRetainsAllReasoning(t *testing.T) {
 		}
 	}
 	t.Fatalf("opencode-zen request dropped older reasoning; sent: %v", request["messages"])
+}
+
+// TestOpenCodeZenCapsReasoningEcho verifies the P3 knob: with a positive
+// MaxReasoningTurns, DeepSeek-line providers keep only the most recent turn's
+// reasoning and strip older blocks — shrinking the prompt at the cost of one
+// deliberate prefix rewrite. Default (0) keeps everything append-only, which is
+// why this cap is opt-in.
+func TestOpenCodeZenCapsReasoningEcho(t *testing.T) {
+	old := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "old reasoning"}, {Type: "text", Text: "old answer"},
+	}}
+	recent := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "recent reasoning"},
+		{Type: "tool_use", ID: "call-1", Name: "read", Input: json.RawMessage(`{"path":"a"}`)},
+	}}
+	request := reasoningEchoClientCapped(t, "opencode-zen", "deepseek-v4-flash-free",
+		[]provider.Message{old, provider.UserText("turn 2"), recent}, provider.ReasoningHigh, 1)
+
+	sawOld := false
+	sawRecent := false
+	for _, raw := range request["messages"].([]any) {
+		msg, ok := raw.(map[string]any)
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		if reasoning, _ := msg["reasoning_content"].(string); reasoning == "old reasoning" {
+			sawOld = true
+		} else if reasoning == "recent reasoning" {
+			sawRecent = true
+		}
+		if sawOld && sawRecent {
+			break
+		}
+	}
+	if sawOld {
+		t.Fatalf("MaxReasoningTurns=1 retained older reasoning; sent: %v", request["messages"])
+	}
+	if !sawRecent {
+		t.Fatalf("MaxReasoningTurns=1 dropped the most recent reasoning; sent: %v", request["messages"])
+	}
+}
+
+// reasoningEchoClientCapped is like reasoningEchoClient but fixes a
+// MaxReasoningTurns cap on the sent request.
+func reasoningEchoClientCapped(t *testing.T, providerID, model string, messages []provider.Message, level provider.ReasoningEffort, maxTurns int) map[string]any {
+	t.Helper()
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &request)
+		w.Header().Set("content-type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := New(providerID, "test-key", server.URL)
+	client.HTTP = server.Client()
+	events := make(chan provider.Event)
+	go client.Stream(context.Background(), provider.Request{
+		Model:             model,
+		Messages:          messages,
+		Reasoning:         level,
+		MaxReasoningTurns: maxTurns,
+	}, events)
+	for range events {
+	}
+	return request
 }

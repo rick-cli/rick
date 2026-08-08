@@ -41,11 +41,39 @@ type Session struct {
 	EnvGit    string     `json:"env_git,omitempty"`
 	Snapshots []Snapshot `json:"snapshots,omitempty"`
 	Usage     Usage      `json:"usage"`
+	// Requests records provider per-request token accounting (one entry per
+	// provider request / EvUsage event), not just the cumulative totals. This
+	// makes per-turn cache-hit/miss behavior observable so cache changes
+	// (warm, retention, reasoning caps) can be measured request-by-request.
+	Requests []RequestUsage `json:"requests,omitempty"`
 	// ContextUsed is the provider-facing prompt size from the latest turn. It is
 	// intentionally separate from cumulative Usage so resumed clients can
 	// restore an accurate context gauge.
 	ContextUsed  int               `json:"context_used,omitempty"`
 	Optimization OptimizationUsage `json:"optimization,omitempty"`
+}
+
+// RequestUsage is one request's provider-reported token accounting.
+type RequestUsage struct {
+	// Index is the chronological request number within the session (1-based).
+	Index int `json:"index"`
+	// Agent labels which sub-run produced the request ("" = primary session).
+	Agent string `json:"agent,omitempty"`
+	// Input, Output, CacheRead, CacheWrite mirror provider.Usage for this
+	// single request.
+	Input      int `json:"input"`
+	Output     int `json:"output"`
+	CacheRead  int `json:"cache_read"`
+	CacheWrite int `json:"cache_write"`
+	// Divergence, when set, is the prefix-divergence diagnostics for this
+	// request ("message@7;dedup"): where the provider-facing bytes stopped
+	// matching the previous turn and the inferred cause.
+	Divergence string `json:"divergence,omitempty"`
+	// ReasoningTokens is the client-side token size of the deep-reasoning
+	// echo sent with this request (all `thinking` blocks in the message
+	// view). It makes the reasoning-echo fresh-tail cost measurable per
+	// request so `cache_max_reasoning_turns` can be tuned from real data.
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // OptimizationUsage accumulates exact local measurements for provider-facing

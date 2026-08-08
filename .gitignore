@@ -15,3 +15,11 @@ dist/
 
 # Research scratch (temporary clones for reference study)
 _research/
+
+# Deploy backups and scratch artifacts
+rick.before-*
+zz_*.go.bak
+*.test.exe
+
+# Benchmark run logs and throwaway analysis scripts
+tmp/

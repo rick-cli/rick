@@ -293,6 +293,20 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 	}
 
 	b.WriteString("\n" + s.Faint.Render("usage saved to: "+m.deps.Usage.Path()))
+
+	// Active-session cache health: how many times the provider dropped the
+	// prefix cache (idle-gap TTL evictions) plus the current cache-read
+	// shortfall, mirroring the Runner's P1b miss detector.
+	if m.cacheMissCount > 0 || m.cacheMissTokens > 0 {
+		b.WriteString(s.Faint.Render(fmt.Sprintf(
+			"\nsession cache: %d evictions, ~%s re-billed (last miss: %s)",
+			m.cacheMissCount, humanTokens(m.cacheMissTokens), m.cacheMissReason(true))))
+	} else if m.cachePrevPrompt > 0 {
+		b.WriteString(s.Faint.Render(fmt.Sprintf("\nsession cache: no evictions — prefix stayed warm")))
+	}
+	if m.pendingDivergence != "" {
+		b.WriteString(s.Faint.Render(fmt.Sprintf("; prefix change: %s", m.pendingDivergence)))
+	}
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: b.String(), Time: time.Now()})
 	return m, nil
 }

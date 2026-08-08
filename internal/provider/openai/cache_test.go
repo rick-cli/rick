@@ -3,10 +3,13 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"rick/internal/provider"
@@ -79,6 +82,74 @@ func TestNoneRetentionOmitsCacheFields(t *testing.T) {
 	}
 	if decoded.PromptCacheKey != "" || decoded.PromptCacheRetention != "" {
 		t.Fatalf("none retention leaked cache fields: key=%q retention=%q", decoded.PromptCacheKey, decoded.PromptCacheRetention)
+	}
+}
+
+func TestWarmSendsNonStreamingPrefixAndHonorsSession(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-session-affinity") != "sess-1" {
+			t.Errorf("missing session-affinity header: %q", r.Header.Get("x-session-affinity"))
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &request)
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	client := New("openai", "test-key", server.URL)
+	client.HTTP = server.Client()
+
+	var cw provider.CacheWarmber = client // compile-time check
+	err := cw.Warm(context.Background(), provider.Request{
+		Model:          "gpt-5",
+		System:         "stable instructions",
+		SystemStable:   "stable instructions",
+		SessionID:      "sess-1",
+		CacheRetention: provider.CacheRetentionLong,
+		Messages:       []provider.Message{provider.UserText("hello")},
+		MaxTokens:      4096,
+	})
+	if err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if request["model"] != "gpt-5" {
+		t.Fatalf("model = %v", request["model"])
+	}
+	if request["stream"] != false {
+		t.Fatalf("stream = %v, want false", request["stream"])
+	}
+	if got := request["max_completion_tokens"]; got != float64(1) {
+		t.Fatalf("max_completion_tokens = %v, want 1", got)
+	}
+	retention, _ := request["prompt_cache_retention"].(string)
+	if retention != "24h" {
+		t.Fatalf("prompt_cache_retention = %q, want 24h (long retention warm)", retention)
+	}
+	messages, ok := request["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("messages = %#v", request["messages"])
+	}
+}
+
+func TestWarmSurfacesHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	client := New("openai", "test-key", server.URL)
+	client.HTTP = server.Client()
+	err := client.Warm(context.Background(), provider.Request{
+		Model:    "gpt-5",
+		Messages: []provider.Message{provider.UserText("hello")},
+	})
+	if err == nil {
+		t.Fatal("warm returned nil error for a 502 response")
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Fatalf("error did not mention status: %v", err)
 	}
 }
 
@@ -198,3 +269,166 @@ func TestStableSystemPrefixIsSentBeforeVolatileTail(t *testing.T) {
 		t.Fatalf("volatile message = %#v", wire[1])
 	}
 }
+
+// TestWarmMatchesStreamReasoningBytes verifies that Warm and Stream produce a
+// byte-identical prior-turn transcript for a reasoning model, so the warm
+// actually primes the prefix the real append-only stream will send. Before
+// this fix Warm stripped reasoning and primed different bytes than the stream,
+// so the provider's automatic prefix cache never hit on reasoning turns.
+func TestWarmMatchesStreamReasoningBytes(t *testing.T) {
+	msg := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "Let me think carefully about this solution."},
+		{Type: "text", Text: "Here is my reasoning"},
+	}}
+	req := provider.Request{
+		Model:             "gpt-5",
+		Messages:          []provider.Message{provider.UserText("hi"), msg},
+		MaxReasoningTurns: 0,
+	}
+
+	preserve, retain := func() (bool, bool) {
+		_, p, r := (&Client{ID: "opencode-zen"}).wireReasoning(req)
+		return p, r
+	}()
+	if !preserve {
+		t.Fatal("expected reasoning to be preserved for a model with thinking blocks")
+	}
+	if !retain {
+		t.Fatal("expected all reasoning retained for append-only prefix")
+	}
+
+	warmWire := toWireWithReasoning(req.System, req.Messages, preserve, retain)
+	streamWire := toWireWithReasoning(req.System, req.Messages, preserve, retain)
+	if serialized(warmWire) != serialized(streamWire) {
+		t.Fatal("warm and stream serialized different bytes")
+	}
+
+	// And the reasoning must actually be echoed: the thinking text must live in
+	// a ReasoningContent field (non-empty) rather than being dropped.
+	found := false
+	for _, wm := range streamWire {
+		if wm.Role == "assistant" && wm.ReasoningContent != nil &&
+			strings.Contains(*wm.ReasoningContent, "Let me think") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("reasoning_content was dropped; warm would prime empty reasoning")
+	}
+}
+
+func serialized(w []wireMessage) string {
+	b, _ := json.Marshal(w)
+	return string(b)
+}
+
+// TestDeepSeekWireUsesMaxTokens verifies that DeepSeek-line endpoints
+// (OpenCode Zen/Go) send the output budget as max_tokens rather than OpenAI's
+// max_completion_tokens, and that the OpenAI-only retention hint is omitted on
+// the warm so the automatic prefix cache needs no client field.
+func TestDeepSeekWireUsesMaxTokens(t *testing.T) {
+	var warmBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &warmBody)
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer server.Close()
+
+	client := New("opencode-zen", "test-key", server.URL)
+	client.HTTP = server.Client()
+
+	var cw provider.CacheWarmber = client
+	err := cw.Warm(context.Background(), provider.Request{
+		Model:          "deepseek-v4-flash-free",
+		System:         "stable",
+		CacheRetention: provider.CacheRetentionLong,
+		Messages:       []provider.Message{provider.UserText("hello")},
+		MaxTokens:      4096,
+	})
+	if err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if _, ok := warmBody["max_completion_tokens"]; ok {
+		t.Fatal("DeepSeek-line endpoint got max_completion_tokens")
+	}
+	if got := warmBody["max_tokens"]; got != float64(1) {
+		t.Fatalf("warm max_tokens = %v, want 1", got)
+	}
+	if _, ok := warmBody["prompt_cache_retention"]; ok {
+		t.Fatal("warm sent prompt_cache_retention to a DeepSeek-line endpoint")
+	}
+	if _, ok := warmBody["prompt_cache_key"]; ok {
+		t.Fatal("warm sent prompt_cache_key to a DeepSeek-line endpoint")
+	}
+}
+
+// flakyRoundTripper fails the first n requests with a transient transport
+// error (a dropped keep-alive connection) and serves the rest normally, so a
+// retrying client must transparently recover.
+type flakyRoundTripper struct {
+	base  http.RoundTripper
+	fails int
+	mu    sync.Mutex
+}
+
+func (f *flakyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	if f.fails > 0 {
+		f.fails--
+		f.mu.Unlock()
+		return nil, &net.OpError{Op: "read", Net: "tcp", Err: io.ErrUnexpectedEOF}
+	}
+	f.mu.Unlock()
+	return f.base.RoundTrip(req)
+}
+
+// TestWarmRetriesTransientEOF verifies that a request hitting "unexpected EOF"
+// (as OpenCode Zen intermittently produces on keep-alive reuse) is retried and
+// succeeds on the next attempt instead of aborting the turn.
+func TestWarmRetriesTransientEOF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer server.Close()
+
+	client := New("opencode-zen", "test-key", server.URL)
+	client.HTTP.Transport = &flakyRoundTripper{
+		base:  server.Client().Transport,
+		fails: 1,
+	}
+
+	var cw provider.CacheWarmber = client
+	err := cw.Warm(context.Background(), provider.Request{
+		Model:    "deepseek-v4-flash-free",
+		System:   "stable",
+		Messages: []provider.Message{provider.UserText("hello")},
+	})
+	if err != nil {
+		t.Fatalf("warm after a transient EOF retry: %v", err)
+	}
+}
+
+// TestRetryableTransportErrorClassification pins the retry predicate down.
+func TestRetryableTransportErrorClassification(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{&net.OpError{Op: "read", Net: "tcp", Err: io.ErrUnexpectedEOF}, true},
+		{fmt.Errorf("client: Post %q: unexpected EOF", "x"), true},
+		{fnError(context.Canceled), false},
+		{fnError(context.DeadlineExceeded), false},
+		{fmt.Errorf("some other oops"), false},
+	}
+	for _, c := range cases {
+		if got := retryableTransportError(c.err); got != c.want {
+			t.Fatalf("retryableTransportError(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
+
+func fnError(e error) error { return e }

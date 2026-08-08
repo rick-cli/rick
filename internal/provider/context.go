@@ -98,6 +98,10 @@ func KnownContextWindow(modelID string) int {
 		return 1_048_576
 
 	// Chinese labs.
+	case strings.HasPrefix(id, "deepseek-v4-flash-free"):
+		return 200_000
+	case strings.HasPrefix(id, "deepseek-v4-flash"), strings.HasPrefix(id, "deepseek-v4-pro"):
+		return 1_000_000
 	case strings.Contains(id, "deepseek"):
 		return 128_000
 	case strings.Contains(id, "kimi"), strings.Contains(id, "moonshot"):

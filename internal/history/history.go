@@ -56,6 +56,44 @@ func Retain(messages []provider.Message, maxTokens int, encoding tokens.Encoding
 	return retained, start
 }
 
+// DropFirstGroups returns the messages without their first n logical groups (a
+// tool_use/tool_result pair counts as one) while preserving every surviving
+// message's bytes. It backs the agent's stable-head trimming: once the head is
+// dropped we never drop again, so a provider view only ever grows at the tail
+// and the prompt-cache prefix stays warm across requests.
+func DropFirstGroups(messages []provider.Message, n int, encoding tokens.Encoding) []provider.Message {
+	if n <= 0 {
+		return append([]provider.Message(nil), messages...)
+	}
+	groups := logicalGroups(messages, encoding)
+	if n > len(groups) {
+		n = len(groups)
+	}
+	out := make([]provider.Message, 0, len(messages))
+	for _, item := range groups[n:] {
+		out = append(out, item.messages...)
+	}
+	return out
+}
+
+// TakeFirstGroups returns the messages that make up the first n logical groups
+// (the same groups Retain/DropFirstGroups would omit); n is clamped to the
+// number of groups. It backs archiving so trimmed originals stay traceable.
+func TakeFirstGroups(messages []provider.Message, n int, encoding tokens.Encoding) []provider.Message {
+	if n <= 0 {
+		return nil
+	}
+	groups := logicalGroups(messages, encoding)
+	if n > len(groups) {
+		n = len(groups)
+	}
+	out := make([]provider.Message, 0, n)
+	for _, item := range groups[:n] {
+		out = append(out, item.messages...)
+	}
+	return out
+}
+
 func logicalGroups(messages []provider.Message, encoding tokens.Encoding) []group {
 	groups := make([]group, 0, len(messages))
 	for index := 0; index < len(messages); index++ {

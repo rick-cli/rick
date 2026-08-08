@@ -103,6 +103,9 @@ type Model struct {
 	agentName string
 	agentID   string
 	modelID   string
+	// pendingDivergence carries the prefix-divergence diagnostics from an
+	// agent event until the next usage row arrives (they precede EvUsage).
+	pendingDivergence string
 
 	// repoMapOnce/repoMapBlock build the RepoMap once per session so every
 	// turn sends a byte-identical system suffix (provider cache stays warm).
@@ -137,6 +140,9 @@ type Model struct {
 	cacheMissCount  int
 	cacheMissStreak int
 	cacheLastUsage  time.Time
+	// requestSeq counts provider requests in the primary session so the
+	// persisted per-request telemetry has stable chronological indices.
+	requestSeq int
 
 	// streaming
 	running     bool
@@ -867,6 +873,12 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.deps.Budget != nil {
 			insert = lastBoundaryBefore(m.history, removed, m.deps.Budget.ChooseBoundaries(m.history))
 		}
+		// Reuse the previous summary pair's position so repeated compactions
+		// keep the summary at the same bytes; a moving summary would rewrite
+		// the canonical prefix and invalidate the provider prefix cache.
+		if existing := summaryPairAt(m.history); existing >= 0 && existing < removed {
+			insert = existing
+		}
 		newHistory := append([]provider.Message{}, m.history[:insert]...)
 		newHistory = append(newHistory,
 			provider.UserText("Summary of the conversation so far:\n\n"+summary),
@@ -1116,8 +1128,14 @@ func (m *Model) trimTranscript() {
 	if len(m.msgs) <= maxTranscriptMessages {
 		return
 	}
-	remove := len(m.msgs) - maxTranscriptMessages
-	m.msgs = append([]ChatMsg{{Kind: MsgSystem, Text: fmt.Sprintf("... %d earlier messages omitted to limit RAM", remove), Time: time.Now()}}, m.msgs[remove:]...)
+	// Omit enough older messages that the replacement (system note + tail)
+	// lands at or under the cap. Trimming only down to 501 would leave the
+	// transcript permanently over budget: every refresh — the 25 Hz stream
+	// drain and the 90 ms spinner — would re-enter trimTranscript and
+	// invalidate the whole render cache, forcing a full re-render of every
+	// block per frame as the session grows.
+	remove := len(m.msgs) - maxTranscriptMessages + 1
+	m.msgs = append([]ChatMsg{{Kind: MsgSystem, Text: fmt.Sprintf("... %d earlier messages omitted to fit the transcript", remove), Time: time.Now()}}, m.msgs[remove:]...)
 	m.pendingTools = make(map[string]int)
 	for i, msg := range m.msgs {
 		if msg.Kind == MsgTool && msg.CallID != "" && msg.ToolRunning {

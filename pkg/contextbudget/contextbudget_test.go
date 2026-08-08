@@ -1,8 +1,10 @@
 package contextbudget
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"rick/internal/provider"
 )
@@ -204,7 +206,131 @@ func TestCompressLiveStoresNonJSONViaCap(t *testing.T) {
 	if !strings.Contains(compressed, "retrieve_uncompressed_context") {
 		t.Fatal("cap marker missing from output")
 	}
+	// The marker must name the retrieval key so the model can round-trip the
+	// payload through retrieve_uncompressed_context instead of guessing it.
+	if !strings.Contains(compressed, "key call-7") {
+		t.Fatalf("cap marker omits the retrieval key: %q", compressed)
+	}
 	if original, ok := budget.LiveOriginal("call-7"); !ok || original != payload {
 		t.Fatal("capped original not retrievable")
+	}
+}
+
+// TestMaskJSONTruncationStaysRuneAligned locks the live-zone JSON mask: a
+// long string value must be cut on a rune boundary. Byte-slicing mid-rune
+// used to make json.Marshal emit a literal U+FFFD replacement char, so the
+// model received corrupted JSON instead of a clean truncation.
+func TestMaskJSONTruncationStaysRuneAligned(t *testing.T) {
+	budget := New(Options{})
+	// 155 ASCII bytes followed by two 3-byte runes: byte 157 lands inside the
+	// first "€", which previously produced a "\ufffd" escape in the mask.
+	prefix := strings.Repeat("a", 155)
+	payload := `{"msg":"` + prefix + "€€" + `"}`
+	compressed, changed := budget.CompressLive("call-rune", payload)
+	if !changed {
+		t.Fatal("expected JSON mask to change the payload")
+	}
+	if strings.Contains(compressed, "ufffd") {
+		t.Fatalf("mask truncated mid-rune (replacement char present): %q", compressed)
+	}
+	if !utf8.ValidString(compressed) {
+		t.Fatalf("mask output is not valid UTF-8: %q", compressed)
+	}
+	// The truncation point must still be a rune boundary.
+	if cut := strings.Index(compressed, "…"); cut >= 0 {
+		if !utf8.ValidString(compressed[:cut]) {
+			t.Fatalf("mask cut is not rune-aligned: %q", compressed[:cut])
+		}
+	}
+}
+
+// TestCutRunesNeverSplitsARune is the direct helper-level check: cutting any
+// multibyte string at a byte limit must not produce invalid UTF-8.
+func TestCutRunesNeverSplitsARune(t *testing.T) {
+	text := strings.Repeat("a", 155) + "€€"
+	for limit := 0; limit <= len(text); limit++ {
+		cut := cutRunes(text, limit)
+		if !utf8.ValidString(cut) {
+			t.Fatalf("cutRunes(%d) produced invalid UTF-8: %q", limit, cut)
+		}
+		if len(cut) > limit {
+			t.Fatalf("cutRunes(%d) exceeded limit: %d bytes", limit, len(cut))
+		}
+	}
+}
+
+// TestDedupDecisionIsPerResultAndNeverFlipped locks the B-phase invariant:
+// a tool result's bytes are decided once, by tool_use_id, and never change —
+// even when duplication trimming moves the payload's copy out of the view and
+// a brand-new occurrence of the same payload appears later.
+func TestDedupDecisionIsPermanentPerToolUseID(t *testing.T) {
+	budget := New(Options{})
+	payload := strings.Repeat("identical large payload ", 200)
+
+	toolPair := func(id string) []provider.Message {
+		return []provider.Message{
+			{Role: provider.RoleAssistant, Content: []provider.ContentBlock{{Type: "tool_use", ID: id, Name: "bash"}}},
+			{Role: provider.RoleUser, Content: []provider.ContentBlock{{Type: "tool_result", ToolUseID: id, Content: payload}}},
+		}
+	}
+
+	// Turn 1: c1 verbatim, c2 (same payload) collapsed to a pointer.
+	turn1 := append([]provider.Message{provider.UserText("go")}, toolPair("c1")...)
+	turn1 = append(turn1, toolPair("c2")...)
+	view1 := budget.ApplyDedup(turn1).View
+	// view1 = [user, c1 use, c1 result, c2 use, c2 result]
+	if !strings.Contains(view1[2].Content[0].Content, payload) {
+		t.Fatal("first result was collapsed while its original was present")
+	}
+	if !strings.Contains(view1[4].Content[0].Content, "duplicate payload sha256:") {
+		t.Fatal("second result was not collapsed")
+	}
+
+	// Turn 2: the head (the verbatim copy) is trimmed; the surviving pointer
+	// stays a pointer (bytes must not change).
+	turn2 := turn1[3:] // drop the user message and the c1 tool pair
+	view2 := budget.ApplyDedup(turn2).View
+	// view2 = [c2 use, c2 result]
+	if !strings.Contains(view2[1].Content[0].Content, "duplicate payload sha256:") {
+		t.Fatal("surviving result flipped back to the full payload")
+	}
+
+	// Turn 3: the same payload recurs under a new id; the new result must be
+	// collapsed too (the payload has already been sent to the provider), and
+	// the previously sent result's bytes must be untouched.
+	turn3 := append(append([]provider.Message{}, turn2...), toolPair("c3")...)
+	view3 := budget.ApplyDedup(turn3).View
+	if view3[1].Content[0].Content != view2[1].Content[0].Content {
+		t.Fatal("previously sent result changed bytes on a later turn")
+	}
+	if !strings.Contains(view3[3].Content[0].Content, "duplicate payload sha256:") {
+		t.Fatal("new occurrence of a seen payload was not collapsed")
+	}
+}
+
+// TestCompressLiveIsDeterministicAcrossRounds ensures the live-zone pass
+// yields byte-identical output on every application, so a payload captured in
+// one turn serializes the same on save/resume and re-stream.
+func TestCompressLiveIsDeterministicAcrossRounds(t *testing.T) {
+	budget := New(Options{})
+	long := strings.Repeat("some very long field value ", 20) // > 160 chars
+	row := func(i int) string { return fmt.Sprintf("  {\"id\": %d, \"note\": \"%s\"}", i, long) }
+	rows := make([]string, 12)
+	for i := range rows {
+		rows[i] = row(i)
+	}
+	payload := "{\n \"rows\": [\n" + strings.Join(rows, ",\n") + "\n ]\n}"
+	first, changed1 := budget.CompressLive("call-1", payload)
+	if !changed1 {
+		t.Fatal("expected compression to change the payload")
+	}
+	if second, _ := budget.CompressLive("call-1", payload); second != first {
+		t.Fatal("CompressLive produced different bytes on a second pass")
+	}
+	// A fresh budget must give identical bytes for identical input (no
+	// per-instance state affects the output).
+	fresh := New(Options{})
+	if again, _ := fresh.CompressLive("call-1", payload); again != first {
+		t.Fatal("CompressLive output differs between budget instances")
 	}
 }

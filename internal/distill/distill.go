@@ -45,16 +45,16 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.MaxMessages <= 0 {
-		o.MaxMessages = 48
+		o.MaxMessages = 32
 	}
 	if o.MaxSummaryBytes <= 0 {
 		o.MaxSummaryBytes = 2 << 10
 	}
 	if o.MinHistoryTokens <= 0 {
-		o.MinHistoryTokens = 4000
+		o.MinHistoryTokens = 2000
 	}
 	if o.MinRatio <= 0 {
-		o.MinRatio = 0.5
+		o.MinRatio = 0.4
 	}
 	if o.MinLiveRatio <= 0 {
 		o.MinLiveRatio = 0.5
@@ -63,10 +63,10 @@ func (o Options) withDefaults() Options {
 		o.MinCacheBreakBytes = 2 << 10
 	}
 	if o.LiveZoneTurns <= 0 {
-		o.LiveZoneTurns = 2
+		o.LiveZoneTurns = 1
 	}
 	if o.DistillRatio <= 0 {
-		o.DistillRatio = 0.5
+		o.DistillRatio = 0.4
 	}
 	return o
 }

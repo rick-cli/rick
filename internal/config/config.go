@@ -277,6 +277,20 @@ type Config struct {
 	// CacheRetention is the prompt-cache retention policy for all requests:
 	// "" (default/short), "long" (extended TTL), or "none" (caching off).
 	CacheRetention string `json:"cache_retention,omitempty"`
+	// WarmCache, when true, submits a small non-blocking request at session
+	// start so the provider populates its prompt cache for the frozen
+	// system+tools prefix before the first real turn. This lifts cache-hit
+	// ratios for short sessions. Defaults to off until its cost is measured.
+	WarmCache bool `json:"cache_warm,omitempty"`
+	// CacheMaxReasoningTurns caps how many prior turns' reasoning blocks are
+	// echoed to DeepSeek-line providers as reasoning_content (0 = keep all).
+	// Keeps the serialized prefix byte-identical by default; a positive value
+	// shrinks the prompt at the cost of one deliberate cache invalidation.
+	CacheMaxReasoningTurns int `json:"cache_max_reasoning_turns,omitempty"`
+	// CacheMaxToolResultBytes caps each tool_result payload sent to the model
+	// (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the
+	// provider prompt-cache hit ratio high on tool-heavy turns.
+	CacheMaxToolResultBytes int `json:"cache_max_tool_result_bytes,omitempty"`
 	// ContextBudget exposes the session context manager knobs.
 	ContextBudget *ContextBudgetConfig `json:"context_budget,omitempty"`
 }
@@ -378,6 +392,12 @@ func Defaults() (Config, TUI) {
 		SubagentDepth:    &depth,
 		BackgroundNotify: true,
 		MaxBackground:    8,
+		// Cache features are on by default: prompt caching keeps the provider
+		// prefix warm across idle gaps ("long" retention) and a small warm
+		// request primes each new session's prefix before the first turn.
+		CacheRetention:          "long",
+		WarmCache:               true,
+		CacheMaxToolResultBytes: 16 << 10,
 	}
 	t := TUI{
 		Theme:         "pickle-rick",

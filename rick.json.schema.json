@@ -273,6 +273,12 @@
       "description": "Prompt-cache retention for every request: empty (provider default, ~5 min), \"long\" (extended TTL: Anthropic 1h / OpenAI 24h), or \"none\" (caching off).",
       "default": ""
     },
+    "cache_max_tool_result_bytes": {
+      "type": "integer",
+      "description": "Caps each tool_result payload sent to the model (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the provider prompt-cache hit ratio high on tool-heavy turns.",
+      "default": 16384,
+      "minimum": 0
+    },
     "subagent_depth": {
       "type": "integer",
       "description": "How many levels of subagent spawning are permitted.",

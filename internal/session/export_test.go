@@ -138,6 +138,10 @@ func TestExportRoundTrip(t *testing.T) {
 	orig.Cwd = "/tmp/work"
 	orig.Snapshots = []Snapshot{{ID: "abc", Label: "edit", MsgIdx: 1}}
 	orig.Usage = Usage{Input: 5, Output: 6, CacheRead: 7, CacheWrite: 8}
+	orig.Requests = []RequestUsage{
+		{Index: 1, Input: 100, Output: 10, CacheRead: 90, CacheWrite: 0},
+		{Index: 2, Agent: "sub", Input: 20, Output: 5, CacheRead: 80, CacheWrite: 0},
+	}
 
 	var buf bytes.Buffer
 	if err := Export(orig, &buf); err != nil {
@@ -164,6 +168,9 @@ func TestExportRoundTrip(t *testing.T) {
 	}
 	if back.Usage != orig.Usage {
 		t.Fatalf("usage lost: %+v", back.Usage)
+	}
+	if len(back.Requests) != 2 || back.Requests[0] != orig.Requests[0] || back.Requests[1] != orig.Requests[1] {
+		t.Fatalf("per-request telemetry lost: %+v", back.Requests)
 	}
 	if len(back.Snapshots) != 1 || back.Snapshots[0].ID != "abc" {
 		t.Fatalf("snapshots lost: %+v", back.Snapshots)

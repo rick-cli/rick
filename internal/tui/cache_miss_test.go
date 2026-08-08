@@ -7,12 +7,13 @@ import (
 	"rick/internal/provider"
 )
 
-// TestObserveCacheUsageRequiresReportedCacheTokens verifies that a turn which
-// omits the cache fields entirely (gateways do this on some usage chunks)
-// never counts as a full-prompt cache miss. The pre-fix latch kept the
-// previous "reported" state forever, so one cached turn made every later
-// cache-less turn look like the whole history was re-billed.
-func TestObserveCacheUsageRequiresReportedCacheTokens(t *testing.T) {
+// TestObserveCacheUsageCountsOnlyTrueRebillsWithoutCacheFields verifies the
+// heuristic that separates a cache-less "provider omitted the fields on a
+// normal growing turn" (small fresh input, not a miss) from a cache-less
+// "the whole previously sent span was re-billed" turn (fresh input alone
+// covers the span — this is what the analysed sessions showed: read=0 with
+// input ≈ the full prompt). Only the latter may count as a miss.
+func TestObserveCacheUsageCountsOnlyTrueRebillsWithoutCacheFields(t *testing.T) {
 	m := &Model{}
 
 	// Turn 1: warm request, cache read reported. Baseline established.
@@ -21,14 +22,27 @@ func TestObserveCacheUsageRequiresReportedCacheTokens(t *testing.T) {
 		t.Fatalf("turn 1 miss count = %d, want 0", m.cacheMissCount)
 	}
 
-	// Turn 2: same footprint but the provider reports no cache fields at all.
-	// This must not be read as a ~10k-token re-bill.
+	// Turn 2: the provider re-billed the whole footprint with no cache
+	// fields reported at all (read=0, input covers the previous span). This
+	// is a genuine full re-bill and must be counted — it is exactly what
+	// the analysed sessions showed (read=0, input ~= the entire prompt).
 	m.observeCacheUsage(&provider.Usage{InputTokens: 10100})
-	if m.cacheMissCount != 0 {
-		t.Fatalf("cache-less turn miss count = %d, want 0 (no cache reported)", m.cacheMissCount)
+	if m.cacheMissCount != 1 {
+		t.Fatalf("full-rebroadcast turn miss count = %d, want 1", m.cacheMissCount)
 	}
-	if m.cacheMissTokens != 0 {
-		t.Fatalf("cache-less turn miss tokens = %d, want 0", m.cacheMissTokens)
+
+	// Turn 3: back to a cached turn. The count must not double-count.
+	m.observeCacheUsage(&provider.Usage{InputTokens: 120, CacheReadTokens: 10200})
+	if m.cacheMissCount != 1 {
+		t.Fatalf("cached turn after a miss reported count = %d, want 1", m.cacheMissCount)
+	}
+
+	// Turn 4: a masked turn whose fresh input is only the small tail (the
+	// provider happens to omit cache fields on an otherwise cached turn).
+	// That is not a re-bill and must not be counted.
+	m.observeCacheUsage(&provider.Usage{InputTokens: 500})
+	if m.cacheMissCount != 1 {
+		t.Fatalf("tail-only cache-less turn miss count = %d, want 1 (unchanged)", m.cacheMissCount)
 	}
 }
 
@@ -70,13 +84,20 @@ func TestObserveCacheUsageMissReasonDistinguishesIdleGap(t *testing.T) {
 
 	// Gap longer than the default 5-minute TTL is an idle-gap expiry.
 	m.cacheLastUsage = time.Now().Add(-10 * time.Minute)
-	if got := m.cacheMissReason(); got != "idle gap (cache expired)" {
+	if got := m.cacheMissReason(true); got != "idle gap (cache expired)" {
 		t.Fatalf("stale gap reason = %q, want idle gap (cache expired)", got)
 	}
 
 	// A fresh turn (or nil deps with zero cacheLastUsage) is a prefix change.
 	m.cacheLastUsage = time.Now()
-	if got := m.cacheMissReason(); got != "prefix change" {
+	if got := m.cacheMissReason(true); got != "prefix change" {
 		t.Fatalf("fresh turn reason = %q, want prefix change", got)
+	}
+
+	// A cache-less turn with no divergence and no idle gap reports the
+	// provider itself stopped serving the prefix cache.
+	m.cacheLastUsage = time.Now()
+	if got := m.cacheMissReason(false); got != "provider served no prefix cache" {
+		t.Fatalf("no-cache-served reason = %q", got)
 	}
 }

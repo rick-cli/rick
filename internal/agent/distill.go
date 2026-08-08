@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,7 +90,7 @@ func renderTranscript(messages []provider.Message) string {
 			case "text", "thinking":
 				b.WriteString(block.Text)
 			case "tool_use":
-				b.WriteString("[tool " + block.Name + " " + string(block.Input) + "]")
+				b.WriteString("[tool " + block.Name + " " + summarizeToolArgs(block.Input) + "]")
 			case "tool_result":
 				b.WriteString("[result " + block.Content + "]")
 			}
@@ -96,6 +99,33 @@ func renderTranscript(messages []provider.Message) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// maxDistillToolArgChars bounds each tool_use input echoed into the distill
+// transcript so a huge sub-task prompt (subagent delegation) is never
+// re-broadcast wholesale back into the session summary.
+const maxDistillToolArgChars = 800
+
+// summarizeToolArgs renders a tool_use input compactly: full text when it is
+// small, otherwise a deterministic key+size summary. Key order is sorted so
+// identical payloads always render identically.
+func summarizeToolArgs(input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	if len(input) <= maxDistillToolArgChars {
+		return string(input)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(input, &object); err == nil {
+		keys := make([]string, 0, len(object))
+		for key := range object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		return fmt.Sprintf("[%d bytes; keys: %s]", len(input), strings.Join(keys, ","))
+	}
+	return fmt.Sprintf("[%d bytes]", len(input))
 }
 
 // distillSummarizer returns the configured summarizer, or builds one from the
@@ -114,9 +144,16 @@ func (r *Runner) distillSummarizer() distill.Summarizer {
 	return providerSummarizer{provider: r.cfg.Provider, model: model}
 }
 
+// distillAtPercent is the share of the context window at which the oldest
+// stable prefix is folded into a summary. Kept below the eviction band of
+// DeepSeek-style providers: their automatic prefix cache is a bounded LRU, so
+// a view sitting near the window top gets its oldest half evicted and
+// re-billed on the next turn. Distilling earlier keeps the live view inside
+// the cached region and the hit rate high.
+const distillAtPercent = 55
+
 // shouldDistill reports whether the transcript is close enough to the context
-// budget (70% by default per the release plan) that distilling the oldest
-// stable prefix is worthwhile.
+// budget that distilling the oldest stable prefix is worthwhile.
 func (r *Runner) shouldDistill(plan budget.Result, contextWindow int) bool {
 	if !r.cfg.EnableDistillation || r.distillSummarizer() == nil {
 		return false
@@ -124,7 +161,7 @@ func (r *Runner) shouldDistill(plan budget.Result, contextWindow int) bool {
 	if plan.Truncated {
 		return true
 	}
-	return contextWindow > 0 && plan.TotalInputTokens*100 >= contextWindow*70
+	return contextWindow > 0 && plan.TotalInputTokens*100 >= contextWindow*distillAtPercent
 }
 
 // distillOptions builds the distillation policy for the current run.

@@ -215,7 +215,10 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 			ToolFilter: toolFilter, Perms: m.deps.Perms, Ask: m.makeAsker(),
 			Cwd: m.deps.Cwd, SessionID: m.sessionID(), AgentName: spec.Name,
 			Depth: 1, MaxTurns: 0, Parallel: true, // unlimited; the repeated-call guard still stops loops
-			CacheRetention: provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
+			CacheRetention:     provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
+			WarmCache:          m.deps.Loaded.Config.WarmCache,
+			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
+			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
 		}
 		cfg = inheritSwarmWorkerRuntime(cfg, snapshotter, m.deps.Plugins, m.deps.Goals)
 		taskID := spec.TaskID
