@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,28 @@ type Client struct {
 	HTTP    *http.Client
 
 	models []provider.ModelInfo
+
+	// Keep-alive state (SetKeepalive): per-session record of the last stream
+	// body so an idle gap can refresh the provider's prompt cache with the
+	// exact prompt bytes the next real request will extend. Zero interval
+	// leaves all of this inert.
+	kaMu       sync.Mutex
+	kaSessions map[string]*kaSession
+	kaStop     chan struct{}
+	kaOnce     sync.Once
+	kaInterval time.Duration
+}
+
+// kaSession remembers the last stream-shaped wire body per session so the
+// keep-alive loop can re-send the same prompt prefix while the user idles.
+type kaSession struct {
+	body    wireRequest
+	headers http.Header
+	last    time.Time
+	// inFlight is true while a real stream (or a keep-alive POST) for this
+	// session is on the wire, so the loop never double-fires or races a
+	// mid-turn stale body against the live stream.
+	inFlight bool
 }
 
 // New builds a client. baseURL defaults to the public OpenAI API.
@@ -62,6 +85,179 @@ func New(id, apiKey, baseURL string) *Client {
 	return c
 }
 
+// SetKeepalive enables the prompt-cache keep-alive loop with the given idle
+// interval. After a session has been silent for the interval, the exact last
+// stream body is re-sent as a minimal stream-shaped request so the provider
+// keeps the session's prefix cached across idle gaps. Zero disables it; the
+// loop is best-effort and never surfaces errors (same contract as Warm).
+// Must be called before the first request for the interval to take effect.
+func (c *Client) SetKeepalive(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	c.kaInterval = interval
+}
+
+// noteKeepalive records the stream body that just went out so the keep-alive
+// loop can re-send the same prefix later. Local endpoints have no provider
+// cache, and retention "none" explicitly opted out of caching. The session is
+// marked in-flight; finishKeepalive clears it when the stream completes.
+func (c *Client) noteKeepalive(req provider.Request, body wireRequest, headers http.Header) {
+	if c.kaInterval <= 0 || req.SessionID == "" ||
+		req.CacheRetention == provider.CacheRetentionNone || isLocal(c.BaseURL) {
+		return
+	}
+	c.ensureKeepalive()
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	s, ok := c.kaSessions[req.SessionID]
+	if !ok {
+		s = &kaSession{}
+		c.kaSessions[req.SessionID] = s
+	}
+	s.body = body
+	s.headers = headers.Clone()
+	s.inFlight = true
+}
+
+// finishKeepalive marks the session idle again after a stream completes and
+// records the completion time, so the next keep-alive waits a full interval
+// from the turn that just primed the cache.
+func (c *Client) finishKeepalive(sessionID string) {
+	if c.kaInterval <= 0 || sessionID == "" {
+		return
+	}
+	c.kaMu.Lock()
+	if s, ok := c.kaSessions[sessionID]; ok {
+		s.inFlight = false
+		s.last = time.Now()
+	}
+	c.kaMu.Unlock()
+}
+
+// finishKeepaliveFor is the keep-alive-send variant: it only clears the
+// in-flight flag when the map still holds the captured session, so a stale
+// keep-alive completing after a newer stream replaced the entry cannot clear
+// the live stream's in-flight marker.
+func (c *Client) finishKeepaliveFor(sessionID string, s *kaSession) {
+	c.kaMu.Lock()
+	if cur, ok := c.kaSessions[sessionID]; ok && cur == s {
+		s.inFlight = false
+		s.last = time.Now()
+	}
+	c.kaMu.Unlock()
+}
+
+// touchKeepalive bumps the session's last-activity time without replacing the
+// recorded body (used after a successful pre-turn warm, which already primed
+// the cache).
+func (c *Client) touchKeepalive(sessionID string) {
+	if c.kaInterval <= 0 || sessionID == "" {
+		return
+	}
+	c.kaMu.Lock()
+	if s, ok := c.kaSessions[sessionID]; ok {
+		s.last = time.Now()
+	}
+	c.kaMu.Unlock()
+}
+
+func (c *Client) ensureKeepalive() {
+	c.kaOnce.Do(func() {
+		c.kaMu.Lock()
+		c.kaSessions = map[string]*kaSession{}
+		c.kaMu.Unlock()
+		c.kaStop = make(chan struct{})
+		go c.keepaliveLoop()
+	})
+}
+
+// stopKeepalive halts the loop. Production relies on process lifetime; tests
+// call this to avoid leaking the ticker goroutine.
+func (c *Client) stopKeepalive() {
+	c.kaOnce.Do(func() {}) // mark the once so no new loop starts
+	if c.kaStop != nil {
+		close(c.kaStop)
+	}
+}
+
+func (c *Client) keepaliveLoop() {
+	period := c.kaInterval / 2
+	if period < time.Second {
+		period = time.Second
+	}
+	t := time.NewTicker(period)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.kaStop:
+			return
+		case <-t.C:
+			c.keepaliveTick()
+		}
+	}
+}
+
+// keepaliveTick re-sends stale session bodies. Only sessions idle past the
+// interval with no stream in flight are touched, so an active turn never
+// races a keep-alive. Sessions idle over a day are pruned.
+func (c *Client) keepaliveTick() {
+	c.kaMu.Lock()
+	now := time.Now()
+	type due struct {
+		sessionID string
+		s         *kaSession
+	}
+	var toSend []due
+	for sid, s := range c.kaSessions {
+		if idle := now.Sub(s.last); idle > c.kaInterval {
+			if !s.inFlight {
+				s.inFlight = true // held until the POST below completes
+				toSend = append(toSend, due{sid, s})
+			}
+		} else if idle > 24*time.Hour {
+			// Prune long-dead sessions so the map cannot grow unbounded.
+			delete(c.kaSessions, sid)
+		}
+	}
+	c.kaMu.Unlock()
+	for _, d := range toSend {
+		c.keepaliveSend(d.sessionID, d.s)
+	}
+}
+
+// keepaliveSend re-POSTs a session's last stream body reshaped to a minimal
+// stream-shaped request: same messages/tools/model, tiny output budget, so it
+// rides (and refreshes) the exact prompt-cache entry the next real stream
+// will extend. Success bumps the session's last-activity time; any failure
+// clears in-flight so the next tick retries.
+func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
+	body := s.body
+	body.Stream = true
+	body.StreamOpts = nil
+	if deepseekWire(c.ID) {
+		body.MaxTokens = 0
+		body.MaxTokensLegacy = 1
+	} else {
+		body.MaxTokens = 1
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		c.finishKeepaliveFor(sessionID, s)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.doCompletions(ctx, raw, s.headers)
+	if err != nil {
+		c.finishKeepaliveFor(sessionID, s)
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+	resp.Body.Close()
+	c.finishKeepaliveFor(sessionID, s)
+}
+
 func defaultModels(id string) []provider.ModelInfo {
 	switch id {
 	case "openrouter":
@@ -85,12 +281,13 @@ func defaultModels(id string) []provider.ModelInfo {
 			{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextWindow: 1_000_000, MaxOutput: 384_000},
 		}
 	default:
-		return []provider.ModelInfo{
-			{ID: "gpt-5", Name: "GPT-5", ContextWindow: 400000, MaxOutput: 128000},
-			{ID: "gpt-5-mini", Name: "GPT-5 mini", ContextWindow: 400000, MaxOutput: 128000},
-			{ID: "gpt-4.1", Name: "GPT-4.1", ContextWindow: 1000000, MaxOutput: 32000},
-			{ID: "o4-mini", Name: "o4-mini", ContextWindow: 200000, MaxOutput: 100000},
-		}
+		// No static catalogue for arbitrary/custom providers. A provider that
+		// has not been probed yet has no known models — advertising OpenAI
+		// placeholders here (gpt-5, gpt-4.1, o4-mini) would list models the
+		// endpoint does not serve. The real list comes from the /models probe
+		// (auth.json -> SetModels); until then an empty list is honest and
+		// triggers the lazy reload on the next start.
+		return nil
 	}
 }
 
@@ -582,6 +779,9 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		return fmt.Errorf("%s: warm http %d: %s", c.ID, resp.StatusCode, strings.TrimSpace(string(b)))
 	}
+	// A successful warm just primed this session's prefix; let the keep-alive
+	// loop know so it does not also fire during the same idle gap.
+	c.touchKeepalive(req.SessionID)
 	return nil
 }
 
@@ -735,6 +935,11 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 			extraHeaders.Set("x-session-affinity", req.SessionID)
 		}
 	}
+
+	// Record this stream body so the keep-alive loop can re-send the same
+	// prefix while the user idles instead of paying a full cold re-bill.
+	c.noteKeepalive(req, body, extraHeaders)
+	defer c.finishKeepalive(req.SessionID)
 
 	resp, err := c.doCompletions(ctx, raw, extraHeaders)
 	if err != nil {

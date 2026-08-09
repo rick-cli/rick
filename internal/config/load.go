@@ -318,6 +318,12 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 	if has(p, "cache_max_tool_result_bytes") {
 		dst.CacheMaxToolResultBytes = src.CacheMaxToolResultBytes
 	}
+	if has(p, "cache_ttl_seconds") {
+		dst.CacheTTLSeconds = src.CacheTTLSeconds
+	}
+	if has(p, "cache_keepalive_seconds") {
+		dst.CacheKeepaliveSeconds = src.CacheKeepaliveSeconds
+	}
 	if has(p, "autocompact") {
 		dst.AutoCompact = src.AutoCompact
 	}

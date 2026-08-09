@@ -273,6 +273,18 @@
       "description": "Prompt-cache retention for every request: empty (provider default, ~5 min), \"long\" (extended TTL: Anthropic 1h / OpenAI 24h), or \"none\" (caching off).",
       "default": ""
     },
+    "cache_ttl_seconds": {
+      "type": "integer",
+      "description": "Overrides how long a warm prompt prefix is assumed to survive at the provider before an idle gap forces a re-warm (0 = per-vendor table: 1 day for DeepSeek-line endpoints). Set to the real retention when a gateway, e.g. a free flash tier, expires entries in minutes — the idle-gap pre-warm then fires before the next turn instead of paying a full cold re-bill.",
+      "default": 0,
+      "minimum": 0
+    },
+    "cache_keepalive_seconds": {
+      "type": "integer",
+      "description": "When positive, keeps the provider prompt cache alive during idle gaps by re-sending the last stream's exact prompt bytes as a minimal request every interval. This holds a near-100% hit rate across long idle on gateways whose cache TTL is minutes, not days. Zero disables.",
+      "default": 0,
+      "minimum": 0
+    },
     "cache_max_tool_result_bytes": {
       "type": "integer",
       "description": "Caps each tool_result payload sent to the model (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the provider prompt-cache hit ratio high on tool-heavy turns.",

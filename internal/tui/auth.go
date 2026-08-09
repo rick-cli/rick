@@ -1520,6 +1520,7 @@ func (m *Model) reloadProviders() {
 				continue
 			}
 			c := openai.New(id, p.APIKey, p.BaseURL)
+			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
 			if cred, ok := creds[id]; ok && len(cred.Models) > 0 {
 				infos := make([]provider.ModelInfo, 0, len(cred.Models))
 				for _, mid := range cred.Models {

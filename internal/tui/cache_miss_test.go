@@ -86,20 +86,42 @@ func TestObserveCacheUsageMissReasonDistinguishesIdleGap(t *testing.T) {
 
 	// Gap longer than the default 5-minute TTL is an idle-gap expiry.
 	m.cacheLastUsage = time.Now().Add(-10 * time.Minute)
-	if got := m.cacheMissReason(true); got != "idle gap (cache expired)" {
+	if got := m.cacheMissReason(true, 0); got != "idle gap (cache expired)" {
 		t.Fatalf("stale gap reason = %q, want idle gap (cache expired)", got)
 	}
 
 	// A fresh turn (or nil deps with zero cacheLastUsage) is a prefix change.
 	m.cacheLastUsage = time.Now()
-	if got := m.cacheMissReason(true); got != "prefix change" {
+	if got := m.cacheMissReason(true, 0); got != "prefix change" {
 		t.Fatalf("fresh turn reason = %q, want prefix change", got)
 	}
 
 	// A cache-less turn with no divergence and no idle gap reports the
 	// provider itself stopped serving the prefix cache.
 	m.cacheLastUsage = time.Now()
-	if got := m.cacheMissReason(false); got != "provider served no prefix cache" {
+	if got := m.cacheMissReason(false, 0); got != "provider served no prefix cache" {
 		t.Fatalf("no-cache-served reason = %q", got)
+	}
+}
+
+// TestObserveCacheUsageEvictionLabelsProviderDrop pins that a turn which
+// reports cache fields but reads far less than the previous prompt — with no
+// client-side divergence — is labelled a provider eviction, not a misleading
+// "prefix change".
+func TestObserveCacheUsageEvictionLabelsProviderDrop(t *testing.T) {
+	m := &Model{}
+
+	// First turn primes a large prefix; the second re-reads only the shared
+	// system head (~7k) instead of the 60k+ it had already sent.
+	m.cachePrevPrompt = 66000
+	m.cacheLastUsage = time.Now()
+	if got := m.cacheMissReason(true, 7000); got != "provider eviction (session prefix expired)" {
+		t.Fatalf("eviction reason = %q, want provider eviction (session prefix expired)", got)
+	}
+
+	// A normal warm turn that still reads nearly the whole previous prompt is
+	// not an eviction even if the tail missed the noise floor.
+	if got := m.cacheMissReason(true, 65500); got != "prefix change" {
+		t.Fatalf("warm-turn reason = %q, want prefix change", got)
 	}
 }

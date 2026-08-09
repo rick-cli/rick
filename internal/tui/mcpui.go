@@ -300,7 +300,7 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 	if m.cacheMissCount > 0 || m.cacheMissTokens > 0 {
 		b.WriteString(s.Faint.Render(fmt.Sprintf(
 			"\nsession cache: %d evictions, ~%s re-billed (last miss: %s)",
-			m.cacheMissCount, humanTokens(m.cacheMissTokens), m.cacheMissReason(true))))
+			m.cacheMissCount, humanTokens(m.cacheMissTokens), m.cacheLastMissReason)))
 	} else if m.cachePrevPrompt > 0 {
 		b.WriteString(s.Faint.Render(fmt.Sprintf("\nsession cache: no evictions — prefix stayed warm")))
 	}

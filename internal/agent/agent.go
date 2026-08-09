@@ -185,6 +185,9 @@ type Config struct {
 	// CacheRetention is the prompt-cache policy for every request of this
 	// run: "" = provider default, "long" = extended TTL, "none" = disabled.
 	CacheRetention provider.CacheRetention
+	// CacheTTLSeconds overrides the provider's assumed prompt-cache lifetime
+	// for idle-gap pre-warm decisions. Zero uses the per-vendor table.
+	CacheTTLSeconds int
 	// WarmCache, when true and the provider supports provider.CacheWarmber,
 	// submits a small warm request once at session start so the provider
 	// populates its prompt cache for the frozen prefix before the first real
@@ -1685,8 +1688,13 @@ func oneLine(s string) string {
 // cacheTTL bounds how long a warm prefix is assumed to survive at the
 // provider before an idle gap forces a re-warm. The vendor table replaces
 // the old fixed 5-minute default: DeepSeek-line endpoints keep their prefix
-// cache for a day, so re-warming after every idle gap was pure waste.
+// cache for a day, so re-warming after every idle gap was pure waste. A
+// positive CacheTTLSeconds overrides the table for gateways whose real
+// retention is far shorter (free flash tiers expire in minutes, not days).
 func (r *Runner) cacheTTL() time.Duration {
+	if r.cfg.CacheTTLSeconds > 0 {
+		return time.Duration(r.cfg.CacheTTLSeconds) * time.Second
+	}
 	name := ""
 	if r.cfg.Provider != nil {
 		name = r.cfg.Provider.Name()

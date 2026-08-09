@@ -158,6 +158,10 @@ keys and long instruction blocks stay out of the config file.
     }
   },
 
+  "cache_retention": "long",
+  "cache_ttl_seconds": 300,
+  "cache_keepalive_seconds": 120,
+
   "instructions": ["docs/conventions.md"],
 
   "mcp": {
@@ -168,6 +172,22 @@ keys and long instruction blocks stay out of the config file.
   }
 }
 ```
+
+Prompt-cache keys:
+
+- `cache_retention` — `""` (provider default), `"long"` (extended TTL), or
+  `"none"` (caching off). Defaults to `"long"`.
+- `cache_ttl_seconds` — how long a warm prompt prefix is assumed to survive
+  at the provider before an idle gap forces a re-warm. Zero uses the
+  per-vendor table (1 day for DeepSeek-line endpoints). Set this to the real
+  retention when a gateway — e.g. a free flash tier — expires entries in
+  minutes, so the first turn after an idle gap is pre-warmed instead of
+  re-billing the whole prefix cold.
+- `cache_keepalive_seconds` — when positive, re-sends a session's last
+  stream body as a minimal request during idle gaps so the provider keeps
+  the prefix cached (near-100% hit rate across long idle even on gateways
+  with minute-scale cache TTLs). Zero disables. A sensible pairing for a
+  short-TTL gateway is `cache_ttl_seconds: 300, cache_keepalive_seconds: 120`.
 
 ## Permissions
 

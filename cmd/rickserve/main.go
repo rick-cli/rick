@@ -243,6 +243,10 @@ type server struct {
 	// Active run cancellation: session_id -> cancel func.
 	runMu     sync.Mutex
 	runCancel map[string]activeRun
+
+	// Lazy model reload runs at most once per process: providers that have no
+	// fetched model list yet are probed on the first models query.
+	modelsOnce sync.Once
 }
 
 type activeRun struct {
@@ -753,6 +757,11 @@ func (s *server) handleSessions(req Request, out *writer) {
 }
 
 func (s *server) handleModels(out *writer) {
+	// Lazy reload: a provider added without a /models probe (desktop custom
+	// form) has no fetched list; probe it once here so the picker shows the
+	// endpoint's real models instead of static placeholders.
+	s.modelsOnce.Do(s.refreshMissingModels)
+
 	type modelEntry struct {
 		Provider           string                     `json:"provider"`
 		ID                 string                     `json:"id"`
@@ -827,6 +836,62 @@ func (s *server) modelsForProvider(name string, p provider.Provider) []provider.
 		return provider.FilterChatModels(p.Models())
 	}
 	return advertised
+}
+
+// refreshMissingModels probes every authenticated provider whose credential
+// has no fetched model list yet (e.g. a provider added through the desktop
+// "add custom provider" form, which writes the key without probing /models)
+// and persists the real list so the model picker stops advertising static
+// placeholder models that do not belong to the endpoint. It is a lazy reload:
+// providers that already have a fetched list are left untouched.
+func (s *server) refreshMissingModels() {
+	if s.creds == nil {
+		return
+	}
+	changed := false
+	for id, cred := range s.creds.Snapshot() {
+		if cred.Disabled || cred.BaseURL == "" {
+			continue
+		}
+		if len(cred.Models) > 0 {
+			continue // already fetched — nothing to do
+		}
+		key := s.creds.CurrentKey(id)
+		if key == "" {
+			continue // no credential to probe with
+		}
+		res := catalog.Probe(context.Background(), cred.BaseURL, key)
+		if res.Err != nil || len(res.Models) == 0 {
+			continue // endpoint does not publish a list; leave as-is
+		}
+		models := catalog.FilterChatModels(res.Models)
+		if len(models) == 0 {
+			continue
+		}
+		cred.Models = nil
+		cred.ContextWindows = map[string]int{}
+		cred.ContextSources = map[string]provider.ContextSource{}
+		cred.VisionModels = nil
+		for _, mm := range models {
+			cred.Models = append(cred.Models, mm.ID)
+			if mm.Context > 0 {
+				cred.ContextWindows[mm.ID] = mm.Context
+			}
+			if mm.ContextSource != provider.ContextSourceUnknown {
+				cred.ContextSources[mm.ID] = mm.ContextSource
+			}
+			if mm.SupportsImages {
+				cred.VisionModels = append(cred.VisionModels, mm.ID)
+			}
+		}
+		s.creds.Set(id, cred)
+		changed = true
+	}
+	if changed {
+		// modelsForProvider reads s.creds directly, so the freshly persisted
+		// list is visible on the next models query without a daemon restart.
+		_ = s.creds.Save()
+	}
 }
 
 func (s *server) handleConfig(req Request, out *writer) {

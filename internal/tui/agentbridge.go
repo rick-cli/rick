@@ -123,6 +123,7 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			EnableDistillation: cfg.DistillEnabled != nil && *cfg.DistillEnabled,
 			DistillModel:       cfg.DistillModelFor(),
 			CacheRetention:     provider.CacheRetention(cfg.CacheRetention),
+			CacheTTLSeconds:    cfg.CacheTTLSeconds,
 			WarmCache:          cfg.WarmCache,
 			MaxReasoningTurns:  cfg.CacheMaxReasoningTurns,
 			MaxToolResultBytes: cfg.CacheMaxToolResultBytes,
@@ -373,7 +374,8 @@ func (m *Model) observeCacheUsage(u *provider.Usage) string {
 			m.cacheMissTokens += missed
 			m.cacheMissCount++
 			m.cacheMissStreak++
-			missCause := m.cacheMissReason(reported)
+			missCause := m.cacheMissReason(reported, u.CacheReadTokens)
+			m.cacheLastMissReason = missCause
 			if m.cacheMissStreak == 2 {
 				m.appendMsg(ChatMsg{Kind: MsgSystem,
 					Text: fmt.Sprintf("cache miss: ~%s tokens re-billed (%s)",
@@ -392,7 +394,12 @@ func (m *Model) observeCacheUsage(u *provider.Usage) string {
 // vendor (per-vendor table in provider.DefaultCacheTTL): DeepSeek-line
 // endpoints keep their prefix cache for a day, Anthropic's ephemeral cache
 // lives ~5 minutes (1h with long retention), everything else 5m by default.
+// A positive cache_ttl_seconds override wins for gateways that expire far
+// sooner than the vendor table assumes.
 func (m *Model) cacheTTL() time.Duration {
+	if m.deps.Loaded != nil && m.deps.Loaded.Config.CacheTTLSeconds > 0 {
+		return time.Duration(m.deps.Loaded.Config.CacheTTLSeconds) * time.Second
+	}
 	retention := provider.CacheRetentionAuto
 	if m.deps.Loaded != nil {
 		retention = provider.CacheRetention(m.deps.Loaded.Config.CacheRetention)
@@ -404,7 +411,7 @@ func (m *Model) cacheTTL() time.Duration {
 // cacheMissReason tells apart an idle-gap timeout from a prefix change, so
 // cache regressions caused by conversation edits are distinguishable from
 // the cheap misses that come from simply waiting too long.
-func (m *Model) cacheMissReason(reported bool) string {
+func (m *Model) cacheMissReason(reported bool, cacheRead int) string {
 	if m.pendingDivergence != "" {
 		return "prefix change: " + m.pendingDivergence
 	}
@@ -413,6 +420,14 @@ func (m *Model) cacheMissReason(reported bool) string {
 	}
 	if !reported {
 		return "provider served no prefix cache"
+	}
+	// The provider reported cache fields but read far less than the previous
+	// turn had already sent — only the shared system head survived. With no
+	// client-side byte divergence that is a provider eviction (short cache
+	// TTL, router pressure), not a prompt rewrite; label it as such so it is
+	// not mistaken for a regression caused by an edit.
+	if m.cachePrevPrompt > 0 && cacheRead < m.cachePrevPrompt-cacheMissNoiseFloor {
+		return "provider eviction (session prefix expired)"
 	}
 	return "prefix change"
 }

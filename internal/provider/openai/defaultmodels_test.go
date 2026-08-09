@@ -45,3 +45,15 @@ func containsModel(models []provider.ModelInfo, id string) bool {
 	}
 	return false
 }
+
+// TestDefaultModelsUnknownProviderHasNoPlaceholders locks the fix for a stale
+// model list: a custom/unknown provider id must not advertise OpenAI
+// placeholder models (gpt-5, gpt-4.1, o4-mini, ...) that the endpoint does
+// not serve. The real list comes from the /models probe.
+func TestDefaultModelsUnknownProviderHasNoPlaceholders(t *testing.T) {
+	for _, id := range []string{"my-custom-gateway", "random-id", "vllm-server", ""} {
+		if got := defaultModels(id); len(got) != 0 {
+			t.Errorf("defaultModels(%q) = %d models, want none (placeholders leak)", id, len(got))
+		}
+	}
+}

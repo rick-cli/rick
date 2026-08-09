@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased
+## v0.1.14 — 2026-08-09
+
+#### Model list
+
+- **Provider model lists are no longer seeded with placeholder models.** A
+  provider added without a `/models` probe (e.g. the desktop "add custom
+  provider" form, which writes the key without probing) used to fall back to
+  a static OpenAI catalogue (gpt-5, gpt-4.1, o4-mini, ...) that the endpoint
+  does not serve. Unknown/custom providers now advertise an empty list, and
+  rickserve lazily probes each authenticated provider's real `/models` on the
+  first models query (once per process) and persists the fetched list — so
+  the picker shows exactly what the endpoint serves, no stale or foreign
+  models.
+- **Desktop model list cache is invalidated on every auth mutation**
+  (save / update / add-key / remove-key / remove provider), so the model
+  picker refreshes immediately instead of serving a 30-second-stale list.
+
+#### Performance (prompt-cache)
+
+- **`cache_ttl_seconds` overrides the assumed provider cache lifetime** for
+  idle-gap pre-warm decisions (0 = per-vendor table). Gateways whose real
+  retention is minutes instead of the DeepSeek-table day — free flash tiers —
+  now trigger the full-prefix re-warm before the first turn after an idle
+  gap instead of paying a ~60k-token cold re-bill.
+- **`cache_keepalive_seconds` keeps the provider prompt cache alive during
+  idle** (0 = off): the OpenAI-compatible client re-sends a session's last
+  stream body as a minimal stream-shaped request every interval, so a
+  long-idle session holds a near-100% hit rate even on gateways that expire
+  cache entries in minutes. In-flight streams are never raced, sessions are
+  pruned after a day, and local endpoints are skipped.
+- **Cache-miss classification now labels provider evictions correctly**:
+  a turn that reports cache fields but re-reads only the shared system head —
+  with no client-side byte divergence — is reported as
+  `provider eviction (session prefix expired)` instead of the misleading
+  `prefix change`. The last miss cause is surfaced in `/stats`.
 
 #### Performance (CPU / allocations)
 

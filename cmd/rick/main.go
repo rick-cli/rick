@@ -422,10 +422,14 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
 			}
-			out[name] = openai.New(name, p.APIKey, p.BaseURL)
+			c := openai.New(name, p.APIKey, p.BaseURL)
+			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+			out[name] = c
 		default:
 			if p.BaseURL != "" {
-				out[name] = openai.New(name, p.APIKey, p.BaseURL)
+				c := openai.New(name, p.APIKey, p.BaseURL)
+				c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+				out[name] = c
 			}
 		}
 	}

@@ -56,3 +56,21 @@ func TestCacheDefaultsOptOut(t *testing.T) {
 		t.Fatalf("cache_max_tool_result_bytes:4096 did not take effect, got %d", c.CacheMaxToolResultBytes)
 	}
 }
+
+// TestCacheTTLAndKeepaliveMerge pins the gateway-TTL override and idle
+// keep-alive config keys: zero stays the default, positive values merge.
+func TestCacheTTLAndKeepaliveMerge(t *testing.T) {
+	c, tui := Defaults()
+	if c.CacheTTLSeconds != 0 || c.CacheKeepaliveSeconds != 0 {
+		t.Fatalf("defaults not zero: ttl=%d keepalive=%d", c.CacheTTLSeconds, c.CacheKeepaliveSeconds)
+	}
+	if err := mergeInto(&c, &tui, []byte(`{"cache_ttl_seconds": 300, "cache_keepalive_seconds": 120}`), "", "probe.json"); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if c.CacheTTLSeconds != 300 {
+		t.Fatalf("cache_ttl_seconds:300 did not take effect, got %d", c.CacheTTLSeconds)
+	}
+	if c.CacheKeepaliveSeconds != 120 {
+		t.Fatalf("cache_keepalive_seconds:120 did not take effect, got %d", c.CacheKeepaliveSeconds)
+	}
+}

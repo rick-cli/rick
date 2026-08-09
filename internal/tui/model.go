@@ -140,6 +140,10 @@ type Model struct {
 	cacheMissCount  int
 	cacheMissStreak int
 	cacheLastUsage  time.Time
+	// cacheLastMissReason is the classified cause of the most recent miss
+	// ("idle gap (cache expired)", "provider eviction (session prefix
+	// expired)", ...) so /stats and the MCP UI can surface it later.
+	cacheLastMissReason string
 	// requestSeq counts provider requests in the primary session so the
 	// persisted per-request telemetry has stable chronological indices.
 	requestSeq int
@@ -1690,6 +1694,7 @@ func (m *Model) resetStats() {
 	m.cacheMissCount = 0
 	m.cacheMissStreak = 0
 	m.cacheLastUsage = time.Time{}
+	m.cacheLastMissReason = ""
 }
 
 // SetTurnElapsed fakes a completed turn duration (test helper).

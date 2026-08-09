@@ -291,6 +291,18 @@ type Config struct {
 	// (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the
 	// provider prompt-cache hit ratio high on tool-heavy turns.
 	CacheMaxToolResultBytes int `json:"cache_max_tool_result_bytes,omitempty"`
+	// CacheTTLSeconds overrides how long a warm prompt prefix is assumed to
+	// survive at the provider before an idle gap forces a re-warm. Zero uses
+	// the per-vendor table (provider.DefaultCacheTTL), which assumes a day
+	// for DeepSeek-line endpoints — set this to the real retention when a
+	// gateway (e.g. a free flash tier) expires entries far sooner.
+	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
+	// CacheKeepaliveSeconds, when positive, keeps the provider prompt cache
+	// alive during idle gaps by periodically re-sending the last stream's
+	// exact prompt bytes as a minimal request. This is how long-idle sessions
+	// hold a near-100% hit rate on gateways whose cache TTL is minutes, not
+	// days. Zero disables the keep-alive.
+	CacheKeepaliveSeconds int `json:"cache_keepalive_seconds,omitempty"`
 	// ContextBudget exposes the session context manager knobs.
 	ContextBudget *ContextBudgetConfig `json:"context_budget,omitempty"`
 }
