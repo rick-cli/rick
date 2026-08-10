@@ -241,6 +241,9 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 				stats := ev.Tool.Optimization
 				m.optimization.Add(stats.OriginalTokens, stats.CompressedTokens, stats.SavedTokens)
 			}
+			if ev.Tool.Repaired != "" && m.deps.Usage != nil {
+				_ = m.deps.Usage.RecordRepair(m.modelID, ev.Tool.Name)
+			}
 			if m.toolOutputs == nil {
 				m.toolOutputs = make(map[string]string)
 			}
@@ -294,15 +297,16 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			if m.sess != nil {
 				m.requestSeq++
 				m.sess.Requests = append(m.sess.Requests, session.RequestUsage{
-					Index:           m.requestSeq,
-					Agent:           m.agentName,
-					Input:           ev.Usage.InputTokens,
-					Output:          ev.Usage.OutputTokens,
-					CacheRead:       ev.Usage.CacheReadTokens,
-					CacheWrite:      ev.Usage.CacheWriteTokens,
-					Divergence:      m.pendingDivergence,
-					Eviction:        eviction,
-					ReasoningTokens: ev.ReasoningTokens,
+					Index:            m.requestSeq,
+					Agent:            m.agentName,
+					Input:            ev.Usage.InputTokens,
+					Output:           ev.Usage.OutputTokens,
+					CacheRead:        ev.Usage.CacheReadTokens,
+					CacheWrite:       ev.Usage.CacheWriteTokens,
+					Divergence:       m.pendingDivergence,
+					Eviction:         eviction,
+					ReasoningTokens:  ev.ReasoningTokens,
+					ResponseCacheHit: ev.Usage.ResponseCacheHit,
 				})
 				m.pendingDivergence = ""
 			}

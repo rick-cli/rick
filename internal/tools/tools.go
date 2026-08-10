@@ -22,6 +22,11 @@ type Context struct {
 	Elicit    func(prompt string) (string, error) // optional interactive hook
 	Progress  func(string)                        // optional progress reporting
 	Depth     int                                 // subagent recursion depth
+	// Repair carries the per-call tool-call-repair configuration. The agent
+	// fills it; tools pass it to RepairDecode so repaired args and the
+	// description of what was fixed flow back to the agent for surfacing and
+	// per-model telemetry. Nil is fine (tests, direct callers).
+	Repair *RepairOpts
 }
 
 // Result is a tool's outcome.
@@ -147,6 +152,14 @@ func obj(props map[string]any, required ...string) map[string]any {
 
 func strProp(desc string) map[string]any {
 	return map[string]any{"type": "string", "description": desc}
+}
+
+// pathProp is strProp for filesystem-path fields. The "format" hint tells
+// schema-aware consumers the value is a path (never markdown), and the
+// runtime unwrapMarkdownLink guard in resolvePath fixes auto-linked paths
+// like `[notes.md](http://notes.md)` regardless.
+func pathProp(desc string) map[string]any {
+	return map[string]any{"type": "string", "description": desc, "format": "path"}
 }
 
 func numProp(desc string) map[string]any {

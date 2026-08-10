@@ -65,7 +65,7 @@ func (t TeamTool) Run(_ context.Context, tc tools.Context, input json.RawMessage
 	}
 
 	var args teamArgs
-	if err := json.Unmarshal(input, &args); err != nil {
+	if err := tools.RepairDecode(input, &args, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	args.Action = strings.TrimSpace(args.Action)

@@ -39,7 +39,7 @@ import (
 	"rick/pkg/contextbudget"
 )
 
-var Version = "0.1.15"
+var Version = "0.1.16"
 
 func main() {
 	var (
@@ -425,11 +425,13 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 			}
 			c := openai.New(name, p.APIKey, p.BaseURL)
 			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+			c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 			out[name] = c
 		default:
 			if p.BaseURL != "" {
 				c := openai.New(name, p.APIKey, p.BaseURL)
 				c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+				c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 				out[name] = c
 			}
 		}

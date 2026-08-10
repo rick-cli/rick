@@ -56,6 +56,20 @@ type Options struct {
 	Encoding tokens.Encoding
 	// LiveZoneCapBytes bounds live-zone compressed tool output.
 	LiveZoneCapBytes int
+	// PruneMinReclaimBytes is the minimum provider-facing bytes a proactive
+	// prune must reclaim before it commits a rewrite of already-sent history.
+	// Committing is a deliberate cache-boundary event (the head rewrites
+	// once), so it must be worth it; below the floor the prune waits for the
+	// history to grow more. Default 4 KiB.
+	PruneMinReclaimBytes int
+	// PruneMinResultBytes is the minimum size of an old tool result that is
+	// considered for a deterministic 1-line summary. Results at or below
+	// MinDedupBytes are left verbatim. Default 8 KiB.
+	PruneMinResultBytes int
+	// PruneLiveZoneTurns is how many newest logical turns are never pruned
+	// (the volatile tail stays byte-exact so the cache prefix keeps
+	// extending). Default 2.
+	PruneLiveZoneTurns int
 }
 
 func (o Options) withDefaults() Options {
@@ -87,6 +101,15 @@ func (o Options) withDefaults() Options {
 	if o.LiveZoneCapBytes <= 0 {
 		o.LiveZoneCapBytes = 8 << 10
 	}
+	if o.PruneMinReclaimBytes <= 0 {
+		o.PruneMinReclaimBytes = 4 << 10
+	}
+	if o.PruneMinResultBytes <= 0 {
+		o.PruneMinResultBytes = 8 << 10
+	}
+	if o.PruneLiveZoneTurns <= 0 {
+		o.PruneLiveZoneTurns = 2
+	}
 	return o
 }
 
@@ -109,6 +132,18 @@ type Budget struct {
 	// once, so a repeated payload collapses to a pointer even after the
 	// original copy is trimmed from the view.
 	verbatim map[string]bool
+	// pruneArmed is true while a proactive prune may commit a rewrite of the
+	// already-sent head. After a commit it disarms until the history regrows
+	// a full trigger-sized runway (measured in provider-facing bytes), so
+	// prunes are episodic (one cache boundary) instead of firing every turn.
+	pruneArmed    bool
+	pruneRearmAt  int
+	pruneSumBytes int
+	pruneSumCalls int
+	// summarizedIDs records tool_use_ids whose result was already replaced by
+	// a deterministic 1-line summary, so a result is summarized exactly once
+	// and its bytes never change between turns.
+	summarizedIDs map[string]bool
 	// Per-message analysis of the previous ChooseBoundaries input, valid for
 	// the shared prefix of the next call: message hashes, serialized byte
 	// lengths, token lengths, cumulative prefix bytes/tokens, and the
@@ -132,12 +167,14 @@ type prefixState struct {
 // New builds an enabled Budget with defaults applied.
 func New(opts Options) *Budget {
 	return &Budget{
-		opts:      opts.withDefaults(),
-		live:      map[string]string{},
-		cab:       map[string]string{},
-		stability: map[int]*prefixState{},
-		dedupIDs:  map[string]bool{},
-		verbatim:  map[string]bool{},
+		opts:          opts.withDefaults(),
+		live:          map[string]string{},
+		cab:           map[string]string{},
+		stability:     map[int]*prefixState{},
+		dedupIDs:      map[string]bool{},
+		verbatim:      map[string]bool{},
+		summarizedIDs: map[string]bool{},
+		pruneArmed:    true,
 	}
 }
 
@@ -246,11 +283,174 @@ func (b *Budget) ApplyDedup(messages []provider.Message) DedupResult {
 	return result
 }
 
-// decideDedup returns whether the tool result must be serialized as a
-// degenerate pointer. The decision is permanent per tool_use_id: it is made
-// on the first occurrence and never re-evaluated, so the message's bytes
-// never change between turns (the prefix cache stays warm). Id-less results
-// fall back to the per-view duplicate rule.
+// PruneResult reports what a proactive prune changed.
+type PruneResult struct {
+	View       []provider.Message
+	SavedBytes int
+	Summarized int
+	Committed  bool
+}
+
+// PruneOldToolResults deterministically shrinks old, bulky tool results in
+// the provider view: each result older than the prune live zone and larger
+// than PruneMinResultBytes is replaced once by a 1-line informative summary
+// (tool name + command/path + exit state), with the original stored under
+// its content address so retrieve_uncompressed_context can still fetch it.
+//
+// Cache contract: rewriting already-sent history is a deliberate cache
+// boundary, so a commit only happens when the estimated reclaim is at least
+// PruneMinReclaimBytes AND the budget is armed. After a commit it disarms
+// until the history regrows a full trigger-sized runway (measured in
+// provider-facing bytes), making prunes episodic — one boundary per commit,
+// never a per-turn rewrite. Every summary is decided exactly once per
+// tool_use_id so the surviving bytes never change between turns.
+func (b *Budget) PruneOldToolResults(messages []provider.Message) PruneResult {
+	result := PruneResult{View: append([]provider.Message(nil), messages...)}
+	if !b.Enabled() {
+		return result
+	}
+
+	// Group tool_use/tool_result pairs so the live-zone boundary never
+	// splits a pair, and count how much of the head is reclaimable.
+	groups := logicalGroups(messages)
+	cutoff := len(groups) - b.opts.PruneLiveZoneTurns
+	if cutoff <= 0 {
+		return result
+	}
+
+	// Estimate reclaim with the current byte sizes first (id-aware, so a
+	// result already summarized or dedup'd is not re-counted).
+	reclaim := 0
+	for gi, g := range groups {
+		if gi >= cutoff {
+			break
+		}
+		for mi := g.start; mi < len(messages) && mi <= g.start+1; mi++ {
+			for _, block := range messages[mi].Content {
+				if block.Type != "tool_result" || len(block.Content) < b.opts.PruneMinResultBytes {
+					continue
+				}
+				if b.summarizedIDs[block.ToolUseID] {
+					continue
+				}
+				summary := summarizeToolResult(block.ToolUseID, block.Content)
+				if len(summary) >= len(block.Content) {
+					continue
+				}
+				reclaim += len(block.Content) - len(summary)
+			}
+		}
+	}
+	b.mu.Lock()
+	armed := b.pruneArmed
+	if !armed && b.pruneSumBytes >= b.pruneRearmAt {
+		armed = true
+		b.pruneArmed = true
+	}
+	b.mu.Unlock()
+	if !armed {
+		return result
+	}
+	if reclaim < b.opts.PruneMinReclaimBytes {
+		return result
+	}
+
+	// Commit: apply summaries, one per tool_use_id, storing the original.
+	saved := 0
+	summarized := 0
+	for gi, g := range groups {
+		if gi >= cutoff {
+			break
+		}
+		// A group is messages[g.start .. g.start+1] (a lone message or a
+		// tool_use/tool_result pair).
+		for mi := g.start; mi < len(result.View) && mi <= g.start+1; mi++ {
+			for bi := range result.View[mi].Content {
+				block := &result.View[mi].Content[bi]
+				if block.Type != "tool_result" || len(block.Content) < b.opts.PruneMinResultBytes {
+					continue
+				}
+				if b.summarizedIDs[block.ToolUseID] {
+					continue
+				}
+				summary := summarizeToolResult(block.ToolUseID, block.Content)
+				if len(summary) >= len(block.Content) {
+					continue
+				}
+				b.storeCABLocked(Hash(block.Content), block.Content)
+				saved += len(block.Content) - len(summary)
+				summarized++
+				block.Content = summary
+				b.mu.Lock()
+				b.summarizedIDs[block.ToolUseID] = true
+				b.mu.Unlock()
+			}
+		}
+	}
+
+	// Rearm after the history regrows the reclaimed amount.
+	b.mu.Lock()
+	b.pruneArmed = false
+	b.pruneRearmAt = saved
+	b.pruneSumBytes = 0
+	b.pruneSumCalls = 0
+	b.mu.Unlock()
+
+	result.SavedBytes = saved
+	result.Summarized = summarized
+	result.Committed = true
+	return result
+}
+
+// NotePruneGrowth feeds the prune-rearm accumulator with the provider-facing
+// byte growth of the view since the last prune commit. The budget rearms
+// once the growth covers the reclaimed bytes, so the next prune fires on a
+// fresh trigger-sized runway instead of churning the same head.
+func (b *Budget) NotePruneGrowth(viewBytes int) {
+	if b == nil || !b.Enabled() {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pruneArmed {
+		return
+	}
+	b.pruneSumBytes += viewBytes
+	b.pruneSumCalls++
+}
+
+// summarizeToolResult renders a deterministic one-line summary of a tool
+// result: the tool id, the tool's command/path when recoverable from common
+// shapes, and the size of the original. The bytes are stable for a given
+// payload so re-summarizing the same call id never changes the prefix.
+func summarizeToolResult(id, content string) string {
+	line := "tool result"
+	if id != "" {
+		line += " " + id
+	}
+	// Peek at the leading line for a command/path hint (bash command, file
+	// path, package name) so the model keeps the actionable part.
+	hint := ""
+	for _, candidate := range strings.Split(content, "\n") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if len(candidate) > 120 {
+			candidate = candidate[:120]
+		}
+		hint = candidate
+		break
+	}
+	if hint != "" {
+		line += ": " + hint
+	}
+	line += fmt.Sprintf(" [%d bytes; retrieve via retrieve_uncompressed_context key %s]", len(content), Hash(content))
+	if len(line) > 512 {
+		line = line[:512]
+	}
+	return "[summarized] " + line
+}
 func (b *Budget) decideDedup(id, content, hash string, seenThisView map[string]bool) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()

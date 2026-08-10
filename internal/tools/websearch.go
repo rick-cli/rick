@@ -536,7 +536,7 @@ func webSearchBudgetID(tc Context) string {
 
 func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var args searchArgs
-	if err := json.Unmarshal(in, &args); err != nil {
+	if err := RepairDecode(in, &args, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	args.Query = strings.TrimSpace(args.Query)
@@ -670,7 +670,7 @@ func (t WebSearchTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 	result.Meta["provider_diagnostics"] = providerDiagnostics
 	result.Meta["parallel"] = parallel
 	result.Meta["logical_budget_used"] = n
-	return result, nil
+	return repairNote(result, noteOf(tc)), nil
 }
 
 func webSearchDeadline(cfg *config.WebSearchConfig) time.Duration {

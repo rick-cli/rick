@@ -77,6 +77,7 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		{"enter", "send"},
 		{"esc", "interrupt a run"},
 		{"ctrl+c ×2", "quit"},
+		{"ctrl+v", "paste (instant, multi-line safe)"},
 		{"pgup/pgdn", "scroll a page"},
 		{"shift+↑/↓", "scroll a line"},
 		{"end", "jump to the newest output"},
@@ -89,6 +90,7 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 	}
 	b.WriteString("\n" + s.Accent.Render("mouse") + "\n")
 	b.WriteString("  " + s.Base.Render(padRight("scroll wheel", 22)) + s.Faint.Render("scroll the transcript") + "\n")
+	b.WriteString("  " + s.Base.Render(padRight("drag / shift+drag", 22)) + s.Faint.Render("select text — copy with ctrl+shift+c") + "\n")
 	b.WriteString("  " + s.Base.Render(padRight("click tool line", 22)) + s.Faint.Render("expand / collapse tool output") + "\n")
 	b.WriteString("  " + s.Base.Render(padRight("double-click path", 22)) + s.Faint.Render("copy file path to clipboard") + "\n")
 

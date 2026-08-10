@@ -440,6 +440,7 @@ func (m *Model) doResume(id string) {
 	m.compactionActive = false
 	m.autoCompactPending = false
 	m.lastAutoCompact = time.Time{}
+	m.compactIneffectiveStrikes = 0
 	m.resetSwarmRuntime()
 	sess, err := m.deps.Store.Load(id)
 	if err != nil {
@@ -658,6 +659,11 @@ func (m *Model) maybeAutoCompact() {
 		(!m.lastAutoCompact.IsZero() && time.Since(m.lastAutoCompact) < autoCompactCooldown) {
 		return
 	}
+	// Anti-thrash: after two compactions that each saved <10% of the window,
+	// stop auto-compacting — repeated ineffective folds only burn aux tokens.
+	if m.compactIneffectiveStrikes >= 2 {
+		return
+	}
 	used := m.usage.Input + m.usage.CacheRead + m.usage.CacheWrite + m.usage.Output
 	threshold := contextCompactionThreshold(m.ctxWindow, cfg.ContextReserve)
 	if used > threshold {
@@ -734,6 +740,10 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	}
 	head := append([]provider.Message(nil), m.history[:len(m.history)-keep]...)
 	tail := append([]provider.Message(nil), m.history[len(m.history)-keep:]...)
+	// Bound + redact the compaction input: the summary persists and re-enters
+	// the prompt on every later turn, so secrets must never reach it, and the
+	// aux call stays small even for a long session.
+	head = agent.CompactBoundMessages(head)
 	summaryMaxTokens := compactionTokenLimit(m.deps.Loaded.Config.MaxTokens)
 
 	m.setStatus("compacting…")

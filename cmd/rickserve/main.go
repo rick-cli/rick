@@ -326,7 +326,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.15"
+var rickVersion = "0.1.16"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {
@@ -549,10 +549,16 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
 			}
-			out[name] = openai.New(name, p.APIKey, p.BaseURL)
+			c := openai.New(name, p.APIKey, p.BaseURL)
+			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+			c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
+			out[name] = c
 		default:
 			if p.BaseURL != "" {
-				out[name] = openai.New(name, p.APIKey, p.BaseURL)
+				c := openai.New(name, p.APIKey, p.BaseURL)
+				c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+				c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
+				out[name] = c
 			}
 		}
 	}

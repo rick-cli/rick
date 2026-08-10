@@ -285,6 +285,18 @@
       "default": 0,
       "minimum": 0
     },
+    "cache_openrouter_response": {
+      "type": "boolean",
+      "description": "When true (default), enables OpenRouter's response cache (X-OpenRouter-Cache header) so byte-identical repeated requests — retries, warm, keep-alive, same sub-agent prompt twice — are served from the gateway's response cache at zero billing. Separate from prompt caching and works alongside it.",
+      "default": true
+    },
+    "cache_openrouter_response_ttl": {
+      "type": "integer",
+      "description": "Response-cache TTL in seconds sent with X-OpenRouter-Cache-TTL (1-86400). Zero omits the header and uses OpenRouter's default.",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 86400
+    },
     "cache_max_tool_result_bytes": {
       "type": "integer",
       "description": "Caps each tool_result payload sent to the model (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the provider prompt-cache hit ratio high on tool-heavy turns.",

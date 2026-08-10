@@ -95,7 +95,7 @@ type swarmArgs struct {
 
 func (t SwarmTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage) (tools.Result, error) {
 	var a swarmArgs
-	if err := json.Unmarshal(in, &a); err != nil {
+	if err := tools.RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	a.Action = strings.TrimSpace(a.Action)
@@ -197,7 +197,7 @@ type messageArgs struct {
 
 func (t MessageTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage) (tools.Result, error) {
 	var a messageArgs
-	if err := json.Unmarshal(in, &a); err != nil {
+	if err := tools.RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	if a.To == "" {
@@ -270,7 +270,7 @@ type boardArgs struct {
 
 func (t BoardTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage) (tools.Result, error) {
 	var a boardArgs
-	if err := json.Unmarshal(in, &a); err != nil {
+	if err := tools.RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	if t.Board == nil {

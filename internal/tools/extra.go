@@ -158,7 +158,7 @@ func (GitTool) Description() string {
 func (GitTool) Schema() map[string]any {
 	return obj(map[string]any{
 		"action": enumProp("What to do.", "status", "diff", "log", "branches", "changed_files"),
-		"path":   strProp("Specific file path for diff (optional)."),
+		"path":   pathProp("Specific file path for diff (optional)."),
 		"staged": boolProp("Show staged diff instead of unstaged."),
 		"count":  strProp("Number of log entries (default 10)."),
 		"since":  strProp("Ref to compare against for changed_files (default HEAD~1)."),
@@ -175,7 +175,7 @@ type gitArgs struct {
 
 func (GitTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a gitArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, GitTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Count == "" {
@@ -187,7 +187,8 @@ func (GitTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result,
 
 	switch a.Action {
 	case "status":
-		return gitRun(ctx, tc.Cwd, "status", "--short", "--branch")
+		res, err := gitRun(ctx, tc.Cwd, "status", "--short", "--branch")
+		return repairNote(res, noteOf(tc)), err
 	case "diff":
 		args := []string{"diff"}
 		if a.Staged {
@@ -199,13 +200,17 @@ func (GitTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result,
 		} else {
 			args = append(args, ".")
 		}
-		return gitRun(ctx, tc.Cwd, args...)
+		res, err := gitRun(ctx, tc.Cwd, args...)
+		return repairNote(res, noteOf(tc)), err
 	case "log":
-		return gitRun(ctx, tc.Cwd, "log", "--oneline", "-n", a.Count)
+		res, err := gitRun(ctx, tc.Cwd, "log", "--oneline", "-n", a.Count)
+		return repairNote(res, noteOf(tc)), err
 	case "branches":
-		return gitRun(ctx, tc.Cwd, "branch", "--list", "--no-color")
+		res, err := gitRun(ctx, tc.Cwd, "branch", "--list", "--no-color")
+		return repairNote(res, noteOf(tc)), err
 	case "changed_files":
-		return gitRun(ctx, tc.Cwd, "diff", "--name-only", a.Since, "--", ".")
+		res, err := gitRun(ctx, tc.Cwd, "diff", "--name-only", a.Since, "--", ".")
+		return repairNote(res, noteOf(tc)), err
 	default:
 		return Errf("unknown action %q", a.Action), nil
 	}
@@ -251,7 +256,7 @@ func (DiagnosticsTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 	var a struct {
 		Scope string `json:"scope"`
 	}
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, DiagnosticsTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Scope == "" {
@@ -260,9 +265,9 @@ func (DiagnosticsTool) Run(ctx context.Context, tc Context, in json.RawMessage) 
 
 	out, err := runBoundedCommand(ctx, tc.Cwd, "go", "build", a.Scope)
 	if err == nil {
-		return Result{Output: fmt.Sprintf("no errors in %s", a.Scope), Title: "diagnostics"}, nil
+		return repairNote(Result{Output: fmt.Sprintf("no errors in %s", a.Scope), Title: "diagnostics"}, noteOf(tc)), nil
 	}
-	return Result{Output: fmt.Sprintf("go build %s:\n%s", a.Scope, strings.TrimSpace(out)), Title: "build errors"}, nil
+	return repairNote(Result{Output: fmt.Sprintf("go build %s:\n%s", a.Scope, strings.TrimSpace(out)), Title: "build errors"}, noteOf(tc)), nil
 }
 
 // TestTool runs scoped Go tests with failures-only output.
@@ -290,7 +295,7 @@ func (TestTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result
 		Verbose bool   `json:"verbose"`
 		Related bool   `json:"related"`
 	}
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, TestTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Scope == "" {
@@ -309,9 +314,9 @@ func (TestTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result
 	out, err := runBoundedCommand(ctx, tc.Cwd, "go", args...)
 
 	if err == nil {
-		return Result{Output: fmt.Sprintf("PASS: go test %s", a.Scope), Title: "test " + a.Scope}, nil
+		return repairNote(Result{Output: fmt.Sprintf("PASS: go test %s", a.Scope), Title: "test " + a.Scope}, noteOf(tc)), nil
 	}
-	return Result{Output: fmt.Sprintf("FAIL: go test %s\n%s", a.Scope, strings.TrimSpace(out)), Title: "test " + a.Scope}, nil
+	return repairNote(Result{Output: fmt.Sprintf("FAIL: go test %s\n%s", a.Scope, strings.TrimSpace(out)), Title: "test " + a.Scope}, noteOf(tc)), nil
 }
 
 // TreeTool provides a token-capped directory listing.
@@ -327,7 +332,7 @@ func (TreeTool) Description() string {
 
 func (TreeTool) Schema() map[string]any {
 	return obj(map[string]any{
-		"path":    strProp("Directory to list (default project root)."),
+		"path":    pathProp("Directory to list (default project root)."),
 		"depth":   strProp("Max depth (default 3)."),
 		"pattern": strProp("Glob pattern to filter (e.g. '*.go', '*.md')."),
 	}, "path")
@@ -339,7 +344,7 @@ func (TreeTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 		Depth   int    `json:"depth"`
 		Pattern string `json:"pattern"`
 	}
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, TreeTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Path == "" {
@@ -353,7 +358,7 @@ func (TreeTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 	if err != nil {
 		return Errf("tree: %v", err), nil
 	}
-	return Result{Output: tree, Title: "tree " + a.Path}, nil
+	return repairNote(Result{Output: tree, Title: "tree " + a.Path}, noteOf(tc)), nil
 }
 
 func buildTree(root string, depth int, pattern string, indent string) (string, error) {
@@ -438,7 +443,7 @@ func (FetchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resul
 		URL     string `json:"url"`
 		Extract string `json:"extract"`
 	}
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, FetchTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if !strings.HasPrefix(a.URL, "http://") && !strings.HasPrefix(a.URL, "https://") {
@@ -487,7 +492,7 @@ func (FetchTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resul
 		result.Title = "links: " + a.URL
 	}
 	storeFetchResult(cacheKey, result)
-	return result, nil
+	return repairNote(result, noteOf(tc)), nil
 }
 
 func extractFetchedContent(body, contentType, extract string) string {
@@ -555,7 +560,7 @@ func (MemoryTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		Key    string `json:"key"`
 		Value  string `json:"value"`
 	}
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, MemoryTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Action == "" {
@@ -583,7 +588,7 @@ func (MemoryTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if err := os.WriteFile(path, data, 0o644); err != nil {
 			return Errf("store: %v", err), nil
 		}
-		return Result{Output: fmt.Sprintf("stored %s", a.Key), Title: "memory"}, nil
+		return repairNote(Result{Output: fmt.Sprintf("stored %s", a.Key), Title: "memory"}, noteOf(tc)), nil
 	case "get":
 		if a.Key == "" {
 			return Errf("key required"), nil
@@ -594,7 +599,7 @@ func (MemoryTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 			if !os.IsNotExist(err) {
 				return Errf("get: %v", err), nil
 			}
-			return Result{Output: fmt.Sprintf("no memory for %s", a.Key), Title: "memory"}, nil
+			return repairNote(Result{Output: fmt.Sprintf("no memory for %s", a.Key), Title: "memory"}, noteOf(tc)), nil
 		}
 		defer file.Close()
 		data, err := io.ReadAll(io.LimitReader(file, maxMemoryFileBytes+1))
@@ -608,7 +613,7 @@ func (MemoryTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if err := json.Unmarshal(data, &m); err != nil {
 			return Errf("get: invalid memory file: %v", err), nil
 		}
-		return Result{Output: m["value"], Title: "memory " + a.Key}, nil
+		return repairNote(Result{Output: m["value"], Title: "memory " + a.Key}, noteOf(tc)), nil
 	case "list":
 		entries, err := os.ReadDir(memDir)
 		if err != nil && !os.IsNotExist(err) {
@@ -623,7 +628,7 @@ func (MemoryTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 				}
 			}
 		}
-		return Result{Output: strings.Join(keys, "\n"), Title: "memory"}, nil
+		return repairNote(Result{Output: strings.Join(keys, "\n"), Title: "memory"}, noteOf(tc)), nil
 	case "delete":
 		if a.Key == "" {
 			return Errf("key required"), nil
@@ -631,7 +636,7 @@ func (MemoryTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if err := os.Remove(filepath.Join(memDir, sanitizeKey(a.Key)+".json")); err != nil && !os.IsNotExist(err) {
 			return Errf("delete: %v", err), nil
 		}
-		return Result{Output: fmt.Sprintf("deleted %s", a.Key), Title: "memory"}, nil
+		return repairNote(Result{Output: fmt.Sprintf("deleted %s", a.Key), Title: "memory"}, noteOf(tc)), nil
 	default:
 		return Errf("unknown action %q", a.Action), nil
 	}

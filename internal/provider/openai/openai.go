@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +49,13 @@ type Client struct {
 	// cache-read tokens — evidence the provider evicted the prefix despite
 	// the loop, surfaced so the effective keep-alive interval can be tuned.
 	kaColdKeepalives int64
+
+	// Response-cache state (OpenRouter): when enabled, requests carry
+	// X-OpenRouter-Cache (+ optional TTL) so byte-identical repeated requests
+	// are served at zero billing from the gateway's response cache, and the
+	// X-OpenRouter-Cache-Status header is surfaced per request.
+	orRespCache    bool
+	orRespCacheTTL int
 }
 
 // kaSession remembers the last stream-shaped wire body per session so the
@@ -100,6 +108,14 @@ func (c *Client) SetKeepalive(interval time.Duration) {
 		return
 	}
 	c.kaInterval = interval
+}
+
+// SetOpenRouterResponseCache enables OpenRouter's response cache for this
+// client. ttlSeconds, when positive, is sent as X-OpenRouter-Cache-TTL
+// (1-86400); zero uses the gateway default.
+func (c *Client) SetOpenRouterResponseCache(enabled bool, ttlSeconds int) {
+	c.orRespCache = enabled
+	c.orRespCacheTTL = ttlSeconds
 }
 
 // noteKeepalive records the stream body that just went out so the keep-alive
@@ -413,6 +429,23 @@ func deepseekWire(id string) bool {
 	return id == "opencode-zen" || id == "opencode-go" || id == "deepseek"
 }
 
+// cacheControlMarked reports whether this provider honors an Anthropic-style
+// cache_control marker on the OpenAI wire. Qwen (served by opencode-go),
+// Kimi/Moonshot and MiniMax accept the marker to keep the stable system
+// prefix cached explicitly; plain OpenAI and DeepSeek-line endpoints ignore
+// it (or reject unknown message fields), so it stays off for them.
+func (c *Client) cacheControlMarked() bool {
+	switch c.ID {
+	case "kimi", "kimi-cn", "kimi-for-coding", "minimax", "minimax-cn", "minimax-coding-plan", "qwen":
+		return true
+	}
+	if strings.Contains(strings.ToLower(c.ID), "qwen") ||
+		strings.Contains(strings.ToLower(c.BaseURL), "qwen") {
+		return true
+	}
+	return false
+}
+
 func (c *Client) SetAPIKey(key string) {
 	c.APIKey = key
 }
@@ -445,6 +478,15 @@ type wireMessage struct {
 	ReasoningContent *string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	// CacheControl is an Anthropic-style prompt-cache marker. Some
+	// OpenAI-compatible gateways (Qwen on opencode-go, Kimi/Moonshot,
+	// MiniMax) honor cache_control on the wire to keep the stable system
+	// prefix cached; plain OpenAI and DeepSeek-line endpoints ignore it.
+	CacheControl *wireCacheControl `json:"cache_control,omitempty"`
+}
+
+type wireCacheControl struct {
+	Type string `json:"type"`
 }
 
 type wireTool struct {
@@ -479,14 +521,21 @@ type wireRequest struct {
 	Reasoning      *wireReasoning `json:"reasoning,omitempty"`
 }
 
-// promptCacheKey derives a session-scoped cache key. The session id is stable
-// across resume, so a restarted session keeps hitting the same cache even if
-// the volatile system tail drifts between sessions.
-func promptCacheKey(model, sessionID string) string {
-	if strings.TrimSpace(sessionID) == "" {
+// promptCacheKey derives a cache-key scope for the request. Interactive
+// sessions use the session id (stable across resume), so a restarted session
+// keeps hitting the same cache even if the volatile system tail drifts.
+// Non-interactive runs (cron, rickserve one-shots) pass a CacheScopeKey
+// derived from the stable prompt content so identical runs share a warm
+// bucket instead of cold-writing a fresh prefix each time.
+func promptCacheKey(model, sessionID, scopeKey string) string {
+	scope := scopeKey
+	if scope == "" {
+		scope = sessionID
+	}
+	if strings.TrimSpace(scope) == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(model + "\x00" + sessionID))
+	digest := sha256.Sum256([]byte(model + "\x00" + scope))
 	return hex.EncodeToString(digest[:])
 }
 
@@ -582,9 +631,21 @@ func (c *Client) wireReasoning(req provider.Request) (style provider.ReasoningSt
 // per-turn tail. Direct OpenAI caching can then retain the stable prefix while
 // the volatile environment and skill instructions continue to be sent.
 func toWireWithStable(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning bool) []wireMessage {
+	return toWireWithStableMarked(system, stable, msgs, includeReasoning, retainAllReasoning, false)
+}
+
+// toWireWithStableMarked is toWireWithStable with an optional Anthropic-style
+// cache_control marker on the stable system message. Gateways that honor the
+// marker (Qwen on opencode-go, Kimi/Moonshot, MiniMax) keep the stable prefix
+// cached explicitly; others ignore the field.
+func toWireWithStableMarked(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning, cacheMarked bool) []wireMessage {
 	var out []wireMessage
 	if strings.TrimSpace(stable) != "" && strings.HasPrefix(system, stable) {
-		out = append(out, wireMessage{Role: "system", Content: stable})
+		stableMsg := wireMessage{Role: "system", Content: stable}
+		if cacheMarked {
+			stableMsg.CacheControl = &wireCacheControl{Type: "ephemeral"}
+		}
+		out = append(out, stableMsg)
 		if tail := strings.TrimPrefix(system, stable); strings.TrimSpace(tail) != "" {
 			out = append(out, wireMessage{Role: "system", Content: tail})
 		}
@@ -795,6 +856,16 @@ func (c *Client) doCompletions(ctx context.Context, raw []byte, extraHeaders htt
 		if c.APIKey != "" {
 			httpReq.Header.Set("authorization", "Bearer "+c.APIKey)
 		}
+		// OpenRouter response cache: identical repeated requests (retries,
+		// warm, keep-alive, same sub-agent prompt twice) are served from the
+		// gateway's response cache at zero billing. Separate from prompt
+		// caching and works alongside it.
+		if c.orRespCache && (c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai")) {
+			httpReq.Header.Set("X-OpenRouter-Cache", "true")
+			if c.orRespCacheTTL > 0 {
+				httpReq.Header.Set("X-OpenRouter-Cache-TTL", strconv.Itoa(c.orRespCacheTTL))
+			}
+		}
 		for k, v := range c.Headers {
 			httpReq.Header.Set(k, v)
 		}
@@ -890,7 +961,7 @@ func (c *Client) buildWireBody(req provider.Request, streaming, includeUsage boo
 		Tools:          toWireTools(req.Tools),
 		Stream:         streaming,
 		Temperature:    req.Temperature,
-		PromptCacheKey: promptCacheKey(req.Model, req.SessionID),
+		PromptCacheKey: promptCacheKey(req.Model, req.SessionID, req.CacheScopeKey),
 	}
 	if streaming {
 		body.StreamOpts = &streamOpts{IncludeUsage: includeUsage}
@@ -902,8 +973,8 @@ func (c *Client) buildWireBody(req provider.Request, streaming, includeUsage boo
 	} else {
 		body.MaxTokens = req.MaxTokens
 	}
-	if c.ID == "openai" || deepseekWire(c.ID) {
-		body.Messages = toWireWithStable(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning)
+	if c.ID == "openai" || deepseekWire(c.ID) || c.cacheControlMarked() {
+		body.Messages = toWireWithStableMarked(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning, c.cacheControlMarked())
 	}
 	if c.ID != "openai" {
 		// OpenAI-compatible gateways do not all accept OpenAI's cache-routing
@@ -1039,6 +1110,14 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	}
 	defer resp.Body.Close()
 
+	// OpenRouter response cache: a HIT means this byte-identical request was
+	// served from the gateway's response cache at zero billing. Surface it on
+	// the usage event so telemetry can count response-cache hits separately
+	// from prompt-cache reads.
+	respCacheHit := c.orRespCache &&
+		(c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai")) &&
+		strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-OpenRouter-Cache-Status")), "HIT")
+
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		emit(provider.Event{Kind: provider.EventError,
@@ -1046,9 +1125,8 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		return
 	}
 
-	c.readSSE(ctx, resp.Body, emit)
+	c.readSSE(ctx, resp.Body, emit, respCacheHit)
 }
-
 func isLocal(u string) bool {
 	return strings.Contains(u, "localhost") || strings.Contains(u, "127.0.0.1")
 }
@@ -1059,7 +1137,7 @@ type callAccum struct {
 	args strings.Builder
 }
 
-func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Event) bool) {
+func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Event) bool, respCacheHit bool) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
 
@@ -1068,6 +1146,7 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 	stopReason := ""
 	sawOutput := false
 	completed := false
+	usage.ResponseCacheHit = respCacheHit
 
 	flushCalls := func() bool {
 		// Validate the complete batch before emitting any call. This preserves

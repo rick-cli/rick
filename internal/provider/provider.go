@@ -218,6 +218,13 @@ type Request struct {
 	// session-affinity routing hints. Stable across resume so a restarted
 	// session keeps hitting the same cache.
 	SessionID string
+	// CacheScopeKey, when set, replaces SessionID as the prompt-cache key
+	// scope. Repeated non-interactive runs (cron, rickserve one-shots, CI)
+	// each mint a fresh session id that would cold-write the prefix every
+	// run; deriving the scope from the stable prompt content instead lets
+	// identical runs share a warm bucket while separate conversations never
+	// collide. Empty falls back to SessionID.
+	CacheScopeKey string
 }
 
 // Usage reports token accounting for a turn.
@@ -226,6 +233,10 @@ type Usage struct {
 	OutputTokens     int
 	CacheReadTokens  int
 	CacheWriteTokens int
+	// ResponseCacheHit is true when the gateway served this request from its
+	// response cache (OpenRouter X-OpenRouter-Cache-Status: HIT), i.e. a
+	// byte-identical request returned a cached response at zero billing.
+	ResponseCacheHit bool
 }
 
 // EventKind enumerates stream event types.

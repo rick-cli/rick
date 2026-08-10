@@ -28,7 +28,7 @@ func (CodeSymbolsTool) Description() string {
 func (CodeSymbolsTool) Schema() map[string]any {
 	return obj(map[string]any{
 		"action": enumProp("What to do.", "symbols", "definition", "references"),
-		"path":   strProp("Go source file path (absolute or relative to project root)."),
+		"path":   pathProp("Go source file path (absolute or relative to project root)."),
 		"symbol": strProp("Symbol name to look up (required for definition/references)."),
 	}, "action", "path")
 }
@@ -41,7 +41,7 @@ type codeSymbolsArgs struct {
 
 func (t CodeSymbolsTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a codeSymbolsArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Path == "" {
@@ -63,14 +63,25 @@ func (t CodeSymbolsTool) Run(_ context.Context, tc Context, in json.RawMessage) 
 
 	switch a.Action {
 	case "symbols":
-		return listSymbols(fset, f, p, tc.Cwd)
+		res, err := listSymbols(fset, f, p, tc.Cwd)
+		return repairNote(res, noteOf(tc)), err
 	case "definition":
-		return findDefinition(fset, f, a.Symbol, p, tc.Cwd)
+		res, err := findDefinition(fset, f, a.Symbol, p, tc.Cwd)
+		return repairNote(res, noteOf(tc)), err
 	case "references":
-		return findReferences(fset, f, a.Symbol, p, tc.Cwd)
+		res, err := findReferences(fset, f, a.Symbol, p, tc.Cwd)
+		return repairNote(res, noteOf(tc)), err
 	default:
 		return Errf("unknown action %q (symbols | definition | references)", a.Action), nil
 	}
+}
+
+// noteOf reads the per-call repair note threaded through Context.
+func noteOf(tc Context) string {
+	if tc.Repair != nil && tc.Repair.Note != nil {
+		return *tc.Repair.Note
+	}
+	return ""
 }
 
 func listSymbols(fset *token.FileSet, f *ast.File, path, cwd string) (Result, error) {

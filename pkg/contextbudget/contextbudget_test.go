@@ -1,6 +1,7 @@
 package contextbudget
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -364,5 +365,99 @@ func TestCompressLiveIsDeterministicAcrossRounds(t *testing.T) {
 	fresh := New(Options{})
 	if again, _ := fresh.CompressLive("call-1", payload); again != first {
 		t.Fatal("CompressLive output differs between budget instances")
+	}
+}
+
+func TestPruneOldToolResultsCommitsOnceAndRearms(t *testing.T) {
+	opts := Options{
+		PruneMinResultBytes:  256,
+		PruneMinReclaimBytes: 400,
+		PruneLiveZoneTurns:   1,
+	}
+	b := New(opts)
+
+	// Three old tool calls with bulky results plus a fresh live-zone user turn.
+	msgs := []provider.Message{
+		{Role: "assistant", Content: []provider.ContentBlock{
+			{Type: "tool_use", ID: "call-1", Name: "bash", Input: json.RawMessage(`{"command":"npm test"}`)},
+		}},
+		{Role: "user", Content: []provider.ContentBlock{
+			{Type: "tool_result", ToolUseID: "call-1", Content: strings.Repeat("test output line\n", 30)},
+		}},
+		{Role: "assistant", Content: []provider.ContentBlock{
+			{Type: "tool_use", ID: "call-2", Name: "read", Input: json.RawMessage(`{"path":"main.go"}`)},
+		}},
+		{Role: "user", Content: []provider.ContentBlock{
+			{Type: "tool_result", ToolUseID: "call-2", Content: strings.Repeat("package main\n", 30)},
+		}},
+		{Role: "user", Content: []provider.ContentBlock{{Type: "text", Text: "keep going"}}},
+	}
+
+	// First prune: reclaim is large (two bulky results), commits.
+	r1 := b.PruneOldToolResults(msgs)
+	if !r1.Committed {
+		t.Fatalf("first prune did not commit: saved=%d", r1.SavedBytes)
+	}
+	if r1.SavedBytes < 400 {
+		t.Fatalf("first prune saved %d bytes, want >= 400", r1.SavedBytes)
+	}
+	if r1.Summarized != 2 {
+		t.Fatalf("first prune summarized %d, want 2", r1.Summarized)
+	}
+	for _, m := range r1.View {
+		for _, block := range m.Content {
+			if block.Type == "tool_result" && !strings.HasPrefix(block.Content, "[summarized]") && len(block.Content) > 256 {
+				t.Fatalf("bulky result not summarized: %q", block.Content[:40])
+			}
+		}
+	}
+	// Originals stayed retrievable by content address.
+	for _, m := range msgs {
+		for _, block := range m.Content {
+			if block.Type == "tool_result" && len(block.Content) > 256 {
+				if _, ok := b.StoredPayload(Hash(block.Content)); !ok {
+					t.Fatal("original payload not stored under its content address")
+				}
+			}
+		}
+	}
+
+	// Second prune on the same view: everything is already summarized, so no
+	// reclaim and no commit.
+	r2 := b.PruneOldToolResults(r1.View)
+	if r2.Committed || r2.SavedBytes != 0 {
+		t.Fatalf("second prune committed (%d bytes) when nothing was reclaimable", r2.SavedBytes)
+	}
+
+	// Rearm: feed growth past the reclaimed bytes, then a fresh bulky result
+	// older than the live zone commits again.
+	b.NotePruneGrowth(r1.SavedBytes + 100)
+	extra := []provider.Message{
+		{Role: "assistant", Content: []provider.ContentBlock{
+			{Type: "tool_use", ID: "call-3", Name: "bash", Input: json.RawMessage(`{"command":"go build"}`)},
+		}},
+		{Role: "user", Content: []provider.ContentBlock{
+			{Type: "tool_result", ToolUseID: "call-3", Content: strings.Repeat("build log line\n", 60)},
+		}},
+		{Role: "user", Content: []provider.ContentBlock{{Type: "text", Text: "and now"}}},
+	}
+	combined := append(append([]provider.Message(nil), r1.View...), extra...)
+	r3 := b.PruneOldToolResults(combined)
+	if !r3.Committed {
+		t.Fatalf("prune did not rearm and commit after growth")
+	}
+}
+
+func TestSummarizeToolResultDeterministic(t *testing.T) {
+	a := summarizeToolResult("call-9", "first line of output\nsecond line\n")
+	b := summarizeToolResult("call-9", "first line of output\nsecond line\n")
+	if a != b {
+		t.Fatalf("summary not deterministic: %q vs %q", a, b)
+	}
+	if !strings.Contains(a, "call-9") {
+		t.Fatalf("summary missing call id: %q", a)
+	}
+	if !strings.Contains(a, "first line of output") {
+		t.Fatalf("summary missing leading hint: %q", a)
 	}
 }

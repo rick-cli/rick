@@ -65,3 +65,58 @@ func TestDayCacheHitRate(t *testing.T) {
 		}
 	}
 }
+
+func TestRecordRepairPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	tracker := New(dir)
+	if err := tracker.RecordRepair("deepseek/deepseek-v4-flash", "read"); err != nil {
+		t.Fatalf("RecordRepair returned error: %v", err)
+	}
+	if err := tracker.RecordRepair("deepseek/deepseek-v4-flash", "read"); err != nil {
+		t.Fatalf("second RecordRepair returned error: %v", err)
+	}
+	if err := tracker.RecordRepair("deepseek/deepseek-v4-flash", "edit"); err != nil {
+		t.Fatalf("third RecordRepair returned error: %v", err)
+	}
+	if err := tracker.Flush(); err != nil {
+		t.Fatalf("Flush returned error: %v", err)
+	}
+
+	reloaded := New(dir)
+	counts := reloaded.RepairsForModel("deepseek/deepseek-v4-flash")
+	if counts.Total != 3 {
+		t.Fatalf("total = %d, want 3", counts.Total)
+	}
+	if counts.Tools["read"] != 2 || counts.Tools["edit"] != 1 {
+		t.Fatalf("tool counts = %+v, want read:2 edit:1", counts.Tools)
+	}
+}
+
+func TestRecordRepairIgnoresEmptyKeys(t *testing.T) {
+	tracker := New(t.TempDir())
+	if err := tracker.RecordRepair("", "read"); err != nil {
+		t.Fatalf("empty model returned error: %v", err)
+	}
+	if err := tracker.RecordRepair("model", ""); err != nil {
+		t.Fatalf("empty tool returned error: %v", err)
+	}
+	if counts := tracker.RepairsForModel("model"); counts.Total != 0 {
+		t.Fatalf("empty-key calls must not be counted, got %+v", counts)
+	}
+}
+
+func TestLoadLegacyFileWithoutRepairs(t *testing.T) {
+	// Files written before repair telemetry existed must still load.
+	dir := t.TempDir()
+	legacy := "{\n  \"2026-08-01\": {\n    \"model\": {\n      \"days\": {\"2026-08-01\": {\"input\": 1, \"output\": 2}},\n      \"total\": {\"input\": 1, \"output\": 2}\n    }\n  }\n}\n"
+	if err := os.WriteFile(dir+"/usage.json", []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+	tracker := New(dir)
+	if !tracker.DateExists("2026-08-01") {
+		t.Fatal("legacy usage not loaded")
+	}
+	if counts := tracker.RepairsForModel("model"); counts.Total != 0 {
+		t.Fatalf("legacy file must have no repairs, got %+v", counts)
+	}
+}

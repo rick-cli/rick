@@ -107,3 +107,20 @@ func processNames(t *testing.T) map[uint32]string {
 	}
 	return out
 }
+
+// Text clipboard round-trip: writeClipboardText must store text that
+// readClipboardText returns byte-identical (CRLF normalized), so Ctrl+C/Ctrl+V
+// in rick behaves like a normal terminal.
+func TestClipboardTextRoundTrip(t *testing.T) {
+	want := "line one\nline two\nthird"
+	if err := writeClipboardText(want); err != nil {
+		t.Skipf("clipboard unavailable in this session: %v", err)
+	}
+	got, err := readClipboardText()
+	if err != nil {
+		t.Fatalf("readClipboardText: %v", err)
+	}
+	if got != want {
+		t.Fatalf("round-trip mismatch: got %q want %q", got, want)
+	}
+}

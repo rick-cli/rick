@@ -5,6 +5,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +64,10 @@ type ToolEvent struct {
 	IsError      bool
 	Elapsed      time.Duration
 	Optimization *OptimizationStats
+	// Repaired describes any tool-call repair applied to this call's args
+	// ("" when none). The note is also appended to Output so the model sees
+	// it; this field carries it separately for the TUI and telemetry.
+	Repaired string
 }
 
 // OptimizationStats describes the provider-facing reduction for one tool
@@ -194,6 +200,13 @@ type Config struct {
 	// turn. A cache-warm provider call in this package must remain optional;
 	// a provider that doesn't implement CacheWarmber is skipped.
 	WarmCache bool
+	// CacheScopeKey, when set, is used as the prompt-cache key scope for
+	// every request of this run, replacing the session id. Non-interactive
+	// runs (cron, rickserve one-shots, CI) each mint a fresh session id that
+	// would cold-write the provider prefix every run; deriving the scope
+	// from the stable prompt content instead lets identical runs share a
+	// warm bucket while separate conversations never collide.
+	CacheScopeKey string
 	// MaxReasoningTurns caps the prior-turn reasoning echoed back to
 	// DeepSeek-line providers (0 = keep all, byte-stable prefix).
 	MaxReasoningTurns int
@@ -217,6 +230,10 @@ type Runner struct {
 
 	// budget is the shared session context manager, or a private fallback.
 	budget *contextbudget.Budget
+
+	// repairFamily is the model-family gate for tool-call repair quirks
+	// ("deepseek", "glm", "qwen", ...), derived once from cfg.Model.
+	repairFamily string
 
 	// repoMapOnce/repoMapBlock compute the RepoMap once per run using the
 	// active chat prompt; the block is byte-identical across turns so it does
@@ -262,6 +279,11 @@ type Runner struct {
 	// was dispatched, used to spot idle gaps past the provider cache TTL so
 	// the next turn can re-prime the full prefix before streaming (P1c).
 	lastRequest time.Time
+	// lastViewBytes is the serialized size of the provider view sent last
+	// turn; the per-turn growth feeds the prune-rearm accumulator so a
+	// disarmed prune commits again only after the history regrows a
+	// trigger-sized runway.
+	lastViewBytes int
 	// warmErrWarned dedupes warming-failure notices to one per distinct
 	// error message per run, so a broken warm is surfaced without spamming.
 	warmErrWarned string
@@ -276,7 +298,7 @@ func New(cfg Config) *Runner {
 	if budget == nil {
 		budget = contextbudget.New(contextbudget.Options{})
 	}
-	return &Runner{cfg: cfg, budget: budget}
+	return &Runner{cfg: cfg, budget: budget, repairFamily: tools.FamilyForModel(cfg.Model)}
 }
 
 // Cfg exposes the runner configuration (read-only use).
@@ -853,25 +875,55 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 	if stableSystem != "" && strings.HasPrefix(volatileSystem, stableSystem) {
 		volatileSystem = strings.TrimPrefix(volatileSystem, stableSystem)
 	}
+	// The budget is planned against the capped view (not the raw transcript):
+	// when a one-shot reasoning cap strips stale thinking, the wire only
+	// ships the newest turn's reasoning, so charging all of it for the trim
+	// decision would reserve budget for bytes that never reach the provider
+	// and fire distillation prematurely.
+	view := r.cappedMessages(messages, encoding)
+	if r.budget.Enabled() {
+		view = r.budget.ApplyDedup(view).View
+	}
 	plan := budget.Plan(budget.Input{
 		ContextWindow:        contextWindow,
 		StableSystemTokens:   countTokens(stableSystem, encoding),
 		VolatileSystemTokens: countTokens(volatileSystem, encoding),
 		ToolSchemaTokens:     countJSONValues(schemas, encoding),
-		MessageTokens:        countMessages(messages, encoding),
+		MessageTokens:        countMessages(view, encoding),
 		ReservedOutputTokens: reservedOutput,
 		SafetyMarginTokens:   r.cfg.SafetyMarginTokens,
 	})
 
-	// Content-addressed dedup runs before trimming: the replacement set is
-	// persistent across turns, so the surviving bytes stay stable even when
-	// trimming later moves a payload's first occurrence out of the view.
-	view := r.cappedMessages(messages, encoding)
-	if r.budget.Enabled() {
-		view = r.budget.ApplyDedup(view).View
-	}
 	retained := r.retainStable(view, plan.RetainedMessageTokens, encoding)
 	boundaries := r.budget.ChooseBoundaries(retained)
+
+	// Proactive tool-result pruning: deterministically shrink old bulky tool
+	// results into 1-line summaries (P0-2/P1-2). The commit is gated on the
+	// measured reclaim and rearmed by growth, so it fires episodically —
+	// one cache boundary per commit — instead of rewriting every turn. The
+	// growth signal is the view's byte growth since the last sent view.
+	// Distillation supersedes it: when the transcript is close enough to the
+	// budget that the oldest prefix will be collapsed into a summary anyway,
+	// let that single deliberate rewrite happen instead of also churning the
+	// head with per-result summaries.
+	if r.budget.Enabled() && len(retained) > 0 && !r.shouldDistill(plan, contextWindow) {
+		viewBytes := serializeViewBytes(retained)
+		if r.lastViewBytes > 0 && viewBytes > r.lastViewBytes {
+			r.budget.NotePruneGrowth(viewBytes - r.lastViewBytes)
+		}
+		if pruned := r.budget.PruneOldToolResults(retained); pruned.Committed {
+			retained = pruned.View
+			boundaries = r.budget.ChooseBoundaries(retained)
+			r.lastMutation = "tool-prune"
+			// A prune rewrites the old head; reset the stable-head sentinel
+			// so the new head stays fixed and the view resumes append-only
+			// growth (same contract as distill).
+			r.trimEngaged = false
+			r.trimStart = 0
+			r.trimHead = provider.Message{}
+		}
+		r.lastViewBytes = serializeViewBytes(retained)
+	}
 
 	// State distillation: when the transcript approaches the context budget,
 	// collapse the oldest stable prefix into a structured summary placed just
@@ -903,6 +955,7 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		CacheRetention:    r.cfg.CacheRetention,
 		MaxReasoningTurns: r.wireReasoningTurns(),
 		SessionID:         r.cfg.SessionID,
+		CacheScopeKey:     r.cfg.CacheScopeKey,
 	}
 }
 
@@ -1130,6 +1183,21 @@ func hashBytes(b []byte) string {
 	return contextbudget.Hash(string(b))
 }
 
+// CacheScopeKeyFor derives a content-addressed prompt-cache scope for a
+// non-interactive run: a digest of the model, stable system prefix, and
+// canonical tool list. Repeated runs with identical prompts (cron,
+// rickserve one-shots, CI) share a warm provider bucket, while separate
+// conversations never collide. Interactive sessions keep using the session
+// id instead (see provider.Request.CacheScopeKey).
+func CacheScopeKeyFor(model, stableSystem string, tools []provider.ToolSchema) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		model,
+		stableSystem,
+		string(marshalBytes(provider.CanonicalToolSchemas(tools))),
+	}, "\x00")))
+	return hex.EncodeToString(digest[:])
+}
+
 func marshalBytes(v any) []byte {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -1204,7 +1272,17 @@ func countJSONValues(value any, encoding tokens.Encoding) int {
 func countMessages(messages []provider.Message, encoding tokens.Encoding) int {
 	total := 0
 	for _, message := range messages {
-		total += countTokens(string(tokens.Marshal(message)), encoding) + 4
+		total += tokens.CountMessage(message, encoding)
+	}
+	return total
+}
+
+// serializeViewBytes returns the serialized byte size of a provider view,
+// used as the growth signal for the proactive-prune rearm accumulator.
+func serializeViewBytes(messages []provider.Message) int {
+	total := 0
+	for _, message := range messages {
+		total += len(tokens.Marshal(message))
 	}
 	return total
 }
@@ -1378,6 +1456,7 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		}
 	}
 
+	var repairNoteVar string
 	tc := tools.Context{
 		Cwd:       r.cfg.Cwd,
 		SessionID: r.cfg.SessionID,
@@ -1385,6 +1464,7 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 		AgentID:   r.cfg.AgentID,
 		CallID:    call.ID,
 		Depth:     r.cfg.Depth,
+		Repair:    &tools.RepairOpts{Note: &repairNoteVar, Family: r.repairFamily},
 	}
 	res, err := t.Run(ctx, tc, input)
 	ev.Elapsed = time.Since(start)
@@ -1398,6 +1478,13 @@ func (r *Runner) execOne(ctx context.Context, call provider.ToolCall) (provider.
 	ev.IsError = res.IsError
 	if res.Title != "" {
 		ev.Title = res.Title
+	}
+	// Surface any tool-call repair the tool applied: the note is already in
+	// res.Output (each tool appends "<repaired: …>"), and it is mirrored in
+	// ToolEvent.Repaired for the TUI and per-model telemetry. A repaired call
+	// succeeded, so it is never an error.
+	if repairNoteVar != "" {
+		ev.Repaired = repairNoteVar
 	}
 
 	// plugin hook: tool.execute.after

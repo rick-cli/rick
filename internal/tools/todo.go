@@ -101,9 +101,9 @@ type todoArgs struct {
 }
 
 // Run implements Tool.
-func (t TodoWriteTool) Run(_ context.Context, _ Context, in json.RawMessage) (Result, error) {
+func (t TodoWriteTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a todoArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	inProgress := 0
@@ -142,11 +142,11 @@ func (t TodoWriteTool) Run(_ context.Context, _ Context, in json.RawMessage) (Re
 	if inProgress > 1 {
 		note = "\nnote: more than one item is in_progress; keep it to one."
 	}
-	return Result{
+	return repairNote(Result{
 		Output: fmt.Sprintf("task list updated (%d/%d done)\n%s%s", done, total, b.String(), note),
 		Title:  fmt.Sprintf("todos %d/%d", done, total),
 		Meta:   map[string]any{"todos": a.Todos},
-	}, nil
+	}, noteOf(tc)), nil
 }
 
 // TodoReadTool returns the current list.

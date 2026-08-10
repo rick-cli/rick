@@ -80,6 +80,11 @@ type RequestUsage struct {
 	// view). It makes the reasoning-echo fresh-tail cost measurable per
 	// request so `cache_max_reasoning_turns` can be tuned from real data.
 	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	// ResponseCacheHit records whether the gateway served this request from
+	// its response cache (OpenRouter X-OpenRouter-Cache-Status: HIT) — a
+	// byte-identical repeated request billed at zero. Counted separately from
+	// prompt-cache reads so the response-cache hit rate is measurable.
+	ResponseCacheHit bool `json:"response_cache_hit,omitempty"`
 }
 
 // OptimizationUsage accumulates exact local measurements for provider-facing

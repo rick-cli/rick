@@ -55,7 +55,7 @@ func (BashTool) Schema() map[string]any {
 		"command":     strProp("Shell command to execute."),
 		"description": strProp("Short description of what this command does (shown to the user)."),
 		"timeout":     numProp("Timeout in seconds. Default 120, max 600."),
-		"cwd":         strProp("Working directory. Defaults to the project root."),
+		"cwd":         pathProp("Working directory. Defaults to the project root."),
 	}, "command")
 }
 
@@ -108,7 +108,7 @@ func Shell() (string, []string) {
 // Run implements Tool.
 func (t BashTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a bashArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if strings.TrimSpace(a.Command) == "" {
@@ -185,7 +185,11 @@ func (t BashTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	body = fmt.Sprintf("$ %s\n%s\n<exit %d in %s>",
 		firstLine(a.Command), body, outcome.ExitCode, outcome.Elapsed.Round(time.Millisecond))
 
-	return Result{
+	var note string
+	if tc.Repair != nil && tc.Repair.Note != nil {
+		note = *tc.Repair.Note
+	}
+	return repairNote(Result{
 		Output:  body,
 		Title:   title,
 		IsError: isErr,
@@ -194,7 +198,7 @@ func (t BashTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 			"truncated": truncated, "command": a.Command,
 			"sandbox": outcome.Applied, "sandbox_mode": string(policy.Mode),
 		},
-	}, nil
+	}, note), nil
 }
 
 func firstLine(s string) string {

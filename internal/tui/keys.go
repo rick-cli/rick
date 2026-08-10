@@ -36,6 +36,19 @@ func (m *Model) resizeAfterInputEdit() {
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
+	// Suppress the terminal's re-delivery of a paste's newlines. Windows
+	// Terminal converts a native Ctrl+V into per-character events, and
+	// pasted line breaks arrive as Enter-family key presses (enter / ctrl+j
+	// / ctrl+m) which would otherwise submit the message. Drop them for a
+	// short window after a multi-line paste; the text itself is already in
+	// the input from the direct clipboard read.
+	if time.Now().Before(m.pasteNewlineUntil) {
+		switch key {
+		case "enter", "ctrl+j", "ctrl+m":
+			return m, nil
+		}
+	}
+
 	// ctrl+c: interrupt a run, otherwise if there are attachments or input, clear them.
 	// Second press quits.
 	if key == "ctrl+c" {
@@ -141,6 +154,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		delta := 1
 		if key == "up" {
 			delta = -1
+		}
+		// With mouse capture off (native selection on), Windows Terminal
+		// delivers the scroll wheel as a rapid burst of same-direction
+		// up/down key events. A burst within 150ms is a wheel — scroll the
+		// transcript instead of navigating prompt history.
+		if m.isWheelKeyBurst(delta) {
+			m.scrollBy(delta * m.scrollStep())
+			return m, nil
 		}
 		if m.moveSlashCursor(delta) {
 			return m, nil
@@ -280,6 +301,43 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Suppress the terminal's re-delivery of a paste we already inserted via
+	// the direct clipboard read. Windows Terminal converts its native Ctrl+V
+	// into per-character key events after the fact; without this, pasting
+	// would double-insert the text. While the incoming runes continue to
+	// prefix-match the remembered paste they are dropped; the first rune
+	// that diverges ends suppression and is processed normally.
+	if m.pasteTarget != "" && time.Since(m.lastClipboardPaste) < 500*time.Millisecond {
+		if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
+			m.pasteSuppress = append(m.pasteSuppress, msg.Runes...)
+			target := []rune(m.pasteTarget)
+			if len(m.pasteSuppress) <= len(target) {
+				match := true
+				for i := range m.pasteSuppress {
+					if m.pasteSuppress[i] != target[i] {
+						match = false
+						break
+					}
+				}
+				if match {
+					if len(m.pasteSuppress) == len(target) {
+						m.pasteTarget = ""
+						m.pasteSuppress = nil
+					}
+					return m, nil
+				}
+			}
+			// Diverged: this is real typing. Replay the buffered runes as a
+			// single insert (they were never shown) and clear suppression.
+			m.pasteTarget = ""
+			if len(m.pasteSuppress) > 0 {
+				m.input.InsertString(string(m.pasteSuppress))
+				m.pasteSuppress = nil
+				m.resizeAfterInputEdit()
+			}
+		}
+	}
+
 	prevLines := m.input.LineCount()
 	previousValue := m.input.Value()
 	var cmd tea.Cmd
@@ -304,8 +362,68 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// wheelKey is a single up/down key event recorded for wheel-burst detection.
+type wheelKey struct {
+	at  time.Time
+	dir int // -1 for up, +1 for down
+}
+
+// isWheelKeyBurst reports whether the current up/down key event is part of a
+// rapid same-direction burst (a scroll-wheel emulated as arrow keys by
+// Windows Terminal when mouse capture is off). It records the event and
+// returns true when at least three consecutive same-direction events arrive
+// within a short window. Real arrow-key use (history navigation) rarely
+// produces three same-direction presses that fast, so it is not misread.
+func (m *Model) isWheelKeyBurst(dir int) bool {
+	now := time.Now()
+	cutoff := now.Add(-150 * time.Millisecond)
+	kept := m.wheelKeyTimes[:0]
+	for _, e := range m.wheelKeyTimes {
+		if e.at.After(cutoff) {
+			kept = append(kept, e)
+		}
+	}
+	m.wheelKeyTimes = append(kept, wheelKey{at: now, dir: dir})
+	if len(m.wheelKeyTimes) < 3 {
+		return false
+	}
+	// All recorded events in the burst must go the same direction.
+	for _, e := range m.wheelKeyTimes {
+		if e.dir != dir {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *Model) handleClipboardPaste() {
 	m.lastClipboardPaste = time.Now()
+
+	// Text paste first: read the clipboard directly and insert the whole
+	// string into the input in one operation. This bypasses the terminal's
+	// per-character key delivery entirely, so pasting is instant and a
+	// multi-line paste becomes a multi-line input instead of submitting a
+	// message per line.
+	if text, err := readClipboardText(); err == nil && text != "" {
+		m.input.InsertString(text)
+		m.input.CursorEnd()
+		m.resizeAfterInputEdit()
+		m.slashCursor = 0
+		m.histIdx = -1
+		// Arm suppression: remember the full pasted text so a terminal that
+		// re-delivers the same paste as per-character key events right after
+		// (Windows Terminal's native Ctrl+V) can drop it instead of
+		// double-inserting. Newline re-delivery (Enter-family keys) is
+		// suppressed for a short window too, so a multi-line paste never
+		// auto-submits.
+		m.pasteTarget = text
+		m.pasteSuppress = nil
+		if strings.Contains(text, "\n") {
+			m.pasteNewlineUntil = time.Now().Add(500 * time.Millisecond)
+		}
+		return
+	}
+
 	if path, err := readClipboardImage(); err == nil {
 		if att, addErr := addAttachment(path); addErr == nil {
 			m.attachments = append(m.attachments, *att)
@@ -317,7 +435,7 @@ func (m *Model) handleClipboardPaste() {
 
 	files, err := readClipboardFiles()
 	if err != nil || len(files) == 0 {
-		m.setStatus("no image/files in clipboard")
+		m.setStatus("no text/image/files in clipboard")
 		return
 	}
 	for _, path := range files {

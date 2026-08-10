@@ -46,9 +46,9 @@ type retrieveArgs struct {
 }
 
 // Run implements Tool.
-func (t RetrieveUncompressedTool) Run(_ context.Context, _ Context, in json.RawMessage) (Result, error) {
+func (t RetrieveUncompressedTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a retrieveArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if t.Store == nil {
@@ -61,20 +61,20 @@ func (t RetrieveUncompressedTool) Run(_ context.Context, _ Context, in json.RawM
 		if len(keys) == 0 {
 			return Result{Output: "no compressed payloads are currently stored", Title: "retrieve"}, nil
 		}
-		return Result{
+		return repairNote(Result{
 			Output: fmt.Sprintf("%d stored payloads:\n%s", len(keys), strings.Join(keys, "\n")),
 			Title:  fmt.Sprintf("retrieve (%d keys)", len(keys)),
-		}, nil
+		}, noteOf(tc)), nil
 	}
 	key := strings.TrimSpace(a.Key)
 	if key == "" {
 		return Errf("provide either a key or list:true"), nil
 	}
 	if original, ok := t.Store.LiveOriginal(key); ok {
-		return Result{Output: original, Title: "retrieve " + shortKey(key)}, nil
+		return repairNote(Result{Output: original, Title: "retrieve " + shortKey(key)}, noteOf(tc)), nil
 	}
 	if payload, ok := t.Store.StoredPayload(key); ok {
-		return Result{Output: payload, Title: "retrieve " + shortKey(key)}, nil
+		return repairNote(Result{Output: payload, Title: "retrieve " + shortKey(key)}, noteOf(tc)), nil
 	}
 	return Errf("no stored payload for key %q; run with list:true to see available keys", key), nil
 }

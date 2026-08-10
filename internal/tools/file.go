@@ -183,7 +183,7 @@ func ResetFileState() {
 }
 
 func resolvePath(cwd, p string) string {
-	p = strings.TrimSpace(p)
+	p = unwrapMarkdownLink(p)
 	if p == "" {
 		return cwd
 	}
@@ -277,7 +277,7 @@ func (ReadTool) Description() string {
 // Schema implements Tool.
 func (ReadTool) Schema() map[string]any {
 	return obj(map[string]any{
-		"path":   strProp("File path (absolute, or relative to the project root)."),
+		"path":   pathProp("File path (absolute, or relative to the project root)."),
 		"offset": numProp("1-indexed line to start from. Default 1."),
 		"limit":  numProp("Maximum number of lines to read. Default 2000."),
 		"target": strProp("Optional symbol name: return an AST skeleton with signatures of " +
@@ -297,8 +297,12 @@ type readArgs struct {
 // Run implements Tool.
 func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a readArgs
-	if err := decodeArgs(in, &a); err != nil {
+	var repairNoteText string
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
+	}
+	if tc.Repair != nil && tc.Repair.Note != nil {
+		repairNoteText = *tc.Repair.Note
 	}
 	if a.Path == "" {
 		return Errf("path is required"), nil
@@ -353,11 +357,11 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if content, err := os.ReadFile(p); err == nil {
 			if view, ok := renderNotebook(content); ok {
 				markRead(p)
-				return Result{
+				return repairNote(Result{
 					Output: view,
 					Title:  fmt.Sprintf("%s (notebook)", relTo(tc.Cwd, p)),
 					Meta:   map[string]any{"path": p, "notebook": true},
-				}, nil
+				}, repairNoteText), nil
 			}
 		}
 		// Parse failure falls through to the plain (JSON) read.
@@ -371,11 +375,11 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if t.EnableSkeleton {
 			if skel, err := skeleton.Skeleton(p, a.Target); err == nil {
 				markRead(p)
-				return Result{
+				return repairNote(Result{
 					Output: skel,
 					Title:  fmt.Sprintf("%s (skeleton)", relTo(tc.Cwd, p)),
 					Meta:   map[string]any{"path": p, "skeleton": true},
-				}, nil
+				}, repairNoteText), nil
 			}
 			// Parse failures fall through to the plain read.
 		}
@@ -383,11 +387,11 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 			if content, err := os.ReadFile(p); err == nil {
 				if view, isDelta := t.Delta.Deliver(p, string(content), maxBytes); isDelta {
 					markRead(p)
-					return Result{
+					return repairNote(Result{
 						Output: view,
 						Title:  fmt.Sprintf("%s (delta)", relTo(tc.Cwd, p)),
 						Meta:   map[string]any{"path": p, "delta": true},
-					}, nil
+					}, repairNoteText), nil
 				}
 			}
 		}
@@ -400,6 +404,19 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 	limit := a.Limit
 	if limit <= 0 {
 		limit = 2000
+	}
+	// Surface the relational defaults we applied (offset alone → limit 2000,
+	// limit alone → offset 1) so the model sees the chosen semantics and can
+	// self-correct if the guess was wrong (Command Code: extend semantics
+	// where you can't repair, surface the choice either way). Only fires when
+	// the model explicitly asked for pagination with one side missing —
+	// plain and full:true reads already have unambiguous semantics.
+	var defaultsNote []string
+	if a.Offset < 1 && a.Limit > 0 {
+		defaultsNote = append(defaultsNote, "offset unset → 1")
+	}
+	if a.Limit <= 0 && a.Offset >= 1 {
+		defaultsNote = append(defaultsNote, "limit unset → 2000")
 	}
 
 	// Content-addressed memo: identical reads of an unchanged file are served
@@ -420,12 +437,12 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 		if title == "" {
 			title = relTo(tc.Cwd, p)
 		}
-		return Result{
+		return repairNote(Result{
 			Output: fmt.Sprintf("<unchanged: %s; the exact content was already returned in an earlier read — "+
 				"re-read with full:true to force it>", title),
 			Title: title,
 			Meta:  map[string]any{"path": p, "unchanged": true},
-		}, nil
+		}, repairNoteText), nil
 	}
 
 	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(prefix), file), 32<<10)
@@ -499,11 +516,14 @@ func (t ReadTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result
 	if clampedCount > 0 {
 		foot += fmt.Sprintf("\n<%s>", clampNote(clampedLines, clampedCount))
 	}
-	result := Result{
+	if len(defaultsNote) > 0 {
+		foot += fmt.Sprintf("\n<defaults applied: %s>", strings.Join(defaultsNote, ", "))
+	}
+	result := repairNote(Result{
 		Output: b.String() + foot,
 		Title:  fmt.Sprintf("%s (%d lines)", relTo(tc.Cwd, p), total),
 		Meta:   map[string]any{"path": p, "lines": total},
-	}
+	}, repairNoteText)
 	readMemo.put(key, result)
 	return result, nil
 }
@@ -646,7 +666,7 @@ func (WriteTool) Description() string {
 // Schema implements Tool.
 func (WriteTool) Schema() map[string]any {
 	return obj(map[string]any{
-		"path":    strProp("File path to write."),
+		"path":    pathProp("File path to write."),
 		"content": strProp("Full file content."),
 	}, "path", "content")
 }
@@ -659,7 +679,7 @@ type writeArgs struct {
 // Run implements Tool.
 func (WriteTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a writeArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, WriteTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Path == "" {
@@ -706,11 +726,15 @@ func (WriteTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result,
 		verb = "updated"
 	}
 	nl := strings.Count(a.Content, "\n") + 1
-	return Result{
+	var note string
+	if tc.Repair != nil && tc.Repair.Note != nil {
+		note = *tc.Repair.Note
+	}
+	return repairNote(Result{
 		Output: fmt.Sprintf("%s %s (%d lines, %d bytes)", verb, relTo(tc.Cwd, p), nl, len(a.Content)),
 		Title:  fmt.Sprintf("write %s", relTo(tc.Cwd, p)),
 		Meta:   map[string]any{"path": p, "old": old, "new": a.Content, "created": !existed},
-	}, nil
+	}, note), nil
 }
 
 // ---------- edit ----------
@@ -734,7 +758,7 @@ func (EditTool) Description() string {
 // Schema implements Tool.
 func (EditTool) Schema() map[string]any {
 	return obj(map[string]any{
-		"path":        strProp("File path to edit."),
+		"path":        pathProp("File path to edit."),
 		"old_string":  strProp("Exact text to find, including indentation."),
 		"new_string":  strProp("Replacement text. Empty string deletes the match."),
 		"replace_all": boolProp("Replace every occurrence instead of requiring uniqueness."),
@@ -751,7 +775,7 @@ type editArgs struct {
 // Run implements Tool.
 func (EditTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a editArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, EditTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Path == "" {
@@ -792,11 +816,15 @@ func (EditTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 	if snippet, ok := editSnippet(content, newContent); ok {
 		fmt.Fprintf(&b, "\n%s", snippet)
 	}
-	return Result{
+	var note string
+	if tc.Repair != nil && tc.Repair.Note != nil {
+		note = *tc.Repair.Note
+	}
+	return repairNote(Result{
 		Output: b.String(),
 		Title:  fmt.Sprintf("edit %s", relTo(tc.Cwd, p)),
 		Meta:   map[string]any{"path": p, "old": content, "new": newContent, "count": n},
-	}, nil
+	}, note), nil
 }
 
 // editSnippet renders the first changed hunk as a compact 2-line

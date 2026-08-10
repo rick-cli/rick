@@ -55,12 +55,13 @@ type Deps struct {
 
 // ToolRecord captures one tool invocation for JSON output.
 type ToolRecord struct {
-	Name    string          `json:"name"`
-	Title   string          `json:"title"`
-	Input   json.RawMessage `json:"input,omitempty"`
-	Output  string          `json:"output,omitempty"`
-	IsError bool            `json:"is_error,omitempty"`
-	Elapsed string          `json:"elapsed,omitempty"`
+	Name     string          `json:"name"`
+	Title    string          `json:"title"`
+	Input    json.RawMessage `json:"input,omitempty"`
+	Output   string          `json:"output,omitempty"`
+	IsError  bool            `json:"is_error,omitempty"`
+	Elapsed  string          `json:"elapsed,omitempty"`
+	Repaired string          `json:"repaired,omitempty"`
 }
 
 // UsageRecord captures cumulative token usage.
@@ -143,6 +144,7 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 		WarmCache:          deps.Config.WarmCache,
 		MaxReasoningTurns:  deps.Config.CacheMaxReasoningTurns,
 		MaxToolResultBytes: deps.Config.CacheMaxToolResultBytes,
+		CacheScopeKey:      agent.CacheScopeKeyFor(deps.ModelID, stableSystem, deps.Tools.Schemas(nil)),
 	})
 
 	history := []provider.Message{provider.UserText(opts.Prompt)}
@@ -212,12 +214,13 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 				break
 			}
 			rec := ToolRecord{
-				Name:    ev.Tool.Name,
-				Title:   ev.Tool.Title,
-				Input:   ev.Tool.Input,
-				Output:  truncate(ev.Tool.Output, 2000),
-				IsError: ev.Tool.IsError,
-				Elapsed: ev.Tool.Elapsed.Round(time.Millisecond).String(),
+				Name:     ev.Tool.Name,
+				Title:    ev.Tool.Title,
+				Input:    ev.Tool.Input,
+				Output:   truncate(ev.Tool.Output, 2000),
+				IsError:  ev.Tool.IsError,
+				Elapsed:  ev.Tool.Elapsed.Round(time.Millisecond).String(),
+				Repaired: ev.Tool.Repaired,
 			}
 			toolRecords = append(toolRecords, rec)
 			if opts.Format == FormatStreamJSON {

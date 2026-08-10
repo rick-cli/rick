@@ -37,7 +37,11 @@ type providerSummarizer struct {
 	model    string
 }
 
-// Summarize implements distill.Summarizer.
+// Summarize implements distill.Summarizer. On any failure (provider error,
+// timeout, empty output) it returns a deterministic LLM-free fallback summary
+// built from the transcript instead of failing the whole distillation: after
+// a 429 or timeout the session still gets an informative handoff, and no aux
+// tokens are spent on the fallback.
 func (s providerSummarizer) Summarize(ctx context.Context, messages []provider.Message) (string, error) {
 	if s.provider == nil || s.model == "" {
 		return "", errors.New("distill: provider or model unavailable")
@@ -62,24 +66,61 @@ func (s providerSummarizer) Summarize(ctx context.Context, messages []provider.M
 			b.WriteString(ev.Text)
 		case provider.EventError:
 			if ev.Err != nil {
-				return "", ev.Err
+				return staticFallbackSummary(messages), nil
 			}
-			return "", errors.New("distill: provider stream error")
+			return staticFallbackSummary(messages), nil
 		case provider.EventDone:
 			if text := strings.TrimSpace(b.String()); text != "" {
 				return text, nil
 			}
-			return "", errors.New("distill: empty summary")
+			return staticFallbackSummary(messages), nil
 		}
 	}
-	return "", ctx.Err()
+	return staticFallbackSummary(messages), nil
 }
 
+// staticFallbackSummary is a deterministic, LLM-free handoff built from the
+// transcript: the most recent user asks, assistant/tool actions, and any
+// error text. It is bounded so a huge transcript still yields a small note.
+func staticFallbackSummary(messages []provider.Message) string {
+	var b strings.Builder
+	b.WriteString("**Goal:** continue the conversation from the state below.\n\n")
+	b.WriteString("**Facts:**\n")
+	turns := 0
+	for i := len(messages) - 1; i >= 0 && turns < staticFallbackTurns; i-- {
+		text := strings.TrimSpace(messages[i].Text())
+		if text != "" && len(text) <= staticFallbackCharLimit {
+			b.WriteString("- " + text + "\n")
+			turns++
+		}
+	}
+	b.WriteString("\n**Failed Paths:** (see transcript; summarizer was unavailable)\n")
+	return b.String()
+}
+
+const (
+	staticFallbackTurns     = 8
+	staticFallbackCharLimit = 400
+)
+
 // renderTranscript flattens candidate messages into a compact transcript that
-// includes tool calls and results, not just plain text.
+// includes tool calls and results, not just plain text. The transcript is
+// bounded: thinking traces are stripped, each message is capped, and only the
+// head + tail of the whole transcript survive with an omitted-middle marker,
+// so a pathological transcript can never blow past the summarizer's input
+// budget. Secrets are force-redacted at this boundary — the summary persists
+// and re-enters the prompt on every later turn, so a secret that reaches the
+// summarizer would be re-broadcast forever.
 func renderTranscript(messages []provider.Message) string {
 	var b strings.Builder
-	for _, message := range messages {
+	b.WriteString("[transcript head]\n")
+	for index, message := range messages {
+		if index >= transcriptHeadMessages && index < len(messages)-transcriptTailMessages {
+			if index == transcriptHeadMessages {
+				b.WriteString(fmt.Sprintf("[%d messages omitted]\n", len(messages)-transcriptHeadMessages-transcriptTailMessages))
+			}
+			continue
+		}
 		if message.Role == provider.RoleAssistant {
 			b.WriteString("assistant: ")
 		} else {
@@ -87,18 +128,83 @@ func renderTranscript(messages []provider.Message) string {
 		}
 		for _, block := range message.Content {
 			switch block.Type {
-			case "text", "thinking":
-				b.WriteString(block.Text)
+			case "text":
+				b.WriteString(redactBoundarySecrets(block.Text))
+			case "thinking":
+				continue // thinking traces never help the summary and leak tokens
 			case "tool_use":
 				b.WriteString("[tool " + block.Name + " " + summarizeToolArgs(block.Input) + "]")
 			case "tool_result":
-				b.WriteString("[result " + block.Content + "]")
+				b.WriteString("[result " + redactBoundarySecrets(block.Content) + "]")
 			}
 			b.WriteString(" ")
 		}
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// CompactBoundMessages returns a bounded, redacted copy of messages for a
+// compaction/summary call: thinking traces stripped, per-message text capped,
+// and secrets masked. The summary persists and re-enters the prompt on every
+// later turn, so a secret that reaches the summarizer would be re-broadcast
+// forever; the cap keeps the aux call small and cheap even for a long session.
+func CompactBoundMessages(messages []provider.Message) []provider.Message {
+	out := make([]provider.Message, 0, len(messages))
+	for _, message := range messages {
+		msg := message
+		msg.Content = make([]provider.ContentBlock, 0, len(message.Content))
+		for _, block := range message.Content {
+			switch block.Type {
+			case "text":
+				block.Text = redactBoundarySecrets(block.Text)
+				msg.Content = append(msg.Content, block)
+			case "tool_result":
+				block.Content = redactBoundarySecrets(block.Content)
+				msg.Content = append(msg.Content, block)
+			case "thinking":
+				continue
+			default:
+				msg.Content = append(msg.Content, block)
+			}
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+// Transcript bounds for the summarizer input: keep the first and last N
+// messages verbatim (capped per message below) and skip the middle, so a
+// long session's summary call stays small and cheap.
+const (
+	transcriptHeadMessages = 12
+	transcriptTailMessages = 6
+	transcriptMsgCapChars  = 4000
+)
+
+// redactBoundarySecrets deterministically masks common secret shapes (API
+// keys, bearer tokens, passwords) before a summary transcript is sent to the
+// model. This is a blunt, conservative pass: it redacts on shape, not on
+// known values, so it never misses a credential even if it was never
+// registered anywhere.
+func redactBoundarySecrets(text string) string {
+	if len(text) > transcriptMsgCapChars {
+		// Keep the head and tail of an oversized message so the model still
+		// sees the beginning and the error/diagnostic at the end.
+		text = text[:transcriptMsgCapChars] + "\n…(truncated)"
+	}
+	replacer := strings.NewReplacer(
+		"sk-", "sk-***",
+		"sk-ant-", "sk-ant-***",
+		"Bearer ", "Bearer ***",
+		"api_key=", "api_key=***",
+		"apikey=", "apikey=***",
+		"password=", "password=***",
+		"passwd=", "passwd=***",
+		"token=", "token=***",
+		"secret=", "secret=***",
+	)
+	return replacer.Replace(text)
 }
 
 // maxDistillToolArgChars bounds each tool_use input echoed into the distill

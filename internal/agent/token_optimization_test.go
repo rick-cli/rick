@@ -8,7 +8,9 @@ import (
 
 	"rick/internal/distill"
 	"rick/internal/provider"
+	"rick/internal/tokens"
 	"rick/internal/tools"
+	"rick/pkg/contextbudget"
 )
 
 func TestCapModelToolOutputPreservesCanonicalEventOutput(t *testing.T) {
@@ -183,4 +185,66 @@ func containsDistillSummary(messages []provider.Message) bool {
 		}
 	}
 	return false
+}
+
+func TestBuildRequestPrunesOldToolResultsOnce(t *testing.T) {
+	// A window far above the distillation threshold, so pruning (not
+	// distilling) is the only head rewrite that can fire. Prune thresholds
+	// are forced down so the small test payloads qualify.
+	budget := contextbudget.New(contextbudget.Options{
+		PruneMinResultBytes:  256,
+		PruneMinReclaimBytes: 400,
+		PruneLiveZoneTurns:   1,
+	})
+	runner := New(Config{
+		ContextWindow:      200_000,
+		MaxTokens:          10,
+		SafetyMarginTokens: 10,
+		EnableDistillation: false,
+		Budget:             budget,
+	})
+
+	var messages []provider.Message
+	for i := 0; i < 3; i++ {
+		messages = append(messages, provider.UserText("old request"))
+		messages = append(messages, pairMessage("pr"+string(rune('a'+i)), strings.Repeat("payload", 300))...)
+	}
+	messages = append(messages, provider.UserText("live request"))
+
+	first := runner.buildRequest(messages, nil)
+	// The first prune commits: old bulky results are summarized.
+	pruned := 0
+	for _, m := range first.Messages {
+		for _, block := range m.Content {
+			if block.Type == "tool_result" && strings.HasPrefix(block.Content, "[summarized]") {
+				pruned++
+			}
+		}
+	}
+	if pruned == 0 {
+		t.Fatal("expected old tool results to be pruned into summaries")
+	}
+	// The summary's original is retrievable via the shared budget.
+	for _, m := range messages {
+		for _, block := range m.Content {
+			if block.Type == "tool_result" && len(block.Content) > 256 {
+				if _, ok := runner.budget.StoredPayload(contextbudget.Hash(block.Content)); !ok {
+					t.Fatal("pruned original not stored under its content address")
+				}
+			}
+		}
+	}
+
+	// A second identical request must not rewrite again: every bulky result
+	// is already summarized, so the prune does not commit and the view stays
+	// byte-stable (the prefix cache stays warm).
+	second := runner.buildRequest(messages, nil)
+	if len(second.Messages) != len(first.Messages) {
+		t.Fatalf("second build changed message count: %d vs %d", len(second.Messages), len(first.Messages))
+	}
+	for i := range first.Messages {
+		if string(tokens.Marshal(first.Messages[i])) != string(tokens.Marshal(second.Messages[i])) {
+			t.Fatalf("second build rewrote message %d (prune not write-once)", i)
+		}
+	}
 }

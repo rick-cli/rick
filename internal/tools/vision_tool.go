@@ -41,7 +41,7 @@ func (VisionTool) Description() string {
 // Schema implements Tool.
 func (VisionTool) Schema() map[string]any {
 	return obj(map[string]any{
-		"path":  strProp("Path to the image file (.png, .jpg, .jpeg, .gif, .bmp, .webp, .tiff, .ico)."),
+		"path":  pathProp("Path to the image file (.png, .jpg, .jpeg, .gif, .bmp, .webp, .tiff, .ico)."),
 		"focus": strProp("Optional: what you specifically want to know about the image. The full evidence is still returned."),
 	}, "path")
 }
@@ -54,7 +54,7 @@ type visionArgs struct {
 // Run implements Tool.
 func (t VisionTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a visionArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	a.Path = strings.TrimSpace(a.Path)
@@ -96,12 +96,12 @@ func (t VisionTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Re
 
 	rendered := vision.Render(result)
 	if rendered == "" {
-		return Result{Output: "the vision model returned no evidence for " + p, Title: "vision"}, nil
+		return repairNote(Result{Output: "the vision model returned no evidence for " + p, Title: "vision"}, noteOf(tc)), nil
 	}
-	return Result{
+	return repairNote(Result{
 		Output: rendered,
 		Title:  fmt.Sprintf("vision %s", filepath.Base(p)),
-	}, nil
+	}, noteOf(tc)), nil
 }
 
 // visionConfig resolves the bridge settings from the live config.

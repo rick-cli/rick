@@ -328,6 +328,16 @@ type Config struct {
 	// hold a near-100% hit rate on gateways whose cache TTL is minutes, not
 	// days. Zero disables the keep-alive.
 	CacheKeepaliveSeconds int `json:"cache_keepalive_seconds,omitempty"`
+	// CacheOpenRouterResponse, when true (default), enables OpenRouter's
+	// response cache (X-OpenRouter-Cache header) so byte-identical repeated
+	// requests — retries, warm, keep-alive, same sub-agent prompt twice —
+	// are served from the gateway's response cache at zero billing. Response
+	// caching is separate from prompt caching and works alongside it.
+	CacheOpenRouterResponse bool `json:"cache_openrouter_response,omitempty"`
+	// CacheOpenRouterResponseTTL is the response-cache TTL in seconds sent
+	// with the X-OpenRouter-Cache-TTL header. Zero omits the TTL header and
+	// uses OpenRouter's default.
+	CacheOpenRouterResponseTTL int `json:"cache_openrouter_response_ttl,omitempty"`
 	// ContextBudget exposes the session context manager knobs.
 	ContextBudget *ContextBudgetConfig `json:"context_budget,omitempty"`
 }
@@ -435,13 +445,14 @@ func Defaults() (Config, TUI) {
 		CacheRetention:          "long",
 		WarmCache:               true,
 		CacheMaxToolResultBytes: 16 << 10,
+		CacheOpenRouterResponse: true,
 	}
 	t := TUI{
 		Theme:         "pickle-rick",
 		DiffMode:      "auto",
 		DiffThreshold: 120,
 		ScrollSpeed:   3,
-		Mouse:         true,
+		Mouse:         false, // off = terminal owns selection in the chat view
 		ShowThinking:  &yes,
 		Keybinds: Keybinds{
 			Leader:           "ctrl+x",

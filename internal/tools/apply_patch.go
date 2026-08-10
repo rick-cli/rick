@@ -80,7 +80,7 @@ type patchFile struct {
 // Run implements Tool.
 func (ApplyPatchTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a applyPatchArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, ApplyPatchTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	files, err := ParsePatch(a.Patch)
@@ -208,11 +208,15 @@ func (ApplyPatchTool) Run(_ context.Context, tc Context, in json.RawMessage) (Re
 		})
 	}
 
-	return Result{
+	var note string
+	if tc.Repair != nil && tc.Repair.Note != nil {
+		note = *tc.Repair.Note
+	}
+	return repairNote(Result{
 		Output: fmt.Sprintf("applied patch to %d file(s):\n%s", len(plan), summary.String()),
 		Title:  fmt.Sprintf("apply_patch (%d files)", len(plan)),
 		Meta:   map[string]any{"changes": changes},
-	}, nil
+	}, note), nil
 }
 
 // ParsePatch splits a patch document into per-file sections.

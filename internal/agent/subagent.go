@@ -138,7 +138,7 @@ func titleFor(description, kind string) string {
 // Run implements tools.Tool.
 func (t TaskTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage) (tools.Result, error) {
 	var a taskArgs
-	if err := json.Unmarshal(in, &a); err != nil {
+	if err := tools.RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	if a.Prompt == "" {

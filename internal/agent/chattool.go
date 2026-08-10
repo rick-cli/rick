@@ -39,7 +39,7 @@ type chatArgs struct {
 
 func (t ChatTool) Run(_ context.Context, tc tools.Context, input json.RawMessage) (tools.Result, error) {
 	var args chatArgs
-	if err := json.Unmarshal(input, &args); err != nil {
+	if err := tools.RepairDecode(input, &args, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	args.TargetAgent = strings.TrimSpace(args.TargetAgent)
@@ -98,7 +98,7 @@ type steerArgs struct {
 
 func (t SteerTool) Run(_ context.Context, tc tools.Context, input json.RawMessage) (tools.Result, error) {
 	var args steerArgs
-	if err := json.Unmarshal(input, &args); err != nil {
+	if err := tools.RepairDecode(input, &args, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	args.TargetAgent = strings.TrimSpace(args.TargetAgent)

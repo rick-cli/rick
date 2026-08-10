@@ -29,6 +29,23 @@ type Day struct {
 	CacheWrite int `json:"cache_write"`
 }
 
+// RepairCounts is one model's cumulative tool-call repair accounting: which
+// tools had calls repaired and how often, so a model regressing on a tool
+// contract is detectable from data (Command Code's per-model x tool repair
+// telemetry).
+type RepairCounts struct {
+	Tools map[string]int `json:"tools,omitempty"` // tool name -> repair count
+	Total int            `json:"total"`
+}
+
+// Add merges another set of counts into r.
+func (r *RepairCounts) Add(o RepairCounts) {
+	for tool, n := range o.Tools {
+		r.Tools[tool] += n
+	}
+	r.Total += o.Total
+}
+
 // Total returns every token that passed through the API for this day.
 func (d Day) Total() int {
 	return d.Input + d.Output + d.CacheRead + d.CacheWrite
@@ -59,6 +76,7 @@ type Tracker struct {
 	mu          sync.Mutex
 	dir         string
 	data        map[string]map[string]ModelUsage // date -> model -> usage
+	repairs     map[string]*RepairCounts         // modelID -> repair counts
 	lastPersist time.Time
 	dirty       bool
 }
@@ -73,12 +91,14 @@ type ModelUsage struct {
 
 // New opens (or creates) the usage store at dir.
 func New(dir string) *Tracker {
-	t := &Tracker{dir: dir, data: map[string]map[string]ModelUsage{}}
+	t := &Tracker{dir: dir, data: map[string]map[string]ModelUsage{}, repairs: map[string]*RepairCounts{}}
 	_ = t.Load()
 	return t
 }
 
 // Load reads the store from disk. A missing or malformed file starts empty.
+// The on-disk shape is date-keyed usage with an optional "repairs" sibling;
+// files written before repair telemetry existed simply have no repairs key.
 func (t *Tracker) Load() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -91,11 +111,30 @@ func (t *Tracker) Load() error {
 		}
 		return err
 	}
-	var decoded map[string]map[string]ModelUsage
-	if err := json.Unmarshal(raw, &decoded); err != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
 		return err
 	}
-	t.data = decoded
+	data := map[string]map[string]ModelUsage{}
+	for key, value := range top {
+		if key == "repairs" {
+			var repairs map[string]*RepairCounts
+			if err := json.Unmarshal(value, &repairs); err != nil {
+				return err
+			}
+			t.repairs = repairs
+			continue
+		}
+		var models map[string]ModelUsage
+		if err := json.Unmarshal(value, &models); err != nil {
+			return err
+		}
+		data[key] = models
+	}
+	t.data = data
+	if t.repairs == nil {
+		t.repairs = map[string]*RepairCounts{}
+	}
 	t.dirty = false
 	t.lastPersist = time.Time{}
 	return nil
@@ -114,6 +153,61 @@ func (t *Tracker) Record(modelID string, in, out, cacheRead, cacheWrite int) err
 	return t.recordLocked(modelID, Day{
 		Input: in, Output: out, CacheRead: cacheRead, CacheWrite: cacheWrite,
 	})
+}
+
+// RecordRepair counts one tool-call repair for a model, keyed by tool. It is
+// safe to call from any agent event loop; the counts persist on the same
+// schedule as token usage.
+func (t *Tracker) RecordRepair(modelID, tool string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if modelID == "" || tool == "" {
+		return nil
+	}
+	counts := t.repairs[modelID]
+	if counts == nil {
+		counts = &RepairCounts{Tools: map[string]int{}}
+		t.repairs[modelID] = counts
+	}
+	counts.Tools[tool]++
+	counts.Total++
+	t.dirty = true
+	if t.lastPersist.IsZero() || time.Since(t.lastPersist) >= persistInterval {
+		return t.persistLocked()
+	}
+	return nil
+}
+
+// Repairs returns the per-model repair counts, keyed by model id. The map is
+// a copy so callers cannot mutate the store.
+func (t *Tracker) Repairs() map[string]RepairCounts {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]RepairCounts, len(t.repairs))
+	for model, counts := range t.repairs {
+		cp := RepairCounts{Tools: map[string]int{}, Total: counts.Total}
+		for tool, n := range counts.Tools {
+			cp.Tools[tool] = n
+		}
+		out[model] = cp
+	}
+	return out
+}
+
+// RepairsForModel returns one model's repair counts, or zero values when the
+// model has none.
+func (t *Tracker) RepairsForModel(modelID string) RepairCounts {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	counts, ok := t.repairs[modelID]
+	if !ok {
+		return RepairCounts{}
+	}
+	cp := RepairCounts{Tools: map[string]int{}, Total: counts.Total}
+	for tool, n := range counts.Tools {
+		cp.Tools[tool] = n
+	}
+	return cp
 }
 
 // RecordWithDay is the testable core: append tokens to a model on a specific
@@ -163,7 +257,14 @@ func (t *Tracker) persistLocked() error {
 	if err := os.MkdirAll(t.dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(t.data, "", "  ")
+	out := make(map[string]any, len(t.data)+1)
+	for key, value := range t.data {
+		out[key] = value
+	}
+	if len(t.repairs) > 0 {
+		out["repairs"] = t.repairs
+	}
+	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -217,7 +318,7 @@ type DayEntry struct {
 	Day  Day
 }
 
-// Models returns every model id that has any usage, sorted.
+// Models returns every model id that has any usage or repairs, sorted.
 func (t *Tracker) Models() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -227,6 +328,9 @@ func (t *Tracker) Models() []string {
 		for id := range models {
 			seen[id] = true
 		}
+	}
+	for id := range t.repairs {
+		seen[id] = true
 	}
 	out := make([]string, 0, len(seen))
 	for id := range seen {
@@ -312,6 +416,7 @@ func (t *Tracker) Clear() error {
 	defer t.mu.Unlock()
 
 	t.data = map[string]map[string]ModelUsage{}
+	t.repairs = map[string]*RepairCounts{}
 	t.dirty = true
 	return t.persistLocked()
 }

@@ -25,10 +25,14 @@ var (
 	procOpenClipboard              = user32.NewProc("OpenClipboard")
 	procCloseClipboard             = user32.NewProc("CloseClipboard")
 	procGetClipboardData           = user32.NewProc("GetClipboardData")
+	procSetClipboardData           = user32.NewProc("SetClipboardData")
+	procEmptyClipboard             = user32.NewProc("EmptyClipboard")
 	procIsClipboardFormatAvailable = user32.NewProc("IsClipboardFormatAvailable")
 	procGlobalLock                 = kernel32.NewProc("GlobalLock")
 	procGlobalSize                 = kernel32.NewProc("GlobalSize")
 	procGlobalUnlock               = kernel32.NewProc("GlobalUnlock")
+	procGlobalAlloc                = kernel32.NewProc("GlobalAlloc")
+	procGlobalFree                 = kernel32.NewProc("GlobalFree")
 	procRtlMoveMemory              = kernel32.NewProc("RtlMoveMemory")
 	procDragQueryFileW             = shell32.NewProc("DragQueryFileW")
 	procGetAsyncKeyState           = user32.NewProc("GetAsyncKeyState")
@@ -42,10 +46,11 @@ var (
 )
 
 const (
-	CF_DIB     = 8
-	CF_HDROP   = 15
-	VK_CONTROL = 0x11
-	VK_V       = 0x56
+	CF_DIB         = 8
+	CF_HDROP       = 15
+	CF_UNICODETEXT = 13
+	VK_CONTROL     = 0x11
+	VK_V           = 0x56
 
 	th32csSnapProcess = 0x00000002
 	invalidHandle     = ^uintptr(0)
@@ -199,6 +204,93 @@ func readClipboardImage() (string, error) {
 	}
 
 	return dibToPNG(data)
+}
+
+// readClipboardText reads plain text (CF_UNICODETEXT) from the Windows
+// clipboard. Reading the text directly — instead of letting the terminal
+// deliver a paste as a burst of per-character key events — is what makes
+// pasting instant: the whole string lands in one operation, with no
+// character-by-character retyping and no lag on long pastes.
+func readClipboardText() (string, error) {
+	ret, _, _ := procOpenClipboard.Call(0)
+	if ret == 0 {
+		return "", fmt.Errorf("failed to open clipboard")
+	}
+	defer procCloseClipboard.Call()
+
+	ret, _, _ = procIsClipboardFormatAvailable.Call(uintptr(CF_UNICODETEXT))
+	if ret == 0 {
+		return "", fmt.Errorf("no text in clipboard")
+	}
+
+	h, _, _ := procGetClipboardData.Call(uintptr(CF_UNICODETEXT))
+	if h == 0 {
+		return "", fmt.Errorf("failed to get clipboard data")
+	}
+
+	p, _, _ := procGlobalLock.Call(h)
+	if p == 0 {
+		return "", fmt.Errorf("failed to lock clipboard memory")
+	}
+	defer procGlobalUnlock.Call(h)
+
+	size, _, _ := procGlobalSize.Call(h)
+	if size == 0 || size > 16<<20 { // guard against absurd clipboard sizes
+		return "", fmt.Errorf("clipboard text too large")
+	}
+	data := make([]uint16, size/2)
+	if len(data) > 0 {
+		procRtlMoveMemory.Call(uintptr(unsafe.Pointer(&data[0])), p, size)
+	}
+	// A clipboard string is NUL-terminated; stop at the first NUL.
+	for i, ch := range data {
+		if ch == 0 {
+			data = data[:i]
+			break
+		}
+	}
+	return strings.ReplaceAll(syscall.UTF16ToString(data), "\r\n", "\n"), nil
+}
+
+// writeClipboardText puts text onto the Windows clipboard (CF_UNICODETEXT)
+// so rick can copy like a normal terminal. Ownership of the global memory
+// block passes to the clipboard; we must not free it after SetClipboardData.
+func writeClipboardText(text string) error {
+	ret, _, _ := procOpenClipboard.Call(0)
+	if ret == 0 {
+		return fmt.Errorf("failed to open clipboard")
+	}
+	defer procCloseClipboard.Call()
+
+	// Replace lone LFs with CRLF for Windows clipboard convention.
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\n", "\r\n")
+
+	utf16 := syscall.StringToUTF16(text)
+	size := uintptr(len(utf16) * 2)
+	flags := uintptr(0x0042) // GMEM_MOVEABLE | GMEM_ZEROINIT
+	h, _, _ := procGlobalAlloc.Call(flags, size)
+	if h == 0 {
+		return fmt.Errorf("failed to allocate clipboard memory")
+	}
+
+	p, _, _ := procGlobalLock.Call(h)
+	if p == 0 {
+		procGlobalFree.Call(h)
+		return fmt.Errorf("failed to lock clipboard memory")
+	}
+	procRtlMoveMemory.Call(p, uintptr(unsafe.Pointer(&utf16[0])), size)
+	procGlobalUnlock.Call(h)
+
+	if _, _, _ = procEmptyClipboard.Call(0); 0 != 0 {
+		procGlobalFree.Call(h)
+		return fmt.Errorf("failed to empty clipboard")
+	}
+	if _, _, _ = procSetClipboardData.Call(uintptr(CF_UNICODETEXT), h); 0 != 0 {
+		procGlobalFree.Call(h)
+		return fmt.Errorf("failed to set clipboard data")
+	}
+	return nil
 }
 
 // readClipboardFiles reads file paths from the Windows clipboard (CF_HDROP).

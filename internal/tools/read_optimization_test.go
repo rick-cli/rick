@@ -458,3 +458,68 @@ func parseReadLineNumber(line string) (int, bool) {
 	}
 	return n, true
 }
+
+// TestReadSurfacesRelationalDefaults verifies P2 transparency: when the
+// model supplies only one of offset/limit, the read applies the counterpart
+// default and tells the model which semantics were chosen (so it can
+// self-correct if the guess was wrong).
+func TestReadSurfacesRelationalDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.go")
+	if err := os.WriteFile(path, []byte("l1\nl2\nl3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// limit alone -> offset defaults to 1.
+	res, err := (ReadTool{EnableSkeleton: true}).Run(context.Background(), Context{Cwd: dir},
+		jsonArgs(map[string]any{"path": "f.go", "limit": 2}))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(res.Output, "defaults applied") {
+		t.Fatalf("read should surface applied defaults, got %q", res.Output)
+	}
+
+	// offset alone -> limit defaults to 2000.
+	res, err = (ReadTool{EnableSkeleton: true}).Run(context.Background(), Context{Cwd: dir},
+		jsonArgs(map[string]any{"path": "f.go", "offset": 2}))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(res.Output, "defaults applied") {
+		t.Fatalf("read should surface applied defaults, got %q", res.Output)
+	}
+
+	// Full default read (neither set) goes down the skeleton path and must
+	// not claim defaults were applied.
+	res, err = (ReadTool{EnableSkeleton: true}).Run(context.Background(), Context{Cwd: dir},
+		jsonArgs(map[string]any{"path": "f.go"}))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(res.Output, "defaults applied") {
+		t.Fatalf("plain read must not claim defaults, got %q", res.Output)
+	}
+}
+
+// TestReadRepairsMarkdownAutoLink verifies P3: a path emitted as a markdown
+// auto-link ([notes.md](http://notes.md)) is unwrapped before hitting the
+// filesystem, so the read succeeds instead of failing with a bogus path.
+func TestReadRepairsMarkdownAutoLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notes.md")
+	if err := os.WriteFile(path, []byte("# hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := (ReadTool{}).Run(context.Background(), Context{Cwd: dir},
+		jsonArgs(map[string]any{"path": "[notes.md](http://notes.md)"}))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("auto-linked path must be unwrapped, got error %q", res.Output)
+	}
+	if !strings.Contains(res.Output, "# hi") {
+		t.Fatalf("expected file content, got %q", res.Output)
+	}
+}

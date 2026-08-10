@@ -54,7 +54,7 @@ func (GrepTool) Description() string {
 func (GrepTool) Schema() map[string]any {
 	return obj(map[string]any{
 		"pattern": strProp("Regular expression to search for (Rust regex syntax)."),
-		"path":    strProp("Directory or file to search. Defaults to the project root."),
+		"path":    pathProp("Directory or file to search. Defaults to the project root."),
 		"include": strProp("Glob filter for filenames, e.g. '*.go' or '**/*.{ts,tsx}'."),
 		"mode": map[string]any{
 			"type": "string", "enum": []string{"content", "files_with_matches", "count"},
@@ -79,7 +79,7 @@ type grepArgs struct {
 // Run implements Tool.
 func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a grepArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Pattern == "" {
@@ -142,7 +142,7 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		if err != nil && errb.Len() > 0 && !isExitCode(err, 1) {
 			return Errf("ripgrep: %s", strings.TrimSpace(errb.String())), nil
 		}
-		noMatch := Result{Output: "no matches found", Title: "grep " + a.Pattern}
+		noMatch := repairNote(Result{Output: "no matches found", Title: "grep " + a.Pattern}, noteOf(tc))
 		grepMemo.put(key, noMatch)
 		return noMatch, nil
 	}
@@ -172,11 +172,11 @@ func (t GrepTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	if out.Truncated() {
 		output += "\n… <ripgrep output capped>"
 	}
-	result := Result{
+	result := repairNote(Result{
 		Output: output,
 		Title:  fmt.Sprintf("grep %q (%d)", a.Pattern, n),
 		Meta:   map[string]any{"count": n},
-	}
+	}, noteOf(tc))
 	grepMemo.put(key, result)
 	return result, nil
 }
@@ -283,7 +283,7 @@ func (GlobTool) Description() string {
 func (GlobTool) Schema() map[string]any {
 	return obj(map[string]any{
 		"pattern": strProp("Glob pattern to match filenames against."),
-		"path":    strProp("Directory to search. Defaults to the project root."),
+		"path":    pathProp("Directory to search. Defaults to the project root."),
 		"limit":   numProp("Maximum results. Default 200."),
 	}, "pattern")
 }
@@ -297,7 +297,7 @@ type globArgs struct {
 // Run implements Tool.
 func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a globArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	if a.Pattern == "" {
@@ -370,7 +370,7 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		truncated = true
 	}
 	if len(entries) == 0 {
-		return Result{Output: "no files matched " + a.Pattern, Title: "glob " + a.Pattern}, nil
+		return repairNote(Result{Output: "no files matched " + a.Pattern, Title: "glob " + a.Pattern}, noteOf(tc)), nil
 	}
 
 	var b strings.Builder
@@ -381,11 +381,11 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	if truncated {
 		fmt.Fprintf(&b, "… <truncated at %d results>\n", limit)
 	}
-	return Result{
+	return repairNote(Result{
 		Output: strings.TrimRight(b.String(), "\n"),
 		Title:  fmt.Sprintf("glob %s (%d)", a.Pattern, len(entries)),
 		Meta:   map[string]any{"count": len(entries)},
-	}, nil
+	}, noteOf(tc)), nil
 }
 
 // walkGlob is the no-ripgrep fallback.
@@ -451,7 +451,7 @@ func (ListTool) Description() string {
 // Schema implements Tool.
 func (ListTool) Schema() map[string]any {
 	return obj(map[string]any{
-		"path":  strProp("Directory to list. Defaults to the project root."),
+		"path":  pathProp("Directory to list. Defaults to the project root."),
 		"depth": numProp("How many levels deep to descend. Default 2."),
 	})
 }
@@ -464,7 +464,7 @@ type listArgs struct {
 // Run implements Tool.
 func (ListTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, error) {
 	var a listArgs
-	if err := decodeArgs(in, &a); err != nil {
+	if err := RepairDecode(in, &a, ListTool{}.Schema(), tc.Repair); err != nil {
 		return Errf("invalid arguments: %v", err), nil
 	}
 	root := tc.Cwd
@@ -528,5 +528,5 @@ func (ListTool) Run(_ context.Context, tc Context, in json.RawMessage) (Result, 
 	if truncated {
 		fmt.Fprintf(&b, "… <truncated at %d entries>\n", maxListEntries)
 	}
-	return Result{Output: b.String(), Title: fmt.Sprintf("list %s (%d)", relTo(tc.Cwd, root), count)}, nil
+	return repairNote(Result{Output: b.String(), Title: fmt.Sprintf("list %s (%d)", relTo(tc.Cwd, root), count)}, noteOf(tc)), nil
 }

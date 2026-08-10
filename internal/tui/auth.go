@@ -48,6 +48,9 @@ type authState struct {
 	cursor int
 	scroll int // first visible row in the provider list
 
+	// query filters the provider list as the user types (empty = show all)
+	query string
+
 	// entry being configured
 	returnTo authStage // stage to fall back to when a probe fails
 	target   catalog.Entry
@@ -75,12 +78,13 @@ type authState struct {
 
 // authRow is one line in the provider list.
 type authRow struct {
-	id        string
-	label     string
-	detail    string
-	connected bool
-	envOnly   bool // credential came from the environment, not our store
-	custom    bool
+	id          string
+	label       string
+	detail      string
+	connected   bool
+	envOnly     bool // credential came from the environment, not our store
+	custom      bool
+	addProvider bool // sentinel row: starts the custom-provider add flow
 }
 
 type authButtonZone struct {
@@ -103,8 +107,9 @@ func (m *Model) openAuth() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// rebuildAuthRows recomputes the list: configured providers first (green
-// check), then the rest of the catalog.
+// rebuildAuthRows recomputes the list: "+ Add Provider" first, then
+// configured providers (green check) and the rest of the catalog, all sorted
+// A-Z by label.
 func (m *Model) rebuildAuthRows() {
 	creds := m.creds
 	var connected, available []authRow
@@ -161,7 +166,15 @@ func (m *Model) rebuildAuthRows() {
 	}
 
 	sort.SliceStable(connected, func(i, j int) bool { return connected[i].label < connected[j].label })
-	m.auth.rows = append(connected, available...)
+	sort.SliceStable(available, func(i, j int) bool { return available[i].label < available[j].label })
+
+	// "+ Add Provider" is always the first row so the add flow is reachable
+	// by selection, not only by typing "add" in the input.
+	rows := []authRow{{addProvider: true, label: "+ Add Provider", detail: "custom OpenAI/Anthropic endpoint"}}
+	rows = append(rows, connected...)
+	rows = append(rows, available...)
+
+	m.auth.rows = rows
 	if m.auth.cursor >= len(m.auth.rows) {
 		m.auth.cursor = len(m.auth.rows) - 1
 	}
@@ -189,26 +202,52 @@ func (m *Model) authListPageSize() int {
 	return per
 }
 
+// authFilteredRows returns the provider rows that match the current search
+// query (empty query = everything). Matching is case-insensitive substring
+// against the label, id, and detail.
+func (m *Model) authFilteredRows() []authRow {
+	q := strings.ToLower(strings.TrimSpace(m.auth.query))
+	if q == "" {
+		return m.auth.rows
+	}
+	// The "+ Add Provider" sentinel is always shown, even while searching,
+	// so the add flow stays reachable.
+	var out []authRow
+	for _, r := range m.auth.rows {
+		if r.addProvider {
+			out = append(out, r)
+			continue
+		}
+		if strings.Contains(strings.ToLower(r.label), q) ||
+			strings.Contains(strings.ToLower(r.id), q) ||
+			strings.Contains(strings.ToLower(r.detail), q) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // authVisibleRows returns the slice of providers that fits on screen, plus
 // the window bounds so the caller can number rows correctly.
 func (m *Model) authVisibleRows() ([]authRow, int, int) {
+	rows := m.authFilteredRows()
 	// Budget: 2 border + 2 padding + title + blank + add line + blank +
 	// input + blank + hint, plus the two overflow markers.
 	per := m.authListPageSize()
 	if per < 3 {
 		per = 3
 	}
-	if per >= len(m.auth.rows) {
-		return m.auth.rows, 0, len(m.auth.rows)
+	if per >= len(rows) {
+		return rows, 0, len(rows)
 	}
 	from := m.auth.scroll
-	if from > len(m.auth.rows)-per {
-		from = len(m.auth.rows) - per
+	if from > len(rows)-per {
+		from = len(rows) - per
 	}
 	if from < 0 {
 		from = 0
 	}
-	return m.auth.rows[from : from+per], from, from + per
+	return rows[from : from+per], from, from + per
 }
 
 // authScroll moves the provider list window.
@@ -217,7 +256,7 @@ func (m *Model) authScroll(delta int) {
 	if per < 3 {
 		per = 3
 	}
-	maxScroll := len(m.auth.rows) - per
+	maxScroll := len(m.authFilteredRows()) - per
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -314,7 +353,7 @@ func (m *Model) authView() string {
 func (m *Model) authHint() string {
 	switch m.auth.stage {
 	case authList:
-		return "↑↓ select · enter configure · number/add type shortcut · esc/backspace back"
+		return "type to search · ↑↓ select · enter configure · esc clears search · backspace back"
 	case authEnterKey, authAddKey, authAddName, authAddURL:
 		return "enter confirm · backspace edit · esc back"
 	case authEditMenu:
@@ -358,6 +397,7 @@ func (m *Model) authListBody(w int) string {
 	s := m.styles
 	var b strings.Builder
 	active, _ := config.SplitModel(m.modelID)
+	filtered := m.authFilteredRows()
 
 	// The catalog is longer than most terminals are tall, so page it rather
 	// than rendering a list whose top is unreachable.
@@ -369,6 +409,10 @@ func (m *Model) authListBody(w int) string {
 		num := s.Faint.Render(fmt.Sprintf("%2d ", from+i+1))
 		mark := "  "
 		label := s.Muted.Render(r.label)
+		if r.addProvider && from+i != m.auth.cursor {
+			// Sentinel row: emphasize it but keep it distinct from connected.
+			label = s.Accent.Render(r.label)
+		}
 		if from+i == m.auth.cursor {
 			mark = s.Primary.Render("❯ ")
 			label = s.Base.Render(r.label)
@@ -384,12 +428,14 @@ func (m *Model) authListBody(w int) string {
 		line += s.Faint.Render(truncate(detail, w-40))
 		b.WriteString(line + "\n")
 	}
-	if to < len(m.auth.rows) {
-		b.WriteString(s.Faint.Render(fmt.Sprintf("  ↓ %d more below", len(m.auth.rows)-to)) + "\n")
+	if to < len(filtered) {
+		b.WriteString(s.Faint.Render(fmt.Sprintf("  ↓ %d more below", len(filtered)-to)) + "\n")
 	}
 
 	b.WriteString("\n")
-	b.WriteString(s.Faint.Render(" add ") + s.Muted.Render("add a custom provider (any OpenAI/Anthropic endpoint)") + "\n")
+	if m.auth.query != "" {
+		b.WriteString(s.Faint.Render(fmt.Sprintf("  %d match", len(filtered))) + s.Faint.Render(" — esc clears search") + "\n")
+	}
 	b.WriteString("\n  " + s.Base.Render(m.auth.inputBuf+"█") + "\n")
 	return b.String()
 }
@@ -570,6 +616,11 @@ func (m *Model) authOAuthBody(w int) string {
 func (m *Model) handleAuthKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
 
+	// Esc in the provider list with an active search clears the search
+	// first; only a second esc (or backspace with nothing typed) backs out.
+	if key == "esc" && a.stage == authList && a.query != "" {
+		return m.authListKey(msg, key)
+	}
 	if key == "esc" || (key == "backspace" && !authBackspaceEdits(a.stage, a.inputBuf)) {
 		return m.authBack()
 	}
@@ -644,6 +695,7 @@ func (m *Model) authBack() (tea.Model, tea.Cmd) {
 	case authEditMenu, authAddName, authProbing, authDeviceCode, authEnterKey, authEnterModel:
 		a.stage = authList
 		a.inputBuf = ""
+		a.query = ""
 		m.rebuildAuthRows()
 	case authAddURL:
 		if a.returnTo == authEditMenu {
@@ -660,6 +712,7 @@ func (m *Model) authBack() (tea.Model, tea.Cmd) {
 			a.stage = authEditMenu
 		} else {
 			a.stage = authList
+			a.query = ""
 			m.rebuildAuthRows()
 		}
 	case authOAuthWaiting:
@@ -671,6 +724,9 @@ func (m *Model) authBack() (tea.Model, tea.Cmd) {
 		a.oauthUserCode = ""
 		a.oauthVerifURI = ""
 		a.stage = authList
+		a.inputBuf = ""
+		a.query = ""
+		m.rebuildAuthRows()
 	case authKeyMenu, authKeyMode:
 		a.stage = authEditMenu
 	case authKeyAdd:
@@ -681,45 +737,67 @@ func (m *Model) authBack() (tea.Model, tea.Cmd) {
 
 func (m *Model) authListKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 	a := &m.auth
+	rows := m.authFilteredRows()
 	switch key {
 	case "enter":
 		in := strings.TrimSpace(strings.ToLower(a.inputBuf))
 		a.inputBuf = ""
+		a.query = ""
 		if in == "" {
-			if len(a.rows) == 0 {
+			if len(rows) == 0 {
 				return m, nil
 			}
-			return m.authSelectRow(a.rows[a.cursor])
+			if a.cursor >= len(rows) {
+				a.cursor = len(rows) - 1
+			}
+			return m.authSelectRow(rows[a.cursor])
 		}
 		if in == "add" || in == "a" || in == "+" {
-			a.stage = authAddName
-			a.custom = true
-			a.returnTo = authAddName
-			a.draftID, a.draftURL, a.draftKey = "", "", ""
-			a.inputBuf = ""
-			return m, nil
+			return m.authStartAdd()
 		}
 		// A number selects a row; a bare name also works.
 		idx := -1
-		if n, err := strconv.Atoi(in); err == nil && n >= 1 && n <= len(a.rows) {
+		if n, err := strconv.Atoi(in); err == nil && n >= 1 && n <= len(rows) {
 			idx = n - 1
 		} else {
-			for i, r := range a.rows {
+			for i, r := range rows {
 				if strings.EqualFold(r.id, in) || strings.EqualFold(r.label, in) {
 					idx = i
 					break
 				}
 			}
 		}
+		// A non-empty search query with no exact match still selects the
+		// highlighted match — typing "deep" then Enter configures DeepSeek.
+		if idx < 0 && len(rows) > 0 {
+			if a.cursor >= len(rows) {
+				a.cursor = len(rows) - 1
+			}
+			if r := rows[a.cursor]; !r.addProvider {
+				return m.authSelectRow(r)
+			}
+		}
 		if idx < 0 {
 			a.statusLine = m.styles.Error.Render("  no provider matches " + strconv.Quote(in))
 			return m, nil
 		}
-		return m.authSelectRow(a.rows[idx])
+		return m.authSelectRow(rows[idx])
 
 	case "backspace":
 		if len(a.inputBuf) > 0 {
 			a.inputBuf = a.inputBuf[:len(a.inputBuf)-1]
+			a.query = a.inputBuf
+			a.cursor = 0
+			a.scroll = 0
+		}
+		return m, nil
+
+	case "esc":
+		if a.inputBuf != "" {
+			a.inputBuf = ""
+			a.query = ""
+			a.cursor = 0
+			a.scroll = 0
 		}
 		return m, nil
 
@@ -730,7 +808,7 @@ func (m *Model) authListKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 		m.authRevealRow(a.cursor)
 		return m, nil
 	case "down", "ctrl+n":
-		if a.cursor < len(a.rows)-1 {
+		if a.cursor < len(rows)-1 {
 			a.cursor++
 		}
 		m.authRevealRow(a.cursor)
@@ -743,18 +821,50 @@ func (m *Model) authListKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "home":
 		a.scroll = 0
+		a.cursor = 0
 		return m, nil
 	case "end":
-		m.authScroll(len(a.rows))
+		a.cursor = len(rows) - 1
+		m.authRevealRow(a.cursor)
+		return m, nil
+	case "ctrl+u":
+		a.inputBuf = ""
+		a.query = ""
+		a.cursor = 0
+		a.scroll = 0
 		return m, nil
 	}
 	if len(msg.Runes) == 1 {
 		a.inputBuf += string(msg.Runes)
+		a.query = a.inputBuf
+		a.scroll = 0
+		// Highlight the first real match (skipping the + Add Provider
+		// sentinel at row 0) so Enter picks the provider the user searched
+		// for without an extra arrow press.
+		filtered := m.authFilteredRows()
+		if len(filtered) > 1 && filtered[0].addProvider {
+			a.cursor = 1
+		} else {
+			a.cursor = 0
+		}
 		// Typing a number should reveal the row it refers to.
 		if n, err := strconv.Atoi(strings.TrimSpace(a.inputBuf)); err == nil && n >= 1 {
 			m.authRevealRow(n - 1)
 		}
 	}
+	return m, nil
+}
+
+// authStartAdd begins the custom-provider add flow ("+ Add Provider" row or
+// typing "add").
+func (m *Model) authStartAdd() (tea.Model, tea.Cmd) {
+	a := &m.auth
+	a.stage = authAddName
+	a.custom = true
+	a.returnTo = authAddName
+	a.draftID, a.draftURL, a.draftKey = "", "", ""
+	a.inputBuf = ""
+	a.query = ""
 	return m, nil
 }
 
@@ -776,6 +886,10 @@ func (m *Model) authRevealRow(idx int) {
 // authSelectRow opens the right sub-flow for a chosen provider.
 func (m *Model) authSelectRow(r authRow) (tea.Model, tea.Cmd) {
 	a := &m.auth
+	// The "+ Add Provider" sentinel starts the custom-provider flow.
+	if r.addProvider {
+		return m.authStartAdd()
+	}
 	a.statusLine = ""
 	a.draftID = r.id
 	a.custom = r.custom

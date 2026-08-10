@@ -109,8 +109,7 @@ func logicalGroups(messages []provider.Message, encoding tokens.Encoding) []grou
 func messageTokens(messages []provider.Message, encoding tokens.Encoding) int {
 	total := 0
 	for _, message := range messages {
-		encoded := tokens.Marshal(message)
-		total += tokens.Count(string(encoded), encoding).Count + 4
+		total += tokens.CountMessage(message, encoding)
 	}
 	return total
 }

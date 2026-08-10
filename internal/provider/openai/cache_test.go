@@ -45,21 +45,34 @@ func TestCacheTokensParse(t *testing.T) {
 }
 
 func TestPromptCacheKeyIsStableAndNamespacedByModel(t *testing.T) {
-	first := promptCacheKey("gpt-5", "session-abc")
+	first := promptCacheKey("gpt-5", "session-abc", "")
 	if first == "" || len(first) != 64 {
 		t.Fatalf("key = %q, want a 64-character digest", first)
 	}
-	if got := promptCacheKey("gpt-5", "session-abc"); got != first {
+	if got := promptCacheKey("gpt-5", "session-abc", ""); got != first {
 		t.Fatalf("same session produced different keys: %q vs %q", first, got)
 	}
-	if got := promptCacheKey("gpt-4o", "session-abc"); got == first {
+	if got := promptCacheKey("gpt-4o", "session-abc", ""); got == first {
 		t.Fatal("different models shared a prompt cache key")
 	}
-	if got := promptCacheKey("gpt-5", "session-def"); got == first {
+	if got := promptCacheKey("gpt-5", "session-def", ""); got == first {
 		t.Fatal("different sessions shared a prompt cache key")
 	}
-	if got := promptCacheKey("gpt-5", ""); got != "" {
+	if got := promptCacheKey("gpt-5", "", ""); got != "" {
 		t.Fatalf("empty session id produced key %q", got)
+	}
+	// A content-derived scope key overrides the session id: identical
+	// non-interactive runs (same prompt, different session ids) share a warm
+	// bucket, while different prompt scopes never collide.
+	scopedA := promptCacheKey("gpt-5", "sess-1", "scope-a")
+	if scopedA == "" || len(scopedA) != 64 {
+		t.Fatalf("scoped key = %q, want a 64-character digest", scopedA)
+	}
+	if got := promptCacheKey("gpt-5", "sess-2", "scope-a"); got != scopedA {
+		t.Fatal("identical scope keys with different session ids produced different keys")
+	}
+	if got := promptCacheKey("gpt-5", "sess-1", "scope-b"); got == scopedA {
+		t.Fatal("different scope keys shared a prompt cache key")
 	}
 }
 
@@ -242,7 +255,7 @@ func TestStreamUsageAccountsCacheWritesSeparately(t *testing.T) {
 		}
 		return true
 	}
-	client.readSSE(context.Background(), strings.NewReader(line+"\n\ndata: [DONE]\n\n"), emit)
+	client.readSSE(context.Background(), strings.NewReader(line+"\n\ndata: [DONE]\n\n"), emit, false)
 	if usage.CacheReadTokens != 600 {
 		t.Fatalf("cache read = %d, want 600", usage.CacheReadTokens)
 	}
@@ -432,3 +445,112 @@ func TestRetryableTransportErrorClassification(t *testing.T) {
 }
 
 func fnError(e error) error { return e }
+
+// TestOpenRouterResponseCacheHeaderAndHit verifies the OpenRouter response
+// cache wiring: the X-OpenRouter-Cache header is sent (plus TTL when set) and
+// a X-OpenRouter-Cache-Status: HIT response surfaces on the usage event.
+func TestOpenRouterResponseCacheHeaderAndHit(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("content-type", "text/event-stream")
+		w.Header().Set("X-OpenRouter-Cache-Status", "HIT")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	client := New("openrouter", "test-key", server.URL)
+	client.SetOpenRouterResponseCache(true, 300)
+	ch := make(chan provider.Event, 16)
+	req := provider.Request{
+		Model:          "openai/gpt-5",
+		System:         "sys",
+		Messages:       []provider.Message{provider.UserText("hello")},
+		CacheRetention: provider.CacheRetentionLong,
+	}
+	var usage *provider.Usage
+	client.Stream(context.Background(), req, ch)
+	for ev := range ch {
+		if ev.Kind == provider.EventUsage {
+			usage = ev.Usage
+		}
+		if ev.Kind == provider.EventError {
+			t.Fatalf("stream error: %v", ev.Err)
+		}
+	}
+
+	if gotHeaders.Get("X-OpenRouter-Cache") != "true" {
+		t.Fatalf("X-OpenRouter-Cache header = %q, want true", gotHeaders.Get("X-OpenRouter-Cache"))
+	}
+	if gotHeaders.Get("X-OpenRouter-Cache-TTL") != "300" {
+		t.Fatalf("X-OpenRouter-Cache-TTL = %q, want 300", gotHeaders.Get("X-OpenRouter-Cache-TTL"))
+	}
+	if usage == nil || !usage.ResponseCacheHit {
+		t.Fatal("ResponseCacheHit not surfaced on usage event")
+	}
+}
+
+// TestOpenRouterResponseCacheDisabledOmitsHeader verifies the header is not
+// sent when the response cache is disabled (default off for non-OpenRouter).
+func TestOpenRouterResponseCacheDisabledOmitsHeader(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("content-type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	client := New("openrouter", "test-key", server.URL) // response cache off by default
+	ch := make(chan provider.Event, 16)
+	client.Stream(context.Background(), provider.Request{
+		Model:          "openai/gpt-5",
+		System:         "sys",
+		Messages:       []provider.Message{provider.UserText("hello")},
+		CacheRetention: provider.CacheRetentionLong,
+	}, ch)
+	for ev := range ch {
+		if ev.Kind == provider.EventError {
+			t.Fatalf("stream error: %v", ev.Err)
+		}
+	}
+	if gotHeaders.Get("X-OpenRouter-Cache") != "" {
+		t.Fatalf("X-OpenRouter-Cache header sent when disabled: %q", gotHeaders.Get("X-OpenRouter-Cache"))
+	}
+}
+
+// TestCacheControlMarkerOnMarkerCapableProviders verifies the Anthropic-style
+// cache_control marker is emitted on the stable system message for gateways
+// that honor it (Kimi, MiniMax, Qwen), and omitted for plain OpenAI and
+// DeepSeek-line endpoints that reject unknown fields.
+func TestCacheControlMarkerOnMarkerCapableProviders(t *testing.T) {
+	stable := "stable instructions"
+	system := stable + " volatile env"
+	msgs := []provider.Message{provider.UserText("hi")}
+
+	// Kimi: marker emitted on the stable system message.
+	kimiWire := toWireWithStableMarked(system, stable, msgs, false, false, true)
+	if len(kimiWire) < 1 || kimiWire[0].CacheControl == nil || kimiWire[0].CacheControl.Type != "ephemeral" {
+		t.Fatalf("kimi stable system message missing cache_control: %+v", kimiWire)
+	}
+
+	// Plain OpenAI: no marker.
+	openaiWire := toWireWithStableMarked(system, stable, msgs, false, false, false)
+	if len(openaiWire) < 1 || openaiWire[0].CacheControl != nil {
+		t.Fatalf("openai stable system message should not carry cache_control: %+v", openaiWire)
+	}
+
+	// cacheControlMarked gates on the provider id.
+	if !(&Client{ID: "kimi"}).cacheControlMarked() {
+		t.Fatal("kimi should be marker-capable")
+	}
+	if !(&Client{ID: "minimax"}).cacheControlMarked() {
+		t.Fatal("minimax should be marker-capable")
+	}
+	if (&Client{ID: "deepseek"}).cacheControlMarked() {
+		t.Fatal("deepseek should not be marker-capable")
+	}
+	if (&Client{ID: "openai"}).cacheControlMarked() {
+		t.Fatal("openai should not be marker-capable")
+	}
+}

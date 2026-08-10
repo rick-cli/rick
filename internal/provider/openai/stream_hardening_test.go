@@ -14,7 +14,7 @@ func TestReadSSEReportsMalformedData(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader("data: {not-json}\n\ndata: [DONE]\n\n"), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	if len(events) != 1 || events[0].Kind != provider.EventError {
 		t.Fatalf("events = %#v, want one error", events)
@@ -36,7 +36,7 @@ func TestReadSSERejectsMalformedToolArguments(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	for _, event := range events {
 		if event.Kind == provider.EventToolCall || event.Kind == provider.EventDone {
@@ -63,7 +63,7 @@ func TestReadSSERejectsToolCallWithoutName(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	for _, event := range events {
 		if event.Kind == provider.EventToolCall || event.Kind == provider.EventDone {
@@ -90,7 +90,7 @@ func TestReadSSERejectsEmptyCompletion(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	for _, event := range events {
 		if event.Kind == provider.EventDone {
@@ -112,7 +112,7 @@ func TestReadSSERejectsTruncatedToolCallStream(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	for _, event := range events {
 		if event.Kind == provider.EventToolCall || event.Kind == provider.EventDone {
@@ -139,7 +139,7 @@ func TestReadSSERejectsNonObjectToolArguments(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	for _, event := range events {
 		if event.Kind == provider.EventToolCall || event.Kind == provider.EventDone {
@@ -166,7 +166,7 @@ func TestReadSSERejectsDuplicateToolCallIDsAsOneInvalidBatch(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	for _, event := range events {
 		if event.Kind == provider.EventToolCall || event.Kind == provider.EventDone {
@@ -193,7 +193,7 @@ func TestReadSSESurfacesStreamedRefusalAsAssistantText(t *testing.T) {
 	client.readSSE(context.Background(), strings.NewReader(stream), func(event provider.Event) bool {
 		events = append(events, event)
 		return true
-	})
+	}, false)
 
 	var text strings.Builder
 	for _, event := range events {

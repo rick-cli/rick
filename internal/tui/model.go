@@ -210,7 +210,12 @@ type Model struct {
 	compactionActive   bool
 	compactionRunID    uint64
 	compactionCancel   context.CancelFunc
-	quitting           bool
+	// compactIneffectiveStrikes counts consecutive compactions that saved
+	// less than 10% of the context. After two strikes automatic compaction
+	// is skipped and the reason surfaced, so a dead-end session stops
+	// burning aux tokens on compactions that cannot shrink it.
+	compactIneffectiveStrikes int
+	quitting                  bool
 
 	// provider auth flow
 	auth  authState
@@ -271,7 +276,25 @@ type Model struct {
 	attachments              []attachment
 	clipboardShortcutWasDown bool
 	lastClipboardPaste       time.Time
-	focused                  bool
+	// pasteSuppress buffers terminal re-delivery of a paste we already
+	// inserted via the direct clipboard read. Windows Terminal converts its
+	// native Ctrl+V into per-character key events after the fact; without
+	// this, pasting would double-insert the text. The buffered runes are
+	// compared against the pasted text and dropped while they match.
+	pasteSuppress []rune
+	pasteTarget   string
+	// pasteNewlineUntil is set when a paste with newlines is inserted; the
+	// terminal's re-delivery of those newlines as Enter-family keys must be
+	// dropped until this time, even after the rune match cleared pasteTarget.
+	pasteNewlineUntil time.Time
+	focused           bool
+
+	// wheelKeyTimes tracks recent up/down key timestamps and directions.
+	// With mouse capture off (so the terminal owns selection), Windows
+	// Terminal delivers the scroll wheel as a rapid burst of same-direction
+	// up/down key events; a same-direction burst within a short window is
+	// treated as wheel scrolling instead of prompt history.
+	wheelKeyTimes []wheelKey
 
 	// per-tool expand/collapse (mouse click toggles when toolDetails is off)
 	expandedTools map[string]bool
@@ -545,7 +568,15 @@ func orInt(v, d int) int {
 
 // Init implements tea.Model.
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.input.Focus(), tea.EnterAltScreen, tea.EnableMouseCellMotion}
+	cmds := []tea.Cmd{m.input.Focus(), tea.EnterAltScreen}
+	// Only capture the mouse when an interactive surface needs it; the
+	// ordinary chat view must leave mouse tracking off so the terminal owns
+	// drag selection and copy. m.mouseEnabled tracks the actual mode and is
+	// synced here so the Update toggle knows the starting state.
+	if m.wantsMouseCapture() {
+		cmds = append(cmds, tea.EnableMouseCellMotion)
+		m.mouseEnabled = true
+	}
 	// Some terminals (and piped/CI invocations) never deliver a
 	// WindowSizeMsg. Without a fallback the UI would sit on "starting rick…"
 	// forever, so seed a sane size that a real WindowSizeMsg overrides.
@@ -599,11 +630,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return updated, tea.Batch(cmd, tea.DisableMouse)
 }
 
+// wantsMouseCapture reports whether the terminal should hand mouse events to
+// rick. The ordinary chat + input view deliberately returns false so the
+// terminal owns drag selection and copy there — selecting and copying text
+// works exactly like a normal terminal. Mouse capture is enabled only for
+// interactive surfaces that genuinely need clicks (auth, web, permission
+// prompt, choice menus, activity panel, resume browser). Setting
+// tui.mouse: true overrides this and keeps full mouse capture everywhere.
 func (m *Model) wantsMouseCapture() bool {
-	// Wheel events must remain terminal mouse messages in the ordinary chat
-	// view. If mouse tracking is disabled here, Windows Terminal reports the
-	// wheel as Up/Down key events and the chat bar navigates prompt history.
-	return true
+	if m.deps.Loaded != nil && m.deps.Loaded.TUI.Mouse {
+		return true
+	}
+	if m.web.active || m.auth.active || m.resumeBrowser != nil {
+		return true
+	}
+	if m.modal != modalNone {
+		return true
+	}
+	if isChoiceMenu(m.pending.kind) {
+		return true
+	}
+	if m.activityFocused {
+		return true
+	}
+	return false
 }
 
 func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -674,6 +724,14 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.modal != modalNone {
+			return m, nil
+		}
+		// Shift+click/drag is reserved for the terminal's own selection:
+		// Windows Terminal lets the user select text with Shift even while
+		// the app captures the mouse, so rick must not consume those events.
+		// This is what makes "select and copy like a normal terminal" work
+		// while rick keeps its click features for unmodified clicks.
+		if msg.Shift && msg.Button != tea.MouseButtonWheelUp && msg.Button != tea.MouseButtonWheelDown {
 			return m, nil
 		}
 		switch msg.Button {
@@ -924,6 +982,22 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			provider.AssistantText("Understood. Continuing from that state."),
 		)
 		newHistory = append(newHistory, msg.tail...)
+		// Anti-thrash effectiveness: a compaction that shrank the history by
+		// less than 10% is ineffective — the session can't be meaningfully
+		// compressed. Two strikes in a row stop automatic compaction so it
+		// stops burning aux tokens on dead-end folds.
+		beforeBytes := historyByteSize(m.history)
+		afterBytes := historyByteSize(newHistory)
+		if beforeBytes > 0 && beforeBytes-afterBytes < beforeBytes/10 {
+			m.compactIneffectiveStrikes++
+			if m.compactIneffectiveStrikes == 2 {
+				m.appendMsg(ChatMsg{Kind: MsgSystem,
+					Text: "automatic compaction paused: recent compactions saved <10% of context — run /compact manually if the session is still too large",
+					Time: time.Now()})
+			}
+		} else {
+			m.compactIneffectiveStrikes = 0
+		}
 		m.history = newHistory
 		m.msgs = append([]ChatMsg{{Kind: MsgSystem,
 			Text: "context compacted\n\n" + summary, Time: time.Now()}},
@@ -1454,7 +1528,11 @@ func (m *Model) handleDoubleClick(msg tea.MouseMsg) {
 	}
 	line := lines[contentRow]
 	if match := linkRe.FindString(line); match != "" {
-		copyToClipboardOSC52(match)
+		// Prefer the native Windows clipboard (works everywhere); fall back
+		// to OSC52 for terminals that only support the escape sequence.
+		if err := writeClipboardText(match); err != nil {
+			copyToClipboardOSC52(match)
+		}
 		m.setStatus("copied: " + match)
 	}
 }

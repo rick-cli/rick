@@ -85,7 +85,7 @@ type parallelArgs struct {
 
 func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage) (tools.Result, error) {
 	var a parallelArgs
-	if err := json.Unmarshal(in, &a); err != nil {
+	if err := tools.RepairDecode(in, &a, t.Schema(), tc.Repair); err != nil {
 		return tools.Errf("invalid arguments: %v", err), nil
 	}
 	if len(a.Tasks) == 0 {
@@ -164,9 +164,9 @@ func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.Raw
 		}
 	}
 
-	return tools.Result{
+	return tools.RepairNoteResult(tools.Result{
 		Output: strings.TrimRight(b.String(), "\n"),
 		Title:  fmt.Sprintf("%d parallel tasks", len(a.Tasks)),
 		Meta:   map[string]any{"count": len(a.Tasks)},
-	}, nil
+	}, tools.NoteOf(tc)), nil
 }

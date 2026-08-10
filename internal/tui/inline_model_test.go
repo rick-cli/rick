@@ -34,6 +34,11 @@ func newModelChoiceTestModel() *Model {
 		styles:   NewStyles(nil),
 		tx:       newTranscript(),
 		viewport: viewport.New(100, 20),
+		deps: Deps{
+			Loaded: &config.Loaded{
+				TUI: config.TUI{ScrollSpeed: 3, Mouse: false},
+			},
+		},
 	}
 }
 
@@ -138,24 +143,38 @@ func TestPromptHistoryTakesPriorityOverActivityFocus(t *testing.T) {
 	}
 }
 
-func TestMouseCaptureRemainsEnabledForTranscriptScrolling(t *testing.T) {
+func TestMouseCaptureOffInChatViewForNativeSelection(t *testing.T) {
 	m := newModelChoiceTestModel()
+	// Test models lack deps; give it a Loaded so wantsMouseCapture can read
+	// the mouse preference.
+	m.deps.Loaded = &config.Loaded{TUI: config.TUI{Mouse: false}}
+	if m.wantsMouseCapture() {
+		t.Fatal("plain chat view must NOT capture the mouse — the terminal owns selection there")
+	}
+
+	// Interactive overlays keep mouse capture.
+	m.auth.active = true
 	if !m.wantsMouseCapture() {
-		t.Fatal("chat view disabled mouse capture, so wheel input can become prompt-history keys")
+		t.Fatal("auth overlay must capture the mouse")
 	}
-	if m.mouseEnabled {
-		t.Fatal("test model should not claim runtime mouse state before Update")
-	}
+	m.auth.active = false
 
-	m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
-	if !m.mouseEnabled {
-		t.Fatal("chat view did not enable mouse capture after an update")
+	m.web.active = true
+	if !m.wantsMouseCapture() {
+		t.Fatal("web overlay must capture the mouse")
 	}
+	m.web.active = false
 
-	m.teamViews = map[string]*SwarmView{}
-	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	if !m.mouseEnabled {
-		t.Fatal("mouse capture was disabled after activity became idle")
+	m.activityFocused = true
+	if !m.wantsMouseCapture() {
+		t.Fatal("focused activity panel must capture the mouse")
+	}
+	m.activityFocused = false
+
+	// tui.mouse: true forces capture everywhere (legacy behavior).
+	m.deps.Loaded.TUI.Mouse = true
+	if !m.wantsMouseCapture() {
+		t.Fatal("tui.mouse: true must force mouse capture")
 	}
 }
 

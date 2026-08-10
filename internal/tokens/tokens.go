@@ -15,6 +15,13 @@ import (
 // Encoding identifies the tokenizer vocabulary used by a provider/model.
 type Encoding string
 
+// ImageTokenEstimate is the flat token cost attributed to a base64 image
+// block. Counting the raw base64 bytes as text would massively over-estimate
+// (a 1 MB image ≈ 250K tokens) and trigger premature trimming; counting it as
+// zero under-budgets vision sessions. The flat estimate matches how vision
+// models actually bill images (a small fixed cost each).
+const ImageTokenEstimate = 1600
+
 const (
 	EncodingCl100kBase Encoding = omnitoken.EncodingCL100KBase
 	EncodingO200kBase  Encoding = omnitoken.EncodingO200KBase
@@ -151,6 +158,26 @@ func Marshal(message provider.Message) []byte {
 	return raw
 }
 
+// CountMessage returns the token count of a message for budget decisions.
+// Base64 image blocks are charged at the flat ImageTokenEstimate instead of
+// their byte length, so a vision turn is neither over-budgeted (base64 is
+// not text) nor under-budgeted (images do cost tokens).
+func CountMessage(message provider.Message, encoding Encoding) int {
+	total := Count(string(Marshal(message)), encoding).Count + 4
+	for _, block := range message.Content {
+		if block.Type == "image" && block.Data != "" {
+			// Replace the counted base64 bytes with the flat image cost:
+			// subtract what the base64 data added, add the flat estimate.
+			dataTokens := Count(block.Data, encoding).Count
+			total += ImageTokenEstimate - dataTokens
+		}
+	}
+	if total < 0 {
+		total = 0
+	}
+	return total
+}
+
 type bytesMemo struct {
 	entries map[string][]byte
 	order   []string
@@ -197,14 +224,46 @@ func EncodingForModel(modelID string) Encoding {
 	return EncodingCl100kBase
 }
 
+// conservativeFallback estimates tokens for an unknown encoding without a
+// BPE vocabulary. It is CJK-aware: Han/Hangul/Kana codepoints cost roughly one
+// token each (vs four characters per token for Latin text), so a transcript
+// that is mostly CJK is not over-estimated by the byte/4 rule and does not
+// trigger premature trimming or distillation.
 func conservativeFallback(text string) int {
 	if text == "" {
 		return 0
 	}
 	runeCount := utf8.RuneCountInString(text)
 	byteEstimate := (len(text) + 3) / 4
-	if byteEstimate > runeCount {
-		return byteEstimate
+	denseEstimate := cjkDenseTokens(text)
+	// The CJK estimate is the tighter bound when the text is dense; the
+	// byte/4 rule dominates for long ASCII strings. Take the conservative
+	// (larger) of the two so we never under-budget the provider.
+	estimate := byteEstimate
+	if denseEstimate > estimate {
+		estimate = denseEstimate
 	}
-	return runeCount
+	if estimate < runeCount {
+		estimate = runeCount
+	}
+	return estimate
+}
+
+// cjkDenseTokens counts Han, Hangul and Kana codepoints (roughly one token
+// each in most modern tokenizers) plus one token per rune for the rest.
+func cjkDenseTokens(text string) int {
+	total := 0
+	for _, r := range text {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF, // CJK Unified Ideographs
+			r >= 0x3400 && r <= 0x4DBF, // CJK Ext A
+			r >= 0xAC00 && r <= 0xD7AF, // Hangul syllables
+			r >= 0x3040 && r <= 0x30FF, // Hiragana + Katakana
+			r >= 0xF900 && r <= 0xFAFF: // CJK compatibility ideographs
+			total++
+		default:
+			total++
+		}
+	}
+	return total
 }
