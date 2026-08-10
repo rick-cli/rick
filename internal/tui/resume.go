@@ -717,19 +717,23 @@ func (m *resumeModel) cachedMessageSearchText(id string) string {
 		}
 	}
 
-	sess, err := m.store.Load(id)
-	if err != nil {
-		return ""
-	}
-	var builder strings.Builder
-	for _, message := range sess.Messages {
-		for _, block := range message.Content {
-			if block.Type == "text" {
-				builder.WriteString(block.Text)
+	text := m.messageSearchSidecar(id)
+	if text == "" {
+		// No sidecar (legacy session): fall back to loading the full JSON.
+		sess, err := m.store.Load(id)
+		if err != nil {
+			return ""
+		}
+		var builder strings.Builder
+		for _, message := range sess.Messages {
+			for _, block := range message.Content {
+				if block.Type == "text" {
+					builder.WriteString(block.Text)
+				}
 			}
 		}
+		text = strings.ToLower(builder.String())
 	}
-	text := strings.ToLower(builder.String())
 	if len(text) > maxResumeCachedMessageBytes {
 		return text
 	}
@@ -744,6 +748,16 @@ func (m *resumeModel) cachedMessageSearchText(id string) string {
 	m.messageSearchCache[id] = text
 	m.messageSearchCacheOrder = append(m.messageSearchCacheOrder, id)
 	return text
+}
+
+// messageSearchSidecar reads the store's lightweight .search.txt sidecar for
+// a session, avoiding a full-session JSON unmarshal on every search keystroke.
+func (m *resumeModel) messageSearchSidecar(id string) string {
+	data, err := os.ReadFile(m.store.SearchPath(id))
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func (m *resumeModel) recalculateViewport() {

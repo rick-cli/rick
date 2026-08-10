@@ -40,6 +40,8 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		{"/model <id>", "switch directly, e.g. openai/gpt-5"},
 		{"/auth", "connect or edit a provider"},
 		{"/webproviders", "configure web-search providers and routing"},
+		{"/visionds", "toggle the vision bridge for text-only models (DeepSeek)"},
+		{"/visionapi", "set/clear the free Google AI Studio vision key"},
 		{"/update", "update Rick to the latest GitHub release"},
 		{"/uninstall", "choose FULL or PART removal"},
 	})
@@ -60,6 +62,7 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		{"/compact", "summarise history to free context"},
 		{"/ram", "current Rick terminal RAM usage"},
 		{"/goal <task>", "start an autonomous tracked goal"},
+		{"/loop <dur> <task>", "work on a task for at least <dur>, retrying errors"},
 		{"/refreshmodellist", "refresh model list from providers"},
 		{"/init", "write a project brief"},
 	})
@@ -112,6 +115,7 @@ func (m *Model) cmdConfig() (tea.Model, tea.Cmd) {
 	row("tool details", onOff(m.toolDetails))
 	row("thinking", onOff(m.showThinking))
 	row("mouse capture", onOff(m.deps.Loaded.TUI.Mouse))
+	row("vision bridge", onOff(m.visionEnabled()))
 
 	provs := make([]string, 0, len(m.deps.Providers))
 	for id := range m.deps.Providers {
@@ -124,7 +128,7 @@ func (m *Model) cmdConfig() (tea.Model, tea.Cmd) {
 		row("providers", fmt.Sprintf("%d · %s", len(provs), strings.Join(provs, ", ")))
 	}
 
-	b.WriteString("\n" + s.Faint.Render("  /theme  /models  /auth  /details to change these"))
+	b.WriteString("\n" + s.Faint.Render("  /theme  /models  /auth  /visionds  /details to change these"))
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: b.String(), Time: time.Now()})
 	return m, nil
 }

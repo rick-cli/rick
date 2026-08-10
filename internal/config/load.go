@@ -418,6 +418,32 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 	if has(p, "web_search") && src.WebSearch != nil {
 		dst.WebSearch = mergeWebSearchConfig(dst.WebSearch, src.WebSearch)
 	}
+	if has(p, "vision") && src.Vision != nil {
+		dst.Vision = mergeVisionConfig(dst.Vision, src.Vision)
+	}
+}
+
+// mergeVisionConfig merges a higher-precedence vision block over a lower one.
+// A non-empty field in `over` wins; false/empty values intentionally do not
+// clear an inherited value (a project can enable, never disable, globally).
+func mergeVisionConfig(base, over *VisionConfig) *VisionConfig {
+	if base == nil {
+		base = &VisionConfig{}
+	}
+	out := *base
+	if over.Enabled != nil {
+		out.Enabled = over.Enabled
+	}
+	if over.APIKey != "" {
+		out.APIKey = over.APIKey
+	}
+	if over.Model != "" {
+		out.Model = over.Model
+	}
+	if over.BaseURL != "" {
+		out.BaseURL = over.BaseURL
+	}
+	return &out
 }
 
 func mergeWebSearchConfig(base, over *WebSearchConfig) *WebSearchConfig {

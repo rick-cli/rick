@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -204,4 +205,52 @@ func TestKeepaliveRequiresSessionAndRetention(t *testing.T) {
 		t.Fatalf("keep-alive sessions registered without session/retention (got %d)", n)
 	}
 	client.stopKeepalive()
+}
+
+// TestKeepalivePrunesIdleSessions verifies the 24h prune runs even when the
+// keep-alive interval is far shorter — the bug where the else-if branch was
+// unreachable because every idle > 24h already matched the interval branch.
+func TestKeepalivePrunesIdleSessions(t *testing.T) {
+	client := New("deepseek", "test-key", "https://gateway.test/v1")
+	client.SetKeepalive(10 * time.Millisecond)
+	client.kaMu.Lock()
+	client.kaSessions = map[string]*kaSession{
+		"dead-1": {last: time.Now().Add(-48 * time.Hour)},
+		"live-1": {last: time.Now()},
+	}
+	client.kaMu.Unlock()
+
+	// The tick prunes dead-1 (idle > 24h) and sends a keep-alive for live-1
+	// only if it is idle past the interval — it is not, so nothing is sent.
+	client.keepaliveTick()
+
+	client.kaMu.Lock()
+	defer client.kaMu.Unlock()
+	if _, ok := client.kaSessions["dead-1"]; ok {
+		t.Errorf("dead-1 not pruned: keep-alive map still holds it")
+	}
+	if _, ok := client.kaSessions["live-1"]; !ok {
+		t.Errorf("live-1 was pruned despite being fresh")
+	}
+}
+
+// TestKeepaliveMapSizeCap verifies the map cannot grow past kaMaxSessions:
+// the oldest idle entries beyond the bound are dropped on a tick.
+func TestKeepaliveMapSizeCap(t *testing.T) {
+	client := New("deepseek", "test-key", "https://gateway.test/v1")
+	client.SetKeepalive(10 * time.Millisecond)
+	client.kaMu.Lock()
+	client.kaSessions = make(map[string]*kaSession, kaMaxSessions+10)
+	for i := 0; i < kaMaxSessions+10; i++ {
+		client.kaSessions[fmt.Sprintf("sess-%d", i)] = &kaSession{last: time.Now().Add(-time.Hour)}
+	}
+	client.kaMu.Unlock()
+
+	client.keepaliveTick()
+
+	client.kaMu.Lock()
+	defer client.kaMu.Unlock()
+	if len(client.kaSessions) > kaMaxSessions {
+		t.Fatalf("keep-alive map grew past cap: %d entries (cap %d)", len(client.kaSessions), kaMaxSessions)
+	}
 }

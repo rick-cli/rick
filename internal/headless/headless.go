@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -155,12 +156,19 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 		runErr       error
 	)
 
-	// Run the agent in a goroutine; drain events on this goroutine.
+	// Run the agent in a goroutine; drain events on this goroutine. A panic
+	// in the runner must not leave `<-done` blocked forever — recover it,
+	// surface it as an error, and close done so the drain loop can finish.
 	var appended []provider.Message
 	done := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				runErr = fmt.Errorf("headless: agent runner panicked: %v\n%s", r, debug.Stack())
+			}
+			close(done)
+		}()
 		appended, runErr = runner.Run(ctx, history, ch)
-		close(done)
 	}()
 
 	enc := json.NewEncoder(stdout)

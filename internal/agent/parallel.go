@@ -21,6 +21,28 @@ type ParallelTaskTool struct {
 func (ParallelTaskTool) Name() string   { return "parallel_tasks" }
 func (ParallelTaskTool) ReadOnly() bool { return false }
 
+// maxSubagentReportBytes bounds a single subagent's report echoed to the
+// parent. A report beyond this is head+tail trimmed with a marker so the
+// parent still gets the conclusion and the beginning, not the transcript.
+const maxSubagentReportBytes = 8 << 10
+
+func capSubagentReport(report string) string {
+	if len(report) <= maxSubagentReportBytes {
+		return report
+	}
+	marker := fmt.Sprintf("\n… <%d bytes of subagent report omitted>", len(report)-maxSubagentReportBytes)
+	limit := maxSubagentReportBytes - len(marker)
+	head := limit * 3 / 4
+	tail := limit - head
+	var b strings.Builder
+	b.WriteString(report[:head])
+	b.WriteString(marker)
+	if tail > 0 {
+		b.WriteString(report[len(report)-tail:])
+	}
+	return b.String()
+}
+
 func (ParallelTaskTool) Description() string {
 	return "Spawn multiple subagents in parallel. Each runs independently and concurrently.\n" +
 		"Pass an array of tasks; all are launched at once and results are collected.\n" +
@@ -135,7 +157,10 @@ func (t ParallelTaskTool) Run(ctx context.Context, tc tools.Context, in json.Raw
 		if r.err != nil {
 			fmt.Fprintf(&b, "ERROR: %v\n\n", r.err)
 		} else {
-			fmt.Fprintf(&b, "%s\n\n", r.out)
+			// A subagent's full report can run to tens of KBs; the parent
+			// needs the conclusion, not the transcript. Cap each report and
+			// keep the byte budget per task bounded.
+			fmt.Fprintf(&b, "%s\n\n", capSubagentReport(r.out))
 		}
 	}
 

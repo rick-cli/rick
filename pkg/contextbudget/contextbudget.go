@@ -289,23 +289,18 @@ func (b *Budget) storeCABLocked(hash, payload string) {
 // Boundary selection ------------------------------------------------
 
 // messageHash is a stable per-message fingerprint used to detect prefix
-// stability across requests.
+// stability across requests. The serialized bytes come from the shared
+// marshalled-bytes memo so the boundary pass does not re-marshal messages the
+// token-counting passes already serialized.
 func messageHash(message provider.Message) string {
-	raw, err := json.Marshal(message)
-	if err != nil {
-		return Hash(message.Text())
-	}
-	return Hash(string(raw))
+	return Hash(string(tokens.Marshal(message)))
 }
 
 // messageHashBytes returns the stable per-message fingerprint together with
 // the raw serialized bytes that produced it, so the boundary pass never
 // marshals a message twice (once for the hash, once for its byte length).
 func messageHashBytes(message provider.Message) (string, []byte) {
-	raw, err := json.Marshal(message)
-	if err != nil {
-		return Hash(message.Text()), nil
-	}
+	raw := tokens.Marshal(message)
 	return Hash(string(raw)), raw
 }
 
@@ -369,9 +364,6 @@ func (b *Budget) ChooseBoundaries(messages []provider.Message) map[int]bool {
 	for i := shared; i < n; i++ {
 		hash, raw := messageHashBytes(messages[i])
 		hashes[i] = hash
-		if raw == nil {
-			raw, _ = json.Marshal(messages[i])
-		}
 		byteLen[i] = len(raw)
 		if encoding != "" {
 			tokenLen[i] = tokens.Count(string(raw), encoding).Count + 4

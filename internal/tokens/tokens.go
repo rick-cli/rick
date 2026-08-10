@@ -2,9 +2,12 @@
 package tokens
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"rick/internal/provider"
 
 	"github.com/ron2111/omnitoken"
 )
@@ -112,6 +115,72 @@ func memoStore(text string, encoding Encoding, count int) {
 		memo.order = memo.order[1:]
 		memo.bytes -= len(oldest)
 		delete(memo.entries, oldest)
+	}
+}
+
+// ---------- marshalled-bytes memo ----------
+
+// Marshal returns the canonical JSON bytes for a provider.Message, memoized
+// by its marshalled text so the same stable message is never re-serialized
+// across the per-turn passes (countMessages, history.Retain, ChooseBoundaries
+// each marshal every message). Entries are bounded by count and bytes with
+// FIFO eviction like the count memo.
+func Marshal(message provider.Message) []byte {
+	text := message.Text()
+	if len(text) < memoMinText {
+		raw, err := json.Marshal(message)
+		if err != nil {
+			return []byte("{}")
+		}
+		return raw
+	}
+	key := text
+
+	marshalMu.Lock()
+	if raw, ok := marshalLRU.entries[key]; ok {
+		marshalMu.Unlock()
+		return raw
+	}
+	marshalMu.Unlock()
+
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return []byte("{}")
+	}
+	marshalStore(key, raw)
+	return raw
+}
+
+type bytesMemo struct {
+	entries map[string][]byte
+	order   []string
+	bytes   int
+}
+
+const (
+	marshalMemoMaxEntries = 4096
+	marshalMemoMaxBytes   = 32 << 20
+)
+
+var (
+	marshalMu  sync.Mutex
+	marshalLRU = bytesMemo{entries: map[string][]byte{}}
+)
+
+func marshalStore(key string, raw []byte) {
+	marshalMu.Lock()
+	defer marshalMu.Unlock()
+	if _, exists := marshalLRU.entries[key]; exists {
+		return
+	}
+	marshalLRU.entries[key] = raw
+	marshalLRU.order = append(marshalLRU.order, key)
+	marshalLRU.bytes += len(raw)
+	for marshalLRU.bytes > marshalMemoMaxBytes || len(marshalLRU.order) > marshalMemoMaxEntries {
+		oldest := marshalLRU.order[0]
+		marshalLRU.order = marshalLRU.order[1:]
+		marshalLRU.bytes -= len(marshalLRU.entries[oldest])
+		delete(marshalLRU.entries, oldest)
 	}
 }
 

@@ -89,6 +89,10 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdSandbox(args)
 	case "yolo":
 		return m.cmdYolo(args)
+	case "visionds":
+		return m.cmdVisionDS(args)
+	case "visionapi":
+		return m.cmdVisionAPI(args)
 	case "jobs":
 		return m.cmdJobs()
 	case "agents", "agent":
@@ -101,6 +105,8 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdRAM()
 	case "goal":
 		return m.cmdGoal(args)
+	case "loop":
+		return m.cmdLoop(args)
 	case "update":
 		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "updating Rick from the latest GitHub release…", Time: nowFn()})
 		return m, runUpdate()

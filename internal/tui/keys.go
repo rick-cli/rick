@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"rick/internal/permission"
 	"rick/internal/provider"
 	"rick/internal/tools"
+	"rick/internal/vision"
 )
 
 func (m *Model) syncInputHeight() bool {
@@ -481,6 +484,12 @@ func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
 		m.setStatus("still working — esc to interrupt")
 		return m, nil
 	}
+	// Also block while the vision bridge is reading images — a second prompt
+	// would race the pending turn.
+	if m.visionPending {
+		m.setStatus("vision bridge is reading the image(s) — wait a moment")
+		return m, nil
+	}
 	if m.compactionActive {
 		m.setStatus("compacting — wait for completion")
 		return m, nil
@@ -513,14 +522,27 @@ func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
 	// These are inserted when the user pastes images/files from clipboard.
 	indices, cleaned := parseAttachmentMarkers(prompt)
 
+	// Pick up image paths mentioned in the prompt (bare paths or @path) so
+	// they are routed through the vision bridge instead of the agent hunting
+	// for tools to read them. Runs before the marker loop below, which only
+	// covers clipboard attachments.
+	imagePaths := m.imagePathsInPrompt(cleaned, attached)
+
 	// Build the user message with attachments
 	userMsg := provider.Message{Role: provider.RoleUser, Content: []provider.ContentBlock{provider.TextBlock(cleaned)}}
+	var imageAtts []attachment
 	for _, idx := range indices {
 		if idx > 0 && idx <= len(m.attachments) {
 			att := m.attachments[idx-1]
 			if att.IsImage && att.Base64 != "" {
 				userMsg.Content = append(userMsg.Content, provider.ImageBlock(att.MediaType, att.Base64))
+				imageAtts = append(imageAtts, att)
 			}
+		}
+	}
+	for _, path := range imagePaths {
+		if att, err := addAttachment(path); err == nil && att.IsImage && att.Base64 != "" {
+			imageAtts = append(imageAtts, *att)
 		}
 	}
 
@@ -533,7 +555,129 @@ func (m *Model) submit(text string) (tea.Model, tea.Cmd) {
 	}
 	m.attachments = nil
 
+	// Vision bridge: when enabled, route images to the vision model and
+	// replace the raw image blocks with structured text evidence so a
+	// text-only model (DeepSeek) can answer.
+	if len(imageAtts) > 0 && m.visionEnabled() {
+		return m, m.startVisionBridge(userMsg, imageAtts)
+	}
 	return m, m.startAgentWithMessage(userMsg)
+}
+
+// visionEnabled reports whether the vision bridge is on: the resolved config
+// has it enabled AND an API key is present.
+func (m *Model) visionEnabled() bool {
+	if m.deps.Loaded == nil {
+		return false
+	}
+	cfg := m.deps.Loaded.Config.Vision
+	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
+		return false
+	}
+	return strings.TrimSpace(cfg.APIKey) != ""
+}
+
+// imagePathsInPrompt finds image file paths mentioned in the prompt — bare
+// paths or @path references — so they can be sent through the vision bridge
+// rather than left for the agent to discover with tools. attachedPaths are
+// the @-expanded paths from expandFileRefs, which are skipped (they were
+// already inlined as text).
+func (m *Model) imagePathsInPrompt(prompt string, attachedPaths []string) []string {
+	attachedSet := make(map[string]bool, len(attachedPaths))
+	for _, p := range attachedPaths {
+		abs := p
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(m.deps.Cwd, p)
+		}
+		attachedSet[strings.ToLower(filepath.Clean(abs))] = true
+	}
+
+	var out []string
+	seen := make(map[string]bool)
+	fields := strings.Fields(prompt)
+	for _, f := range fields {
+		tok := strings.TrimSuffix(f, ",")
+		tok = strings.TrimSuffix(tok, ".")
+		tok = strings.TrimPrefix(tok, "@")
+		if tok == "" || !isImageFile(tok) {
+			continue
+		}
+		p := tok
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(m.deps.Cwd, tok)
+		}
+		clean := filepath.Clean(p)
+		if attachedSet[strings.ToLower(clean)] || seen[clean] {
+			continue
+		}
+		if _, err := os.Stat(clean); err != nil {
+			continue
+		}
+		seen[clean] = true
+		out = append(out, clean)
+	}
+	return out
+}
+
+// visionConfig builds the client config for the vision bridge.
+func (m *Model) visionConfig() vision.Config {
+	out := vision.Config{}
+	if m.deps.Loaded == nil {
+		return out
+	}
+	cfg := m.deps.Loaded.Config.Vision
+	if cfg == nil {
+		return out
+	}
+	out.APIKey = strings.TrimSpace(cfg.APIKey)
+	out.Model = cfg.Model
+	out.BaseURL = cfg.BaseURL
+	return out
+}
+
+// startVisionBridge sends each image to the vision model asynchronously,
+// then starts the agent with the evidence in place of the raw images.
+func (m *Model) startVisionBridge(userMsg provider.Message, images []attachment) tea.Cmd {
+	m.visionRunID++
+	runID := m.visionRunID
+	m.visionPending = true
+	if m.visionCancel != nil {
+		m.visionCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.visionCancel = cancel
+	m.setStatus(fmt.Sprintf("vision: reading %d image(s)…", len(images)))
+	cfg := m.visionConfig()
+
+	return func() tea.Msg {
+		defer cancel()
+		client := vision.New(cfg)
+		var evidence strings.Builder
+		for i, att := range images {
+			if err := ctx.Err(); err != nil {
+				return visionDoneMsg{runID: runID, images: i, err: ctx.Err()}
+			}
+			result, err := client.Analyze(ctx, att.MediaType, att.Base64, "")
+			if err != nil {
+				return visionDoneMsg{runID: runID, images: i, err: err}
+			}
+			if evidence.Len() > 0 {
+				evidence.WriteString("\n\n")
+			}
+			fmt.Fprintf(&evidence, "### Image %d (%s)\n%s", i+1, att.Name, strings.TrimSpace(vision.Render(result)))
+		}
+		// Replace the user text with the prompt plus the evidence block, and
+		// drop the raw image blocks entirely.
+		text := ""
+		for _, b := range userMsg.Content {
+			if b.Type == "text" {
+				text = strings.TrimSpace(b.Text)
+			}
+		}
+		final := provider.Message{Role: provider.RoleUser,
+			Content: []provider.ContentBlock{provider.TextBlock(text + "\n\n" + evidence.String())}}
+		return visionDoneMsg{runID: runID, images: len(images), msg: final}
+	}
 }
 
 // startAgentWithMessage kicks off a run with a pre-built user message.

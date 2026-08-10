@@ -15,15 +15,28 @@ import (
 
 // Goal is a tracked objective with optional steps and a token budget.
 type Goal struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description,omitempty"`
-	Status      string    `json:"status"` // active | completed | aborted
-	TokenBudget int       `json:"token_budget,omitempty"`
-	TokensUsed  int       `json:"tokens_used"`
-	Steps       []Step    `json:"steps,omitempty"`
-	Created     time.Time `json:"created"`
-	Updated     time.Time `json:"updated"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	Status      string `json:"status"` // active | completed | aborted
+	TokenBudget int    `json:"token_budget,omitempty"`
+	TokensUsed  int    `json:"tokens_used"`
+	Steps       []Step `json:"steps,omitempty"`
+	// LoopRun, when set, makes this a loop goal: the agent keeps working on
+	// the title, swallowing errors and retrying, until at least MinRunSeconds
+	// of wall time have elapsed. MaxRetries bounds error retries.
+	LoopRun *LoopRun  `json:"loop_run,omitempty"`
+	Created time.Time `json:"created"`
+	Updated time.Time `json:"updated"`
+}
+
+// LoopRun configures an autonomous loop goal (/loop). TokenBudget stays 0
+// (unlimited) for loop goals — the loop is bounded by time, not tokens.
+type LoopRun struct {
+	MinRunSeconds int       `json:"min_run_seconds"`
+	MaxRetries    int       `json:"max_retries"`
+	Retries       int       `json:"retries"`
+	StartedAt     time.Time `json:"started_at,omitempty"`
 }
 
 // Step is one unit of work within a goal.
@@ -271,5 +284,30 @@ func Progress(g *Goal) string {
 	} else if g.TokensUsed > 0 {
 		fmt.Fprintf(&b, " · %dk tokens used", g.TokensUsed/1000)
 	}
+	if g.LoopRun != nil {
+		remaining := g.LoopRun.MinRunSeconds - int(time.Since(g.LoopRun.StartedAt).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Fprintf(&b, " · loop %d/%d retries · %s/%s", g.LoopRun.Retries, g.LoopRun.MaxRetries,
+			formatDuration(remaining), formatDuration(g.LoopRun.MinRunSeconds))
+	}
 	return b.String()
+}
+
+// formatDuration renders a seconds count compactly (e.g. "25m30s").
+func formatDuration(totalSeconds int) string {
+	if totalSeconds < 0 {
+		totalSeconds = 0
+	}
+	h := totalSeconds / 3600
+	m := (totalSeconds % 3600) / 60
+	s := totalSeconds % 60
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%02dm", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }

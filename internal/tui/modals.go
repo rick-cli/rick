@@ -803,6 +803,10 @@ type compactDoneMsg struct {
 
 // ---------- goal commands ----------
 
+// loopMaxRetries bounds how many times a /loop goal retries after an error
+// before giving up.
+const loopMaxRetries = 100
+
 // cmdGoal handles /goal — shows an interactive menu, or handles backward-compat
 // subcommands when args are provided.
 func (m *Model) cmdGoal(args string) (tea.Model, tea.Cmd) {
@@ -849,6 +853,200 @@ func (m *Model) createAndStartGoal(task string) (tea.Model, tea.Cmd) {
 	// Start the agent with the goal as the prompt.
 	m.appendMsg(ChatMsg{Kind: MsgUser, Text: task, Time: time.Now()})
 	return m, m.startAgent(task)
+}
+
+// cmdLoop handles /loop <duration> <task> — like /goal but the agent keeps
+// working (ignoring errors, retrying up to loopMaxRetries times) until at
+// least <duration> of wall time has elapsed. The goal has an unlimited token
+// budget; only the run time and the retry ceiling bound it.
+func (m *Model) cmdLoop(args string) (tea.Model, tea.Cmd) {
+	if m.deps.Goals == nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "goals not available", Time: time.Now()})
+		return m, nil
+	}
+	args = strings.TrimSpace(args)
+	if args == "" {
+		m.appendMsg(ChatMsg{Kind: MsgError,
+			Text: "usage: /loop <duration> <task> — e.g. /loop 30m fix all failing tests", Time: time.Now()})
+		return m, nil
+	}
+	minRun, task := parseLoopArgs(args)
+	if minRun <= 0 {
+		m.appendMsg(ChatMsg{Kind: MsgError,
+			Text: "usage: /loop <duration> <task> — duration like 10m, 1h, 90s", Time: time.Now()})
+		return m, nil
+	}
+	if task == "" {
+		m.appendMsg(ChatMsg{Kind: MsgError,
+			Text: "usage: /loop <duration> <task> — give me something to work on", Time: time.Now()})
+		return m, nil
+	}
+	if m.running || m.agentCh != nil {
+		m.interrupt()
+	}
+	now := time.Now()
+	g := &goal.Goal{
+		Title:  task,
+		Status: "active",
+		LoopRun: &goal.LoopRun{
+			MinRunSeconds: int(minRun.Seconds()),
+			MaxRetries:    loopMaxRetries,
+			StartedAt:     now,
+		},
+	}
+	if err := m.deps.Goals.Save(g); err != nil {
+		m.appendMsg(ChatMsg{Kind: MsgError, Text: "loop: " + err.Error(), Time: time.Now()})
+		return m, nil
+	}
+	_ = m.deps.Goals.SetActive(g.ID)
+	m.loop = &loopState{
+		goalID:     g.ID,
+		task:       task,
+		minRun:     minRun,
+		maxRetries: loopMaxRetries,
+		start:      now,
+	}
+	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: fmt.Sprintf(
+		"loop set: %s — working for at least %s, retrying errors up to %d times, unlimited token budget",
+		task, humanDuration(minRun), loopMaxRetries), Time: time.Now()})
+	m.setStatus("loop: " + truncate(task, 40))
+	m.appendMsg(ChatMsg{Kind: MsgUser, Text: task, Time: time.Now()})
+	return m, m.startAgent(task)
+}
+
+// parseLoopArgs splits "/loop <duration> <task>" into the minimum run duration
+// and the task text. The duration must be the first field and parseable by
+// time.ParseDuration (e.g. "10m", "1h30m", "90s").
+func parseLoopArgs(args string) (time.Duration, string) {
+	fields := strings.Fields(args)
+	if len(fields) < 2 {
+		return 0, ""
+	}
+	d, err := time.ParseDuration(fields[0])
+	if err != nil || d <= 0 {
+		return 0, ""
+	}
+	return d, strings.TrimSpace(strings.TrimPrefix(args, fields[0]))
+}
+
+// loopState tracks one active /loop run in memory. The goal store holds the
+// persistent metadata; this carries the runtime wall-clock and per-iteration
+// counters that only matter while the loop is live.
+type loopState struct {
+	goalID     string
+	task       string
+	minRun     time.Duration
+	maxRetries int
+	retries    int
+	start      time.Time
+	tools      int // tool calls executed during the current iteration
+}
+
+// loopAdvance handles a clean finish of one loop iteration. Before the minimum
+// run time has elapsed the agent is restarted to keep doing real work; after it
+// the loop completes.
+func (m *Model) loopAdvance() (tea.Cmd, bool) {
+	if m.loop == nil {
+		return m.finishRun(nil), true
+	}
+	if time.Since(m.loop.start) >= m.loop.minRun {
+		m.appendMsg(ChatMsg{Kind: MsgSystem,
+			Text: fmt.Sprintf("loop: minimum run time %s reached — task complete", humanDuration(m.loop.minRun)),
+			Time: time.Now()})
+		return m.finishLoop(nil), true
+	}
+	remaining := m.loop.minRun - time.Since(m.loop.start)
+	didWork := m.loop.tools > 0
+	m.loop.tools = 0
+	note := fmt.Sprintf("Loop continuing: %s of the %s minimum run time remain. Keep doing real work on the task: %s",
+		humanDuration(remaining), humanDuration(m.loop.minRun), m.loop.task)
+	if !didWork {
+		note = fmt.Sprintf("Loop continuing: %s of the %s minimum run time remain, and your last answer used no tools — that isn't real work. Keep actively using tools to make progress on: %s",
+			humanDuration(remaining), humanDuration(m.loop.minRun), m.loop.task)
+	}
+	return m.continueLoop(note)
+}
+
+// loopRetry handles an errored iteration of a loop goal: the error is
+// swallowed and the agent restarted, up to maxRetries times.
+func (m *Model) loopRetry(err error) (tea.Cmd, bool) {
+	if m.loop == nil {
+		return m.finishRun(err), true
+	}
+	m.loop.retries++
+	if m.loop.retries >= m.loop.maxRetries {
+		m.appendMsg(ChatMsg{Kind: MsgError,
+			Text: fmt.Sprintf("loop: %d retries exhausted — stopping", m.loop.maxRetries), Time: time.Now()})
+		return m.finishLoop(fmt.Errorf("loop: %d retries exhausted (last error: %v)", m.loop.maxRetries, err)), true
+	}
+	m.loop.tools = 0
+	note := fmt.Sprintf("Loop retry %d/%d: the previous attempt failed with: %v\nIgnore that error and keep working on the task: %s",
+		m.loop.retries, m.loop.maxRetries, err, m.loop.task)
+	return m.continueLoop(note)
+}
+
+// continueLoop cleans up the finished iteration without ending the loop and
+// restarts the agent with the given continuation note.
+func (m *Model) continueLoop(note string) (tea.Cmd, bool) {
+	if m.agentCancel != nil {
+		m.agentCancel()
+		m.agentCancel = nil
+	}
+	m.agentCh = nil
+	m.running = false
+	m.resizeForActivity()
+	// The note below is re-added to history by startAgent; rebuild first so it
+	// is not duplicated by the MsgUser appended for the transcript.
+	m.rebuildHistory()
+	m.recordRunError(nil) // errors are swallowed by the loop
+	if saveErr := m.saveSession(); saveErr != nil {
+		m.reportSessionSaveError(saveErr)
+	}
+	m.refresh()
+	m.appendMsg(ChatMsg{Kind: MsgUser, Text: note, Time: time.Now()})
+	m.setStatus("loop: " + truncate(note, 40))
+	return m.startAgent(note), true
+}
+
+// finishLoop ends a loop run: the goal is marked completed (nil err) or
+// aborted (non-nil err) and the run finishes normally.
+func (m *Model) finishLoop(err error) tea.Cmd {
+	if m.loop != nil && m.deps.Goals != nil {
+		if g, gerr := m.deps.Goals.GetActive(); gerr == nil && g != nil && g.ID == m.loop.goalID {
+			if err != nil {
+				g.Status = "aborted"
+			} else {
+				g.Status = "completed"
+			}
+			if g.LoopRun != nil {
+				g.LoopRun.Retries = m.loop.retries
+			}
+			_ = m.deps.Goals.Save(g)
+			_ = m.deps.Goals.ClearActive()
+		}
+	}
+	m.loop = nil
+	return m.finishRun(err)
+}
+
+// abortLoop stops an active loop without completing its goal, recording the
+// goal as aborted. Used when a run ends outside the loop handlers (user
+// interrupt, unexpected stream end).
+func (m *Model) abortLoop() {
+	if m.loop == nil {
+		return
+	}
+	if m.deps.Goals != nil {
+		if g, gerr := m.deps.Goals.GetActive(); gerr == nil && g != nil && g.ID == m.loop.goalID {
+			g.Status = "aborted"
+			if g.LoopRun != nil {
+				g.LoopRun.Retries = m.loop.retries
+			}
+			_ = m.deps.Goals.Save(g)
+			_ = m.deps.Goals.ClearActive()
+		}
+	}
+	m.loop = nil
 }
 
 // cmdGoalMenu shows the interactive goal menu.
@@ -946,6 +1144,7 @@ func (m *Model) goalDone() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	_ = m.deps.Goals.ClearActive()
+	m.loop = nil
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: fmt.Sprintf("goal completed: %s (%s)", g.Title, goal.Progress(g)), Time: time.Now()})
 	m.setStatus("goal done")
 	return m, nil
@@ -963,6 +1162,7 @@ func (m *Model) goalAbort() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	_ = m.deps.Goals.ClearActive()
+	m.loop = nil
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "goal aborted: " + g.Title, Time: time.Now()})
 	m.setStatus("goal aborted")
 	return m, nil

@@ -157,6 +157,11 @@ func NewStore(dir string) (*Store, error) {
 // Dir returns the backing directory.
 func (s *Store) Dir() string { return s.dir }
 
+// SearchPath returns the search-sidecar path for a session id. The sidecar
+// is written by Save and read by Search/resume browsing to avoid loading the
+// full session JSON when only message text is needed.
+func (s *Store) SearchPath(id string) string { return s.searchPath(id) }
+
 // NewID mints a sortable, filesystem-safe id.
 func NewID() string {
 	now := time.Now()
@@ -164,6 +169,11 @@ func NewID() string {
 }
 
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+".json") }
+
+// searchPath returns the lightweight search-text sidecar for a session: the
+// lowercased concatenation of all message text, written at Save time so
+// Search can answer without unmarshalling the full session JSON.
+func (s *Store) searchPath(id string) string { return filepath.Join(s.dir, id+".search.txt") }
 
 func validID(id string) bool {
 	return id != "" && id != "." && id != ".." && filepath.Base(id) == id &&
@@ -208,7 +218,37 @@ func (s *Store) Save(sess *Session) error {
 	if err := os.WriteFile(metaTmp, metaData, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(metaTmp, s.metaPath(sess.ID))
+	if err := os.Rename(metaTmp, s.metaPath(sess.ID)); err != nil {
+		return err
+	}
+	// Search sidecar: lowercased concatenated message text so Search avoids
+	// unmarshalling the full session JSON. Written best-effort — a failure
+	// only degrades Search to the Load() fallback.
+	if idxText := searchTextOf(sess); idxText != "" {
+		idxTmp := s.searchPath(sess.ID) + ".tmp"
+		if err := os.WriteFile(idxTmp, []byte(idxText), 0o644); err == nil {
+			_ = os.Rename(idxTmp, s.searchPath(sess.ID))
+		} else {
+			_ = os.Remove(idxTmp)
+		}
+	}
+	return nil
+}
+
+// searchTextOf builds the search-sidecar payload for a session: the
+// lowercased concatenation of every text-bearing block, bounded so the
+// sidecar cannot balloon with a huge transcript.
+func searchTextOf(sess *Session) string {
+	const maxSearchSidecarBytes = 1 << 20 // 1 MiB per session is ample for search
+	var b strings.Builder
+	for _, m := range sess.Messages {
+		b.WriteString(m.Text())
+		b.WriteByte('\n')
+	}
+	if b.Len() > maxSearchSidecarBytes {
+		return strings.ToLower(b.String()[:maxSearchSidecarBytes])
+	}
+	return strings.ToLower(b.String())
 }
 
 // Load reads a session by id.
@@ -227,7 +267,8 @@ func (s *Store) Load(id string) (*Session, error) {
 	return &sess, nil
 }
 
-// Delete removes a session file and its lightweight metadata companion.
+// Delete removes a session file, its lightweight metadata companion, and the
+// search sidecar.
 func (s *Store) Delete(id string) error {
 	if !validID(id) {
 		return fmt.Errorf("invalid session id")
@@ -239,6 +280,10 @@ func (s *Store) Delete(id string) error {
 	metaErr := os.Remove(s.metaPath(id))
 	if metaErr != nil && !os.IsNotExist(metaErr) {
 		return metaErr
+	}
+	searchErr := os.Remove(s.searchPath(id))
+	if searchErr != nil && !os.IsNotExist(searchErr) {
+		return searchErr
 	}
 	return nil
 }
@@ -565,6 +610,16 @@ func (s *Store) Search(query string) ([]Meta, error) {
 	for _, meta := range metas {
 		if strings.Contains(strings.ToLower(meta.Title), q) {
 			out = append(out, meta)
+			continue
+		}
+		// Fast path: the search sidecar holds the lowercased message text,
+		// so matching does not require unmarshalling the full session JSON.
+		// Sessions saved before the sidecar existed fall back to Load().
+		idxText, idxErr := os.ReadFile(s.searchPath(meta.ID))
+		if idxErr == nil {
+			if strings.Contains(string(idxText), q) {
+				out = append(out, meta)
+			}
 			continue
 		}
 		sess, err := s.Load(meta.ID)

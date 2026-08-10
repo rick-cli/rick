@@ -1,6 +1,12 @@
 package tokens
 
-import "testing"
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+
+	"rick/internal/provider"
+)
 
 func TestCountCl100kBaseUsesExactEncoding(t *testing.T) {
 	result := Count("hello world", EncodingCl100kBase)
@@ -84,5 +90,41 @@ func TestCountMemoReturnsIdenticalResultsAndStaysBounded(t *testing.T) {
 	}
 	if memo := memos[EncodingCl100kBase]; memo != nil && memo.bytes > memoMaxBytes {
 		t.Fatalf("memo grew past the byte cap: %d", memo.bytes)
+	}
+}
+
+func TestMarshalMemoMatchesDirectJSONAndStaysBounded(t *testing.T) {
+	msg := provider.Message{
+		Role:    provider.RoleUser,
+		Content: []provider.ContentBlock{provider.TextBlock("memoized marshal test payload with enough text to clear the memo floor")},
+	}
+	direct, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Marshal(msg)
+	if string(got) != string(direct) {
+		t.Fatalf("Marshal memo differs from direct json.Marshal:\n got  %s\n want %s", got, direct)
+	}
+	// Repeat returns identical bytes (memo hit).
+	if again := Marshal(msg); string(again) != string(got) {
+		t.Fatalf("second Marshal changed the payload")
+	}
+
+	// Bounded eviction: flooding with unique messages must not grow past the
+	// entry cap.
+	for i := 0; i < marshalMemoMaxEntries*2; i++ {
+		Marshal(provider.Message{
+			Role:    provider.RoleUser,
+			Content: []provider.ContentBlock{provider.TextBlock(fmt.Sprintf("flood %d with enough text to pass the floor", i))},
+		})
+	}
+	marshalMu.Lock()
+	defer marshalMu.Unlock()
+	if len(marshalLRU.entries) > marshalMemoMaxEntries {
+		t.Fatalf("marshal memo grew past the entry cap: %d", len(marshalLRU.entries))
+	}
+	if marshalLRU.bytes > marshalMemoMaxBytes {
+		t.Fatalf("marshal memo grew past the byte cap: %d", marshalLRU.bytes)
 	}
 }

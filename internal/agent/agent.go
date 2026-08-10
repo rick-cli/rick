@@ -435,7 +435,34 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		ch := make(chan provider.Event, 256)
 		streamCtx, cancelStream := context.WithCancel(ctx)
 		r.lastRequest = time.Now()
-		go r.cfg.Provider.Stream(streamCtx, req, ch)
+		// A panic inside the provider's stream goroutine would otherwise
+		// crash the whole process and (in headless/cachehit callers) skip
+		// Stream's `defer close(ch)`, leaving the event loop blocked forever.
+		// Recover it and surface an EvError so the turn fails cleanly.
+		// Closing the channel on the panic path is best-effort: a provider
+		// that panicked before its own `defer close(ch)` ran leaves the
+		// channel open (the runner's range would block), so we close it; a
+		// provider that panicked after closing (e.g. in a later defer) is
+		// already closed, and a double close is swallowed by the nested
+		// recover.
+		var closeOnce sync.Once
+		closeCh := func() { closeOnce.Do(func() { close(ch) }) }
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					func() {
+						defer func() { _ = recover() }()
+						closeCh()
+					}()
+					// The runner may already have returned and closed `out`;
+					// a send to a closed channel panics, so swallow that
+					// here rather than crash the process.
+					defer func() { _ = recover() }()
+					emit(Event{Kind: EvError, Err: fmt.Errorf("provider stream panicked: %v", rec)})
+				}
+			}()
+			r.cfg.Provider.Stream(streamCtx, req, ch)
+		}()
 
 		var (
 			textBuf    strings.Builder
@@ -737,7 +764,15 @@ func (r *Runner) execTools(ctx context.Context, calls []provider.ToolCall, emit 
 		for _, i := range serialIdx {
 			t, ok := r.cfg.Tools.Get(calls[i].Name)
 			if ok && !t.ReadOnly() {
-				_, _ = r.cfg.Snapshotter.Snapshot(calls[i].Name)
+				if _, snapErr := r.cfg.Snapshotter.Snapshot(calls[i].Name); snapErr != nil {
+					// A failed snapshot silently breaks the undo promise
+					// (the user's file state was not captured), so surface
+					// one warning instead of letting the agent keep mutating
+					// as if nothing happened.
+					emit(Event{Kind: EvAgentMessage,
+						Text: "warning: file snapshot failed before " + calls[i].Name +
+							" — undo may be unavailable: " + snapErr.Error()})
+				}
 				break
 			}
 		}
@@ -1169,7 +1204,7 @@ func countJSONValues(value any, encoding tokens.Encoding) int {
 func countMessages(messages []provider.Message, encoding tokens.Encoding) int {
 	total := 0
 	for _, message := range messages {
-		total += countJSONValues(message, encoding)
+		total += countTokens(string(tokens.Marshal(message)), encoding) + 4
 	}
 	return total
 }
@@ -1432,6 +1467,7 @@ func capToolOutputStatic(call provider.ToolCall, output string, isError bool, ma
 	compressed := compress.ForTool(compress.Input{
 		Text:     output,
 		Command:  compressionCommand(call),
+		Tool:     call.Name,
 		MaxBytes: maxBytes,
 		IsError:  isError,
 	})
@@ -1661,6 +1697,13 @@ func describe(call provider.ToolCall, cwd string) permission.Request {
 	case "websearch":
 		req.Title = "web search: " + str("query")
 		req.Body = str("query")
+	case "vision":
+		req.Path = str("path")
+		req.Title = "vision " + req.Path
+		req.Body = req.Path
+		if f := str("focus"); f != "" {
+			req.Body += "\nfocus: " + oneLine(f)
+		}
 	default:
 		req.Title = call.Name
 		req.Body = string(call.Input)

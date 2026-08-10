@@ -21,6 +21,8 @@ var slashCommands = []slashCmd{
 	{"/sessions", "browse, resume, fork, rename sessions"},
 	{"/auth", "connect a provider (api key / oauth / custom endpoint)"},
 	{"/webproviders", "configure web-search providers and routing"},
+	{"/visionds", "toggle the vision bridge for text-only models"},
+	{"/visionapi", "set/clear the free Google AI Studio vision key"},
 	{"/model", "switch directly to a model"},
 	{"/models", "switch model"},
 	{"/update", "update Rick to the latest GitHub release"},
@@ -29,6 +31,7 @@ var slashCommands = []slashCmd{
 	{"/config", "settings: theme, model, agent, details"},
 	{"/agent", "toggle build / plan mode"},
 	{"/goal", "set a goal and work until done"},
+	{"/loop <dur>", "loop: work at least <dur>, retrying errors"},
 	{"/compact", "summarise and shrink the context"},
 	{"/undo", "revert the last file changes"},
 	{"/redo", "reapply reverted changes"},
@@ -425,6 +428,12 @@ func (m *Model) expandFileRefs(text string) (string, []string) {
 		}
 		data, err := os.ReadFile(p)
 		if err != nil {
+			continue
+		}
+		// When the vision bridge is on, don't inline image files as text
+		// (that would embed binary garbage). Leave the @token in the prompt
+		// so imagePathsInPrompt can route it through the vision model.
+		if isImageFile(p) && m.visionEnabled() {
 			continue
 		}
 		if len(data) > 64<<10 {

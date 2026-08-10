@@ -10,11 +10,14 @@ import (
 )
 
 // Input is the lossless output plus a provider-facing byte budget. Command is
-// the tool name or shell command that produced the output.
+// the tool name or shell command that produced the output; Tool is the tool
+// name when known (so dedicated git/grep/list tools route to the same
+// command-aware compactors as their bash equivalents).
 type Input struct {
 	Text     string
 	Query    string
 	Command  string
+	Tool     string
 	MaxBytes int
 	IsError  bool
 }
@@ -41,6 +44,16 @@ var (
 // use the generic normalizer and cap rather than applying a risky heuristic.
 func ForTool(input Input) Result {
 	command := strings.ToLower(strings.TrimSpace(input.Command))
+	// The dedicated tools are routed by name so their output gets the same
+	// command-aware compaction as the equivalent bash command.
+	switch strings.ToLower(strings.TrimSpace(input.Tool)) {
+	case "git":
+		return finish(input, compactGit(input.Text), "git")
+	case "grep", "glob", "list", "tree", "find":
+		return finish(input, compactSearch(input.Text), "search")
+	case "test", "diagnostics", "go":
+		return finish(input, compactGoDiagnostics(input.Text, input.IsError), "go-diagnostics")
+	}
 	switch {
 	case isGitCommand(command):
 		return finish(input, compactGit(input.Text), "git")

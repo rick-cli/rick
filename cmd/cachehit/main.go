@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -256,6 +257,18 @@ func runTurn(ctx context.Context, runner *agent.Runner, history []provider.Messa
 	return used, appended, runErr
 }
 
+// runTurnSafe wraps runTurn so a panic in the runner (which would skip
+// Run's `defer close(out)` and leave the drain goroutine blocked forever)
+// surfaces as an error instead of deadlocking the benchmark.
+func runTurnSafe(ctx context.Context, runner *agent.Runner, history []provider.Message) (u unit, appended []provider.Message, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("cachehit: runner panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return runTurn(ctx, runner, history)
+}
+
 // rawTranscript is the original benchmark's append-only user-only transcript:
 // never echoes the model reply, only grows by the user turn + payload each
 // request. This is the shape whose numbers are comparable to any pre-runner
@@ -306,6 +319,19 @@ func runRawTurn(ctx context.Context, p provider.Provider, model, system, session
 	return used, streamErr
 }
 
+// runRawTurnSafe wraps runRawTurn so a panic in the provider stream (which
+// would skip Stream's `defer close(ch)` and leave the drain goroutine blocked
+// forever) surfaces as an error instead of deadlocking the benchmark.
+func runRawTurnSafe(ctx context.Context, p provider.Provider, model, system, sessionID string,
+	messages []provider.Message, maxTokens int) (u unit, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("cachehit: provider stream panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return runRawTurn(ctx, p, model, system, sessionID, messages, maxTokens)
+}
+
 // runRawPass runs the exact pre-Runner harness: one warm at session start,
 // then one append-only user transcript per turn with no assistant echo.
 func runRawPass(ctx context.Context, p provider.Provider, model, system, sessionID string,
@@ -328,7 +354,7 @@ func runRawPass(ctx context.Context, p provider.Provider, model, system, session
 		if payloadKB > 0 {
 			tr.messages = append(tr.messages, provider.UserText(payload(i, payloadKB)))
 		}
-		used, err := runRawTurn(ctx, p, model, system, sessionID, tr.messages, 512)
+		used, err := runRawTurnSafe(ctx, p, model, system, sessionID, tr.messages, 512)
 		if err != nil {
 			return results, fmt.Errorf("turn %d: %w", i+1, err)
 		}
@@ -368,7 +394,7 @@ func runPass(ctx context.Context, runner *agent.Runner, turns, payloadKB int) ([
 		if payloadKB > 0 {
 			history = append(history, provider.UserText(payload(i, payloadKB)))
 		}
-		used, appended, err := runTurn(ctx, runner, history)
+		used, appended, err := runTurnSafe(ctx, runner, history)
 		if err != nil {
 			return results, fmt.Errorf("turn %d: %w", i+1, err)
 		}

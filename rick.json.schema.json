@@ -571,6 +571,29 @@
           }
         }
       }
+    },
+    "vision": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Vision bridge: gives a text-only model (DeepSeek) sight by routing image attachments through a vision-capable model and feeding back structured text evidence.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "When true, image attachments are sent to the vision model and replaced with text evidence for the text-only model."
+        },
+        "api_key": {
+          "type": "string",
+          "description": "Free Google AI Studio key (https://aistudio.google.com). Set with /visionapi."
+        },
+        "model": {
+          "type": "string",
+          "description": "Vision model id. Defaults to gemini-3.5-flash-lite (free tier)."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "Gemini API root. Defaults to https://generativelanguage.googleapis.com"
+        }
+      }
     }
   }
 }

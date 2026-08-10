@@ -190,6 +190,27 @@ type WebSearchConfig struct {
 	Providers       map[string]WebSearchProviderConfig `json:"providers,omitempty"`
 }
 
+// VisionConfig configures the vision bridge that gives text-only models
+// (DeepSeek) sight. When Enabled, image attachments are sent to a
+// vision-capable model via the Gemini generateContent API and the returned
+// structured text evidence is fed to the text-only model in place of the raw
+// image bytes.
+type VisionConfig struct {
+	// Enabled turns the bridge on. A pointer distinguishes "not set"
+	// (inherit) from an explicit off, so a project block that only sets a
+	// model keeps the global enabled state. Off leaves image attachments
+	// untouched, so native-vision models keep receiving raw images.
+	Enabled *bool `json:"enabled,omitempty"`
+	// APIKey is the Google AI Studio key (free tier works). Stored in the
+	// global rick.json; prefer /visionapi for setting it.
+	APIKey string `json:"api_key,omitempty"`
+	// Model is the vision model id. Defaults to the free "gemini-3.5-flash-lite".
+	Model string `json:"model,omitempty"`
+	// BaseURL overrides the Gemini API root; defaults to
+	// https://generativelanguage.googleapis.com
+	BaseURL string `json:"base_url,omitempty"`
+}
+
 // ContextBudgetConfig exposes the session context manager knobs
 // (content-addressed dedup, cache boundaries, live-zone compression) as
 // rick.json settings. Zero values keep the built-in defaults.
@@ -274,6 +295,10 @@ type Config struct {
 	MaxBackground    int              `json:"max_background,omitempty"`
 	Plugins          []string         `json:"plugin,omitempty"`
 	WebSearch        *WebSearchConfig `json:"web_search,omitempty"`
+	// Vision bridges images to a vision-capable model so text-only models
+	// (DeepSeek) can "see". Enabled, the TUI replaces image attachments with
+	// the vision engine's structured text evidence before the agent turn.
+	Vision *VisionConfig `json:"vision,omitempty"`
 	// CacheRetention is the prompt-cache retention policy for all requests:
 	// "" (default/short), "long" (extended TTL), or "none" (caching off).
 	CacheRetention string `json:"cache_retention,omitempty"`

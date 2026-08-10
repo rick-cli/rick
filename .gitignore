@@ -26,3 +26,11 @@ tmp/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local planning/research notes (not part of the shipped repo)
+docs/
+CPU_OPTIMIZATION_PLAN.md
+RAM_OPTIMIZATION_PROMPT.md
+changelog__2.md
+discordannoun.md
+researchresult.md

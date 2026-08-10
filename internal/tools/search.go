@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -315,6 +316,7 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 	}
 
 	var paths []string
+	var scanErr error
 	if ripgrepPath != "" {
 		runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
@@ -323,7 +325,18 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		cmd.Dir = tc.Cwd
 		out := boundedBuffer{limit: defaultSearchOutputLimit}
 		cmd.Stdout = &out
-		_ = cmd.Run()
+		if err := cmd.Run(); err != nil {
+			// rg --files exits 1 for the normal "no matches" case, which is
+			// not an error. Any other exit code (permission denied on a
+			// subtree, unreadable path, missing binary) is a genuine failure
+			// that must be surfaced instead of reported as an empty match.
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+				// no matches — fine
+			} else {
+				scanErr = fmt.Errorf("glob: rg failed: %w", err)
+			}
+		}
 		sc := bufio.NewScanner(strings.NewReader(out.String()))
 		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
 		for sc.Scan() {
@@ -333,6 +346,9 @@ func (t GlobTool) Run(ctx context.Context, tc Context, in json.RawMessage) (Resu
 		}
 	} else {
 		paths = walkGlob(searchPath, a.Pattern, limit*4)
+	}
+	if scanErr != nil {
+		return Errf("%v", scanErr), nil
 	}
 
 	entries := make([]string, 0, len(paths))

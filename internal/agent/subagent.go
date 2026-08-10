@@ -191,7 +191,7 @@ func (t TaskTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage)
 		title = a.SubagentType + " subagent"
 	}
 	return tools.Result{
-		Output: out,
+		Output: capSubagentReport(out),
 		Title:  fmt.Sprintf("%s (%s)", title, a.SubagentType),
 		Meta:   map[string]any{"subagent": a.SubagentType, "description": a.Description},
 	}, nil

@@ -139,7 +139,7 @@ func (t SwarmTool) Run(ctx context.Context, tc tools.Context, in json.RawMessage
 		if err != nil {
 			return tools.Errf("swarm spawn failed: %v", err), nil
 		}
-		return tools.Result{Output: result, Title: "agent team completed"}, nil
+		return tools.Result{Output: capSubagentReport(result), Title: "agent team completed"}, nil
 
 	default:
 		return tools.Errf("unknown action %q (use: spawn)", a.Action), nil

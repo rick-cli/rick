@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.1.15 — 2026-08-10
+
+### Vision for text-only models
+
+- **Text-only models (DeepSeek, etc.) can now see images.** New `/visionds`
+  command toggles the vision bridge: when ON, image attachments are read by
+  Google's free `gemini-3.5-flash-lite` and the extracted evidence (OCR,
+  layout, chart semantics) is handed to the text model. `/visionapi <key>`
+  sets/clears the free Google AI Studio key — no paid tier required.
+- New `vision` tool lets the model itself inspect screenshots, diagrams, and
+  charts from within a session.
+
+### Performance (prompt-cache & session)
+
+- **Keep-alive session prune is no longer dead code.** The prune branch could
+  never execute (any idle > 24 h matched the interval branch first), so the
+  keep-alive map grew unbounded and every abandoned session cost one API call
+  per interval. Sessions are now pruned after 24 h, capped at 256 (oldest
+  idle first, in-flight never dropped), and cold keep-alives are counted.
+- **Session search is now RAM O(1).** A small sidecar file replaces loading
+  every full session JSON (was hundreds of MB transient).
+- **Per-message token counts are memoized** (bounded FIFO): the same stable
+  prefix is no longer BPE-counted three times per turn, only once per new
+  message (byte-identical output).
+
+### Read-tool token savings
+
+- **Partial-view ledger** — `write` now refuses to overwrite lines the model
+  never read (`only lines N-M of T were read`), preventing wrong whole-file
+  overwrites and the re-write/undo loop that followed (~12–24k tokens per
+  occurrence).
+- **Unchanged re-reads return a stub** that consumes its own memo entry —
+  the "sticky cache" failure mode is self-healing. ~3% of reads are unchanged
+  re-reads: ≈54k tokens saved per 300-read session (~2–5% of read tokens).
+- **Filename repair** — Unicode NFC normalization + bounded Levenshtein(2)
+  catch macOS NFD filenames and near-miss names (`AGENT.md` → `AGENTS.md`)
+  that previously burned whole turns on invisible misses (~24k
+  tokens/session).
+- **Notebook rendering** — `.ipynb` reads are tagged cell-by-cell, base64
+  image blobs never reach context, and cell outputs over 10k chars become
+  pointers: 90–99% token reduction on image-heavy notebook reads.
+
+### Read-tool hardening pass
+
+- **Clamped reads are never recorded as "full".** A read of a file whose only
+  line is a 100 KB minified bundle previously counted as fully read (all line
+  numbers delivered, 2000 chars shown), so `write` could silently destroy the
+  file. The ledger now records the clamp and refuses the overwrite.
+- **Clamp recovery notes** — reads that clamp a line now name it and tell the
+  model to `grep` instead of re-reading (a re-read clamps again and loops).
+- **Ledger size gate** — reads/writes now require mtime **and** size to
+  match, catching same-mtime external edits (sync tools, coarse timestamps).
+
+### Tool-output audit (471 sessions profiled)
+
+- **`edit` no longer echoes a 24 KB unified diff** — compact summary with
+  change stats + 2 KB snippet; full content still in Meta. ~80% smaller
+  (~5.8% of all tool-result bytes).
+- **Dedicated tools route to command-aware compressors** (`git`, `grep`,
+  `glob`, `list`, `tree`, `test`, `diagnostics`): consecutive-duplicate
+  collapse saves ~5–15% of those tools' bytes.
+- **Subagent reports capped at 8 KB** (head+tail trim + omission marker):
+  ~40% off `parallel_tasks` bytes.
+- **websearch snippets capped at 300 chars**: ~25% off websearch bytes.
+
+### Bug fixes & reliability
+
+- **glob fast path swallowed ripgrep failures** — permission/IO errors
+  surface instead of "no matches".
+- **Headless runner panic hung forever** — the runner goroutine now recovers,
+  records the panic + stack, and always closes the channel.
+- **Provider stream panic crashed the process / deadlocked callers** — the
+  stream goroutine recovers, closes the event channel exactly once
+  (`sync.Once`), and surfaces an error instead of hanging.
+- **Snapshot failures were silent** — a failed shadow-git snapshot now emits
+  a warning so the user knows undo may be unavailable.
+- **Deleted 399 MB of stale deploy backups** from the repo root.
+
 ## v0.1.14 — 2026-08-09
 
 #### Model list

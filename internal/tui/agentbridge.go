@@ -176,6 +176,10 @@ func (m *Model) drainAgent(runID uint64) (tea.Model, tea.Cmd) {
 			processed = true
 			if !ok {
 				if m.agentCh != nil {
+					if m.loop != nil {
+						cmd, _ := m.loopRetry(fmt.Errorf("agent event stream ended unexpectedly"))
+						return m, cmd
+					}
 					return m, m.finishRun(fmt.Errorf("agent event stream ended unexpectedly"))
 				}
 				return m, nil
@@ -209,6 +213,9 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 	case agent.EvToolStart:
 		m.flushStream()
 		if ev.Tool != nil {
+			if m.loop != nil {
+				m.loop.tools++
+			}
 			if ev.Tool.CallID != "" {
 				if _, pending := m.pendingTools[ev.Tool.CallID]; pending {
 					return nil, false
@@ -324,11 +331,17 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 		if ev.Err != nil {
 			m.msgs = append(m.msgs, ChatMsg{Kind: MsgError, Text: ev.Err.Error(), Time: time.Now()})
 		}
+		if m.loop != nil {
+			return m.loopRetry(ev.Err)
+		}
 		return m.finishRun(ev.Err), true
 
 	case agent.EvDone:
 		m.flushStream()
 		m.flushTurnBoundary()
+		if m.loop != nil {
+			return m.loopAdvance()
+		}
 		return m.finishRun(nil), true
 	}
 	return nil, false
@@ -472,6 +485,11 @@ func (m *Model) flushStream() {
 func (m *Model) finishRun(err error) tea.Cmd {
 	m.flushStream()
 	m.flushTurnBoundary()
+	// A loop goal ending outside its own handlers (user interrupt, unexpected
+	// stream end) stops the loop and records the goal as aborted.
+	if m.loop != nil {
+		m.abortLoop()
+	}
 	m.running = false
 	if !m.turnStart.IsZero() {
 		m.turnElapsed = time.Since(m.turnStart)
@@ -754,6 +772,13 @@ func (m *Model) interrupt() {
 	m.cancelCompaction()
 	if m.permReply != nil {
 		m.answerPermission(agent.DecideReject)
+	}
+	// Cancel an in-flight vision bridge call; its completion will be dropped
+	// by the runID guard in the update loop.
+	if m.visionCancel != nil {
+		m.visionCancel()
+		m.visionCancel = nil
+		m.visionPending = false
 	}
 	if m.agentCh != nil {
 		// Invalidate already-scheduled drain ticks before cancelling the runner.

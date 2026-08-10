@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"rick/internal/config"
 )
@@ -777,8 +778,9 @@ func formatResultsFiltered(query string, results []searchResult, original int, c
 	for i, r := range results {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, r.Title)
 		fmt.Fprintf(&b, "   %s\n", r.URL)
-		if r.Snippet != "" && !strings.EqualFold(strings.TrimSpace(r.Title), strings.TrimSpace(r.Snippet)) {
-			fmt.Fprintf(&b, "   %s\n", r.Snippet)
+		snippet := r.Snippet
+		if snippet != "" && !strings.EqualFold(strings.TrimSpace(r.Title), strings.TrimSpace(snippet)) {
+			fmt.Fprintf(&b, "   %s\n", capSnippet(snippet))
 		}
 		b.WriteString("\n")
 	}
@@ -793,6 +795,17 @@ func formatResultsFiltered(query string, results []searchResult, original int, c
 		Title:  fmt.Sprintf("web search (%d results)", len(results)),
 		Meta:   map[string]any{"query": query, "results": len(results)},
 	}
+}
+
+// capSnippet bounds a search snippet so one long provider blurb cannot eat
+// the read budget; the URL and title already identify the result.
+func capSnippet(s string) string {
+	const maxSnippetRunes = 300
+	if utf8.RuneCountInString(s) <= maxSnippetRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxSnippetRunes]) + " …"
 }
 
 // --- provider implementations ---

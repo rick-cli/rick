@@ -39,7 +39,7 @@ import (
 	"rick/pkg/contextbudget"
 )
 
-var Version = "0.1.14"
+var Version = "0.1.15"
 
 func main() {
 	var (
@@ -326,6 +326,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	reg.Register(tools.MemoryTool{})
 	reg.Register(tools.WebSearchTool{Restrictions: loaded.Config.WebSearch})
 	reg.Register(tools.RetrieveUncompressedTool{Store: ctxBudget})
+	reg.Register(tools.VisionTool{Loaded: loaded})
 
 	goals, _ := goal.NewStore(filepath.Join(config.DataDir(), "goals"))
 	if goals != nil {

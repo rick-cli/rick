@@ -297,6 +297,18 @@ type Model struct {
 
 	// agentRunID prevents stale drain ticks from consuming a later run's events.
 	agentRunID uint64
+
+	// visionRunID tracks the active vision bridge run so stale completions
+	// (from an interrupted run) are dropped.
+	visionRunID uint64
+	// visionPending is true while image attachments are being sent to the
+	// vision model before the agent turn starts.
+	visionPending bool
+	// visionCancel cancels the in-flight vision bridge HTTP call.
+	visionCancel context.CancelFunc
+
+	// loop tracks an active /loop goal run; nil when not looping.
+	loop *loopState
 }
 
 // toolRowEntry records the content-row span of one rendered tool block.
@@ -313,6 +325,12 @@ func (m *Model) SetProgram(p *tea.Program) { m.program = p }
 type spinnerTickMsg time.Time
 type themePollMsg time.Time
 type readAgentMsg struct{ runID uint64 }
+type visionDoneMsg struct {
+	runID  uint64
+	images int
+	err    error
+	msg    provider.Message
+}
 type statusMsg struct {
 	text string
 	quit bool
@@ -735,6 +753,23 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case readAgentMsg:
 		return m.drainAgent(msg.runID)
+
+	case visionDoneMsg:
+		if !m.visionPending || msg.runID != m.visionRunID {
+			return m, nil
+		}
+		m.visionPending = false
+		if msg.err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "vision: " + msg.err.Error(), Time: time.Now()})
+			m.setStatus("vision failed")
+			return m, nil
+		}
+		plural := "image"
+		if msg.images != 1 {
+			plural = "images"
+		}
+		m.setStatus(fmt.Sprintf("read %d %s via vision model", msg.images, plural))
+		return m, m.startAgentWithMessage(msg.msg)
 
 	case permAskMsg:
 		m.permReq = msg.req

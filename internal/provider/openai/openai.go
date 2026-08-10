@@ -44,6 +44,10 @@ type Client struct {
 	kaStop     chan struct{}
 	kaOnce     sync.Once
 	kaInterval time.Duration
+	// kaColdKeepalives counts keep-alive POSTs whose response reported zero
+	// cache-read tokens — evidence the provider evicted the prefix despite
+	// the loop, surfaced so the effective keep-alive interval can be tuned.
+	kaColdKeepalives int64
 }
 
 // kaSession remembers the last stream-shaped wire body per session so the
@@ -198,9 +202,21 @@ func (c *Client) keepaliveLoop() {
 	}
 }
 
+// kaPruneIdle is how long a session can sit untouched before the keep-alive
+// map drops it. Independent of kaInterval so long-dead sessions are removed
+// even when the interval is much shorter (the old else-if could never run
+// because every idle > 24h had already matched the interval branch).
+const kaPruneIdle = 24 * time.Hour
+
+// kaMaxSessions bounds the keep-alive map so a process that churns through
+// many one-shot sessions cannot accumulate an unbounded number of tracked
+// entries (each costing one keep-alive POST per interval until pruned).
+const kaMaxSessions = 256
+
 // keepaliveTick re-sends stale session bodies. Only sessions idle past the
 // interval with no stream in flight are touched, so an active turn never
-// races a keep-alive. Sessions idle over a day are pruned.
+// races a keep-alive. Sessions idle over a day are pruned regardless of the
+// interval, and the map is size-capped so abandoned sessions cannot pile up.
 func (c *Client) keepaliveTick() {
 	c.kaMu.Lock()
 	now := time.Now()
@@ -208,16 +224,45 @@ func (c *Client) keepaliveTick() {
 		sessionID string
 		s         *kaSession
 	}
+
+	// Pass 1: prune long-dead sessions. This must run independent of the
+	// interval branch so a session idle > 24h is dropped even when the
+	// interval is far shorter (the old else-if could never execute).
+	for sid, s := range c.kaSessions {
+		if idle := now.Sub(s.last); idle > kaPruneIdle {
+			delete(c.kaSessions, sid)
+		}
+	}
+
+	// Pass 2: size cap. Evict the oldest idle sessions beyond the bound so
+	// abandoned sessions cannot pile up. In-flight sessions are never
+	// dropped from under a live stream.
+	if over := len(c.kaSessions) - kaMaxSessions; over > 0 {
+		type age struct {
+			sid string
+			s   *kaSession
+		}
+		candidates := make([]age, 0, len(c.kaSessions))
+		for sid, s := range c.kaSessions {
+			if !s.inFlight {
+				candidates = append(candidates, age{sid, s})
+			}
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].s.last.Before(candidates[j].s.last)
+		})
+		for i := 0; i < len(candidates) && over > 0; i++ {
+			delete(c.kaSessions, candidates[i].sid)
+			over--
+		}
+	}
+
+	// Pass 3: select stale sessions to keep alive.
 	var toSend []due
 	for sid, s := range c.kaSessions {
-		if idle := now.Sub(s.last); idle > c.kaInterval {
-			if !s.inFlight {
-				s.inFlight = true // held until the POST below completes
-				toSend = append(toSend, due{sid, s})
-			}
-		} else if idle > 24*time.Hour {
-			// Prune long-dead sessions so the map cannot grow unbounded.
-			delete(c.kaSessions, sid)
+		if idle := now.Sub(s.last); idle > c.kaInterval && !s.inFlight {
+			s.inFlight = true // held until the POST below completes
+			toSend = append(toSend, due{sid, s})
 		}
 	}
 	c.kaMu.Unlock()
@@ -230,7 +275,10 @@ func (c *Client) keepaliveTick() {
 // stream-shaped request: same messages/tools/model, tiny output budget, so it
 // rides (and refreshes) the exact prompt-cache entry the next real stream
 // will extend. Success bumps the session's last-activity time; any failure
-// clears in-flight so the next tick retries.
+// clears in-flight so the next tick retries. If the response reports zero
+// cache-read tokens the prefix was evicted despite the loop; the event is
+// counted (kaColdKeepalives) so a chronically cold keep-alive is measurable
+// instead of silently burning requests.
 func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
 	body := s.body
 	body.Stream = true
@@ -253,9 +301,52 @@ func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
 		c.finishKeepaliveFor(sessionID, s)
 		return
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+	// Read the usage fields the stream would surface: cache_read == 0 on a
+	// keep-alive means the prefix is gone, so the next real turn pays full
+	// price — exactly the miss this loop exists to prevent.
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	resp.Body.Close()
+	if usage := parseUsageFields(bodyBytes); usage != nil && usage.CacheReadTokens == 0 {
+		c.kaMu.Lock()
+		c.kaColdKeepalives++
+		c.kaMu.Unlock()
+	}
 	c.finishKeepaliveFor(sessionID, s)
+}
+
+// parseUsageFields extracts the cache/input token fields from a raw
+// chat-completions JSON payload (non-stream or the final stream chunk). Nil
+// is returned when the payload carries no usage object.
+func parseUsageFields(raw []byte) *provider.Usage {
+	var payload struct {
+		Usage *struct {
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
+			} `json:"prompt_tokens_details"`
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil || payload.Usage == nil {
+		return nil
+	}
+	cacheRead := payload.Usage.PromptTokensDetails.CachedTokens
+	if cacheRead == 0 {
+		cacheRead = payload.Usage.PromptCacheHitTokens
+	}
+	cacheWrite := payload.Usage.PromptTokensDetails.CacheWriteTokens
+	input := payload.Usage.PromptTokens - cacheRead - cacheWrite
+	if input < 0 {
+		input = 0
+	}
+	return &provider.Usage{
+		InputTokens:      input,
+		OutputTokens:     payload.Usage.CompletionTokens,
+		CacheReadTokens:  cacheRead,
+		CacheWriteTokens: cacheWrite,
+	}
 }
 
 func defaultModels(id string) []provider.ModelInfo {
