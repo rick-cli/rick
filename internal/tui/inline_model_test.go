@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -76,18 +77,24 @@ func TestPromptHistoryUsesArrowKeys(t *testing.T) {
 	m.histIdx = -1
 	m.input.SetValue("current draft")
 
+	// Deliberate arrow presses are spaced well beyond the wheel-pair window
+	// (a human takes 300ms+ between presses); the wheel detector must not
+	// eat them. Pressing twice instantly would be a wheel pair by design.
 	m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
 	if got := m.input.Value(); got != "second prompt" {
 		t.Fatalf("first Up returned %q, want latest prompt", got)
 	}
+	time.Sleep(400 * time.Millisecond)
 	m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
 	if got := m.input.Value(); got != "first prompt" {
 		t.Fatalf("second Up returned %q, want oldest prompt", got)
 	}
+	time.Sleep(400 * time.Millisecond)
 	m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.input.Value(); got != "second prompt" {
 		t.Fatalf("Down returned %q, want newer prompt", got)
 	}
+	time.Sleep(400 * time.Millisecond)
 	m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.input.Value(); got != "current draft" {
 		t.Fatalf("final Down returned %q, want saved draft", got)
@@ -131,6 +138,139 @@ func TestMouseWheelOverPromptScrollsChatNotActivity(t *testing.T) {
 	}
 }
 
+func TestWheelOverInputHistoryOnlyScrollsChat(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{Loaded: &config.Loaded{TUI: config.TUI{ScrollSpeed: 1}}}
+	m.viewport.SetContent(strings.Repeat("chat line\n", 80))
+	// Seed history exactly like a real session would.
+	m.inputHist = []string{"first prompt", "second prompt"}
+	m.histIdx = -1
+	m.input = textarea.New()
+	m.input.SetValue("current draft")
+
+	// Simulate the exact burst sequence Windows Terminal sends when the
+	// scroll wheel is used over the prompt: three rapid same-direction
+	// up/down key events. These must scroll the chat and must NOT touch the
+	// prompt history or the saved draft.
+	m.isWheelKey(1) // prime the detector
+	before := m.viewport.YOffset
+	m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if got := m.input.Value(); got != "current draft" {
+		t.Fatalf("wheel over prompt changed input to %q, want unchanged draft", got)
+	}
+	if m.viewport.YOffset <= before {
+		t.Fatalf("wheel over prompt did not scroll chat: offset %d -> %d", before, m.viewport.YOffset)
+	}
+	if m.activityFocused {
+		t.Fatal("wheel over prompt focused the activity panel")
+	}
+}
+
+// TestWheelBurstRestoresDraftWithoutPriming is the real-world regression:
+// Windows Terminal delivers a wheel as up/down key events with no priming, so
+// the first event is indistinguishable from an arrow key and may browse
+// history. Once the burst is confirmed the draft must be restored and the
+// chat must scroll — the input must never be left on an old prompt.
+func TestWheelBurstRestoresDraftWithoutPriming(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{Loaded: &config.Loaded{TUI: config.TUI{ScrollSpeed: 1}}}
+	m.input = textarea.New()
+	m.ready = false
+	for i := 0; i < 60; i++ {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "chat line " + strings.Repeat("x", i%20), Time: nowFn()})
+	}
+	m.handleResize(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m.viewport.GotoBottom()
+	start := m.viewport.YOffset
+	m.inputHist = []string{"first prompt", "second prompt"}
+	m.histIdx = -1
+	m.input.SetValue("current draft")
+	m.histDraft = "current draft"
+
+	// No priming: six rapid Up events (30ms apart), exactly what the terminal
+	// sends for a wheel-up over the prompt.
+	for i := 0; i < 6; i++ {
+		m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+		time.Sleep(30 * time.Millisecond)
+	}
+	if got := m.input.Value(); got != "current draft" {
+		t.Fatalf("wheel-up left input on %q, want draft restored", got)
+	}
+	if m.histIdx != -1 {
+		t.Fatalf("wheel-up left history index at %d", m.histIdx)
+	}
+	if m.viewport.YOffset >= start {
+		t.Fatalf("wheel-up did not scroll up: offset %d (start %d)", m.viewport.YOffset, start)
+	}
+}
+
+// TestMediumWheelScrollsNotHistory covers a wheel at ~4 notches/sec (250ms
+// spacing), which the old 3-event burst rule missed entirely — every event
+// fell through to history. A same-direction pair must confirm the wheel.
+func TestMediumWheelScrollsNotHistory(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{Loaded: &config.Loaded{TUI: config.TUI{ScrollSpeed: 1}}}
+	m.input = textarea.New()
+	m.ready = false
+	for i := 0; i < 60; i++ {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "chat line " + strings.Repeat("x", i%20), Time: nowFn()})
+	}
+	m.handleResize(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m.viewport.GotoBottom()
+	start := m.viewport.YOffset
+	m.inputHist = []string{"first prompt", "second prompt"}
+	m.histIdx = -1
+	m.input.SetValue("draft")
+	m.histDraft = "draft"
+
+	for i := 0; i < 4; i++ {
+		m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+		time.Sleep(250 * time.Millisecond)
+	}
+	if got := m.input.Value(); got != "draft" {
+		t.Fatalf("medium wheel-up corrupted input to %q", got)
+	}
+	if m.viewport.YOffset >= start {
+		t.Fatalf("medium wheel-up did not scroll up: offset %d (start %d)", m.viewport.YOffset, start)
+	}
+}
+
+func TestWheelBurstOverActivityMovesCursorNotChat(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{Loaded: &config.Loaded{TUI: config.TUI{ScrollSpeed: 1}}}
+	m.viewport.SetContent(strings.Repeat("chat line\n", 80))
+	m.teamViews = map[string]*SwarmView{
+		"swarm": {
+			SwarmID:  "swarm",
+			Name:     "team",
+			Active:   true,
+			AgentOrd: []string{"agent"},
+			Agents: map[string]*AgentView{
+				"agent": {Name: "agent", Status: swarm.StatusWorking},
+			},
+		},
+	}
+	_, panelBottom := m.activityPanelBounds()
+	if panelBottom <= 0 {
+		t.Fatal("activity panel has no bounds")
+	}
+	m.activityFocused = false
+	m.activityCursor = 0
+	before := m.viewport.YOffset
+
+	// Prime the burst detector, then burst at the panel's own row.
+	m.isWheelKey(-1)
+	m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	if !m.activityFocused {
+		t.Fatal("wheel burst over activity panel did not focus the panel")
+	}
+	if m.viewport.YOffset != before {
+		t.Fatalf("wheel over activity moved chat offset %d -> %d", before, m.viewport.YOffset)
+	}
+}
+
 func TestPromptHistoryTakesPriorityOverActivityFocus(t *testing.T) {
 	m := newModelChoiceTestModel()
 	m.activityFocused = true
@@ -148,6 +288,10 @@ func TestMouseCaptureOffInChatViewForNativeSelection(t *testing.T) {
 	// Test models lack deps; give it a Loaded so wantsMouseCapture can read
 	// the mouse preference.
 	m.deps.Loaded = &config.Loaded{TUI: config.TUI{Mouse: false}}
+	// The plain chat view must NOT capture the mouse on any platform — the
+	// terminal owns drag selection and copy there. The scroll wheel still
+	// scrolls the chat via the same-direction key-burst path (isWheelKeyBurst)
+	// instead of arriving as a MouseMsg.
 	if m.wantsMouseCapture() {
 		t.Fatal("plain chat view must NOT capture the mouse — the terminal owns selection there")
 	}
@@ -198,7 +342,7 @@ func TestModelChoiceSupportsArrowsAndNumberedInput(t *testing.T) {
 		t.Fatalf("up moved cursor to %d, want 1", m.pending.cursor)
 	}
 
-	rendered := m.renderMsg(m.msgs[0], m.contentWidth())
+	rendered := m.renderPendingMenu(m.contentWidth())
 	for _, label := range []string{"second", "↑/↓ select", "← Back", "↵ Select", "esc/backspace back"} {
 		if !strings.Contains(rendered, label) {
 			t.Fatalf("interactive model choice is missing %q:\n%s", label, rendered)
@@ -375,6 +519,48 @@ func TestModelChoiceSelectButtonSelectsHighlightedModel(t *testing.T) {
 	})
 	if m.pending.kind != pendingNone || m.modelID != "test/second" {
 		t.Fatalf("select button state: pending=%d model=%q", m.pending.kind, m.modelID)
+	}
+}
+
+// TestChoiceMenuSticksToBottomWhileStreaming locks the pinned-menu behaviour:
+// once a menu is armed, streaming a long tail after it must not push the menu
+// out of the viewport. The menu is re-rendered as a pinned tail of its own,
+// so the final chat content ends with the menu's option block, and the choice
+// buttons map to the last rows of the rendered content.
+func TestChoiceMenuSticksToBottomWhileStreaming(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.viewport.YPosition = 0
+	m.viewport.Height = 20
+	m.armChoice("select a model · test", pendingModel, "test", []choiceOption{
+		{value: "first", label: "first"},
+		{value: "second", label: "second"},
+	})
+	// Stream a tail far taller than the viewport.
+	for i := 0; i < 30; i++ {
+		m.PushStreamChunk("streamed token line " + string(rune('a'+i%26)) + "\n")
+	}
+	lines := strings.Split(m.chatContent, "\n")
+	// The pinned menu occupies the bottom block: title, options, hint and
+	// buttons. Verify the last non-blank line is the button row and that the
+	// final option is one line above it, i.e. the whole menu sits at the tail.
+	lastRow := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			lastRow = i
+			break
+		}
+	}
+	if lastRow < 2 || !strings.Contains(lines[lastRow-2], "2 second") {
+		t.Fatalf("menu was pushed out of the transcript bottom; rows around tail: %q / %q / %q",
+			lines[lastRow-2], lines[lastRow-1], lines[lastRow])
+	}
+	if len(m.choiceButtons) != 2 {
+		t.Fatalf("want two choice buttons while menu pinned, got %+v", m.choiceButtons)
+	}
+	for _, b := range m.choiceButtons {
+		if b.y != lastRow {
+			t.Fatalf("choice button y=%d, want last transcript row %d", b.y, lastRow)
+		}
 	}
 }
 
@@ -628,13 +814,35 @@ func TestModelsForAppliesOpenCodeZenOverrideToCachedModels(t *testing.T) {
 			"opencode-zen": {
 				Models:         []string{"nemotron-3-ultra-free"},
 				ContextWindows: map[string]int{"nemotron-3-ultra-free": 128_000},
+				// A persisted source of api means the stored value came from the
+				// endpoint; the hardcoded gateway override must not replace it.
+				ContextSources: map[string]provider.ContextSource{
+					"nemotron-3-ultra-free": provider.ContextSourceAPI,
+				},
+			},
+		}},
+	}
+
+	models := m.modelsFor("opencode-zen")
+	if len(models) != 1 || models[0].ContextWindow != 128_000 {
+		t.Fatalf("API-reported cached context = %+v, want 128000 (override must not clobber API)", models)
+	}
+}
+
+// TestModelsForOpenCodeZenOverrideFillsMissingValue: with no stored value the
+// hardcoded gateway limit still fills in the gap.
+func TestModelsForOpenCodeZenOverrideFillsMissingValue(t *testing.T) {
+	m := &Model{
+		creds: &config.Credentials{Providers: map[string]config.Credential{
+			"opencode-zen": {
+				Models: []string{"nemotron-3-ultra-free"},
 			},
 		}},
 	}
 
 	models := m.modelsFor("opencode-zen")
 	if len(models) != 1 || models[0].ContextWindow != 1_000_000 {
-		t.Fatalf("cached OpenCode Zen model context = %+v, want 1000000", models)
+		t.Fatalf("OpenCode Zen model context = %+v, want 1000000", models)
 	}
 }
 

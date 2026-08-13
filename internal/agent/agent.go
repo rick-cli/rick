@@ -433,23 +433,29 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		// carries the exact bytes this stream will send, so the stream reads
 		// the prefix back from cache instead of re-billing it cold. Errors
 		// are surfaced once instead of swallowed.
-		if r.cfg.WarmCache {
-			if warmer, ok := r.cfg.Provider.(provider.CacheWarmber); ok {
-				warmNeeded := cacheEvicted || r.lastMutation == "head-trim" ||
+		//
+		// A head-trim rewrites the provider-facing prefix by definition (the
+		// trim sentinel replaces the dropped head), so the next request is a
+		// guaranteed cold re-bill unless the new prefix is primed first. That
+		// warm is mandatory even when general warming is disabled — it is the
+		// only way to avoid a re-bill the trim itself caused, and it costs
+		// one small request per trim (trims are rare, once per long session).
+		if warmer, ok := r.cfg.Provider.(provider.CacheWarmber); ok {
+			warmNeeded := strings.HasPrefix(r.lastMutation, "head-trim") ||
+				(r.cfg.WarmCache && (cacheEvicted ||
 					(turn == 0 && len(req.Messages) > 1) ||
-					(!r.lastRequest.IsZero() && time.Since(r.lastRequest) > r.cacheTTL())
-				if warmNeeded {
-					warmReq := req
-					if warmReq.CacheRetention == "" {
-						warmReq.CacheRetention = provider.CacheRetentionLong
-					}
-					if err := warmer.Warm(ctx, warmReq); err != nil {
-						r.warnWarmOnce(emit, err)
-					} else {
-						r.warmErrWarned = ""
-					}
-					r.lastRequest = time.Now()
+					(!r.lastRequest.IsZero() && time.Since(r.lastRequest) > r.cacheTTL())))
+			if warmNeeded {
+				warmReq := req
+				if warmReq.CacheRetention == "" {
+					warmReq.CacheRetention = provider.CacheRetentionLong
 				}
+				if err := warmer.Warm(ctx, warmReq); err != nil {
+					r.warnWarmOnce(emit, err)
+				} else {
+					r.warmErrWarned = ""
+				}
+				r.lastRequest = time.Now()
 			}
 		}
 		cacheEvicted = false
@@ -955,8 +961,34 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		CacheRetention:    r.cfg.CacheRetention,
 		MaxReasoningTurns: r.wireReasoningTurns(),
 		SessionID:         r.cfg.SessionID,
-		CacheScopeKey:     r.cfg.CacheScopeKey,
+		CacheScopeKey:     r.cacheScopeKey(),
 	}
+}
+
+// cacheScopeKey returns the prompt-cache routing scope for this run. An
+// explicitly configured CacheScopeKey (non-interactive runs) always wins.
+// Parallel agents (subagents, swarm workers) share the parent SessionID and
+// a byte-stable system head, so without a partition every concurrent agent
+// would pile onto one hot prompt_cache_key. OpenAI recommends keeping each
+// key near ~15 requests/minute — a swarm or /task burst of 4+ agents can
+// blow past that and force cold misses. Deriving the scope from session +
+// agent identity spreads concurrent agents across routing keys while each
+// agent stays stable across its own turns (same scope for every request of
+// that agent), so per-agent prefixes still hit.
+func (r *Runner) cacheScopeKey() string {
+	if r.cfg.CacheScopeKey != "" {
+		return r.cfg.CacheScopeKey
+	}
+	if r.cfg.Parallel && r.cfg.SessionID != "" {
+		identity := r.cfg.AgentID
+		if identity == "" {
+			identity = r.cfg.AgentName
+		}
+		if identity != "" {
+			return r.cfg.SessionID + "\x00agent:" + identity
+		}
+	}
+	return ""
 }
 
 // wireReasoningTurns is what the provider adapter sees. The one-shot cap
@@ -1829,7 +1861,10 @@ func (r *Runner) cacheTTL() time.Duration {
 	if r.cfg.Provider != nil {
 		name = r.cfg.Provider.Name()
 	}
-	return provider.DefaultCacheTTL(name, r.cfg.CacheRetention)
+	// Model-aware refinement: OpenAI GPT-5.6+ guarantees a 30-minute cache
+	// minimum, pre-5.6 in-memory evicts after 5-10 minutes. All other
+	// providers fall back to the vendor table.
+	return provider.CacheTTLForModel(name, r.cfg.Model, r.cfg.CacheRetention)
 }
 
 // warnWarmOnce surfaces a warm failure once per distinct error message per

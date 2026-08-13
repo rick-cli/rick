@@ -47,6 +47,64 @@ type Provider struct {
 	APIKey  string `json:"apiKey,omitempty"`
 	BaseURL string `json:"baseUrl,omitempty"`
 	Enabled *bool  `json:"enabled,omitempty"`
+	// RefreshToken is the OAuth refresh token for OAuth providers (ChatGPT /
+	// Codex); the access token in APIKey is short-lived and refreshed with it.
+	RefreshToken string `json:"refreshToken,omitempty"`
+	// TokenExpiresAt is the unix-epoch second when APIKey expires. Zero means
+	// the token does not expire.
+	TokenExpiresAt int64 `json:"tokenExpiresAt,omitempty"`
+	// AccountID is the ChatGPT account id for the Codex backend, sent as the
+	// ChatGPT-Account-ID header.
+	AccountID string `json:"accountId,omitempty"`
+	// CacheRetention overrides the global cache_retention for this provider
+	// ("" = inherit global). Per-provider prompt-cache tuning lets each
+	// backend run its optimal profile (DeepSeek day-long, OpenAI minutes,
+	// Anthropic 1h) without one global policy fighting another.
+	CacheRetention string `json:"cache_retention,omitempty"`
+	// CacheTTLSeconds overrides the global cache_ttl_seconds for this
+	// provider (0 = inherit global).
+	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
+	// CacheKeepaliveSeconds overrides the global cache_keepalive_seconds for
+	// this provider (0 = inherit global). A nil-pointer-free int cannot
+	// distinguish "inherit" from "explicitly 0", so 0 always inherits; use a
+	// tiny positive value to effectively disable the loop for one provider.
+	CacheKeepaliveSeconds int `json:"cache_keepalive_seconds,omitempty"`
+	// WarmCache overrides the global cache_warm for this provider (nil =
+	// inherit global).
+	WarmCache *bool `json:"cache_warm,omitempty"`
+}
+
+// CacheFor returns this provider's resolved prompt-cache policy, applying its
+// per-provider overrides on top of the global defaults. The returned values
+// are what the agent and client should use for this provider.
+func (p Provider) CacheFor(global Config) (retention string, ttlSeconds, keepaliveSeconds int, warm bool) {
+	retention = global.CacheRetention
+	ttlSeconds = global.CacheTTLSeconds
+	keepaliveSeconds = global.CacheKeepaliveSeconds
+	warm = global.WarmCache
+	if p.CacheRetention != "" {
+		retention = p.CacheRetention
+	}
+	if p.CacheTTLSeconds != 0 {
+		ttlSeconds = p.CacheTTLSeconds
+	}
+	if p.CacheKeepaliveSeconds != 0 {
+		keepaliveSeconds = p.CacheKeepaliveSeconds
+	}
+	if p.WarmCache != nil {
+		warm = *p.WarmCache
+	}
+	return retention, ttlSeconds, keepaliveSeconds, warm
+}
+
+// CacheForProvider resolves the prompt-cache policy for a named provider,
+// falling back to the global knobs when the provider has no overrides.
+// providerID is the config provider key (e.g. "openai", "deepseek").
+func (c *Config) CacheForProvider(providerID string) (retention string, ttlSeconds, keepaliveSeconds int, warm bool) {
+	if p, ok := c.Providers[providerID]; ok {
+		return p.CacheFor(*c)
+	}
+	return c.CacheRetention, c.CacheTTLSeconds, c.CacheKeepaliveSeconds, c.WarmCache
 }
 
 // Permission is the allow/ask/deny policy set.

@@ -554,3 +554,53 @@ func TestCacheControlMarkerOnMarkerCapableProviders(t *testing.T) {
 		t.Fatal("openai should not be marker-capable")
 	}
 }
+
+// TestCommandcodeDeepseekGetsDeepSeekWireDialect pins that a custom gateway
+// (commandcode) serving a deepseek model now gets the DeepSeek wire dialect:
+// max_tokens instead of max_completion_tokens, plus the stable-marked
+// reasoning shaping — the provider-name-only gate missed this before.
+func TestCommandcodeDeepseekGetsDeepSeekWireDialect(t *testing.T) {
+	c := New("commandcode", "test-key", "https://api.commandcode.ai/provider/v1")
+	body := c.buildWireBody(provider.Request{
+		Model:          "deepseek/deepseek-v4-flash",
+		System:         "stable system prompt",
+		SystemStable:   "stable system prompt",
+		Messages:       []provider.Message{provider.UserText("hi")},
+		CacheRetention: provider.CacheRetentionLong,
+		MaxTokens:      2048,
+	}, true, true)
+	raw, _ := json.Marshal(body)
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["max_completion_tokens"]; ok {
+		t.Errorf("commandcode deepseek got max_completion_tokens, want max_tokens (DeepSeek dialect)")
+	}
+	if mt, ok := m["max_tokens"].(float64); !ok || int(mt) != 2048 {
+		t.Errorf("commandcode deepseek max_tokens=%v, want 2048", m["max_tokens"])
+	}
+	// The system must be a plain single message (commandcode is not cache-
+	// control marked), but it must be present.
+	msgs, ok := m["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		t.Fatalf("no messages in body: %v", m)
+	}
+}
+
+// TestCommandcodeNonDeepseekModelKeepsOpenAIDialect pins the negative case: a
+// non-deepseek model on the same gateway keeps OpenAI's max_completion_tokens.
+func TestCommandcodeNonDeepseekModelKeepsOpenAIDialect(t *testing.T) {
+	c := New("commandcode", "test-key", "https://api.commandcode.ai/provider/v1")
+	body := c.buildWireBody(provider.Request{
+		Model:          "gpt-5.6-luna",
+		System:         "s",
+		Messages:       []provider.Message{provider.UserText("hi")},
+		CacheRetention: provider.CacheRetentionLong,
+		MaxTokens:      2048,
+	}, true, true)
+	raw, _ := json.Marshal(body)
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	if mt, ok := m["max_completion_tokens"].(float64); !ok || int(mt) != 2048 {
+		t.Errorf("commandcode gpt got max_completion_tokens=%v, want 2048", m["max_completion_tokens"])
+	}
+}

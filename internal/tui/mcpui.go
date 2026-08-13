@@ -127,7 +127,7 @@ func (m *Model) cmdRefreshModelList() (tea.Model, tea.Cmd) {
 			if cred.BaseURL == "" {
 				continue
 			}
-			res := catalog.Probe(context.Background(), cred.BaseURL, credentialStore.CurrentKey(id))
+			res := catalog.ProbeWithAccount(context.Background(), cred.BaseURL, credentialStore.CurrentKey(id), cred.AccountID)
 			if res.Err != nil || len(res.Models) == 0 {
 				continue
 			}
@@ -307,8 +307,29 @@ func (m *Model) cmdStats() (tea.Model, tea.Cmd) {
 	if m.pendingDivergence != "" {
 		b.WriteString(s.Faint.Render(fmt.Sprintf("; prefix change: %s", m.pendingDivergence)))
 	}
+	// Keep-alive health: a provider whose keep-alive POSTs keep observing a
+	// cold prefix (zero cache-read tokens) is being evicted faster than the
+	// idle interval refreshes it — a signal to lower cache_keepalive_seconds.
+	if cold := m.coldKeepalives(); cold > 0 {
+		b.WriteString(s.Faint.Render(fmt.Sprintf("\nkeep-alive: %d cold refresh(es) — prefix evicted despite the loop", cold)))
+	}
 	m.appendMsg(ChatMsg{Kind: MsgSystem, Text: b.String(), Time: time.Now()})
 	return m, nil
+}
+
+// coldKeepalives reports how many keep-alive refreshes observed a cold prefix
+// for the active provider (see provider.KeepaliveColdCounter). Zero when the
+// provider does not expose the counter.
+func (m *Model) coldKeepalives() int64 {
+	provID, _ := config.SplitModel(m.modelID)
+	p, ok := m.deps.Providers[provID]
+	if !ok {
+		return 0
+	}
+	if c, ok := p.(provider.KeepaliveColdCounter); ok {
+		return c.ColdKeepalives()
+	}
+	return 0
 }
 
 // padLeft right-aligns a string within width n.

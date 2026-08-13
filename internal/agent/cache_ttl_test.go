@@ -44,3 +44,22 @@ func TestCacheTTLOverrideVendorAndExplicit(t *testing.T) {
 		}
 	})
 }
+
+// TestCacheTTLCommandcodeDeepseek pins the model-name-driven rule end to end:
+// a custom gateway (commandcode) serving a deepseek model gets the DeepSeek
+// day-long cache TTL, not the 5-minute unknown-vendor default.
+func TestCacheTTLCommandcodeDeepseek(t *testing.T) {
+	runner := New(Config{
+		Model:          "deepseek/deepseek-v4-flash",
+		CacheRetention: provider.CacheRetentionLong,
+	})
+	if got := runner.cacheTTL(); got != 24*time.Hour {
+		t.Fatalf("cacheTTL() for commandcode+deepseek = %v, want 24h", got)
+	}
+	// A non-deepseek model on the same gateway keeps the long-retention
+	// default (24h) too, but a bare-model deepseek still matches.
+	runner2 := New(Config{Model: "deepseek-v4-pro"})
+	if got := runner2.cacheTTL(); got != 24*time.Hour {
+		t.Fatalf("cacheTTL() for bare deepseek-v4-pro = %v, want 24h", got)
+	}
+}

@@ -56,6 +56,99 @@ func TestListDoesNotReloadMetadataBackedSessionsAsLegacy(t *testing.T) {
 	}
 }
 
+// TestListCwdFilterSkipsKnownSessionsWithoutReParsingLegacy is a regression
+// test for a startup hang: a cwd-filtered List must not re-parse the full
+// JSON of every session that has a meta.json but a different cwd. Those
+// sessions can never appear in the filtered result, so the legacy fallback
+// must skip them (the "known" set is populated from meta.json files, not
+// from the filtered output).
+func TestListCwdFilterSkipsKnownSessionsWithoutReParsingLegacy(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A meta-backed session in another cwd.
+	otherCwd := filepath.Join(dir, "other-project")
+	if err := os.MkdirAll(otherCwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other := &Session{
+		ID:       "other",
+		Title:    "other project",
+		Cwd:      otherCwd,
+		Messages: []provider.Message{provider.UserText("other")},
+	}
+	if err := store.Save(other); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy session (no meta.json) in the target cwd.
+	target := &Session{
+		ID:       "mine",
+		Title:    "my project",
+		Cwd:      dir,
+		Messages: []provider.Message{provider.UserText("mine")},
+	}
+	data, err := json.Marshal(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mine.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	metas, err := store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 || metas[0].ID != "mine" {
+		t.Fatalf("cwd-filtered list returned %+v, want only the legacy session in cwd", metas)
+	}
+}
+
+// TestWriteSearchTextHelpers verifies HasSearchText and WriteSearchText
+// round-trip and that Search uses the backfilled sidecar.
+func TestWriteSearchTextHelpers(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := &Session{
+		ID:       "legacy",
+		Title:    "old",
+		Cwd:      dir,
+		Messages: []provider.Message{provider.UserText("backfilled needle")},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "legacy.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if store.HasSearchText("legacy") {
+		t.Fatal("HasSearchText true before backfill")
+	}
+	sess, err := store.Load("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteSearchText("legacy", SearchTextOf(sess)); err != nil {
+		t.Fatal(err)
+	}
+	if !store.HasSearchText("legacy") {
+		t.Fatal("HasSearchText false after backfill")
+	}
+	metas, err := store.Search("backfilled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 || metas[0].ID != "legacy" {
+		t.Fatalf("search after backfill: got %+v", metas)
+	}
+}
+
 // TestSearchUsesSidecar verifies Search matches message text via the
 // lightweight .search.txt sidecar without needing the full session JSON, and
 // falls back to Load() for legacy sessions saved before the sidecar existed.

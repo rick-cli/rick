@@ -49,6 +49,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Coalesce the terminal's per-character paste re-delivery (Windows
+	// Terminal/conhost consume Ctrl+V and replay the text as key events) into
+	// a single atomic clipboard insert instead of typing it out.
+	if m.trackPasteBurst(msg) {
+		return m, nil
+	}
+
 	// ctrl+c: interrupt a run, otherwise if there are attachments or input, clear them.
 	// Second press quits.
 	if key == "ctrl+c" {
@@ -155,12 +162,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key == "up" {
 			delta = -1
 		}
+		// Snapshot the scroll offset before the first event of a possible
+		// wheel gesture. The first event is indistinguishable from an arrow
+		// key and may browse history (which resets the viewport to the
+		// bottom); the snapshot lets a confirmed wheel restore the position
+		// it started from.
+		if !m.wheelPotentialActive() {
+			m.wheelPreScroll = m.viewport.YOffset
+		}
 		// With mouse capture off (native selection on), Windows Terminal
 		// delivers the scroll wheel as a rapid burst of same-direction
-		// up/down key events. A burst within 150ms is a wheel — scroll the
-		// transcript instead of navigating prompt history.
-		if m.isWheelKeyBurst(delta) {
-			m.scrollBy(delta * m.scrollStep())
+		// up/down key events. A burst within a short window is a wheel —
+		// scroll the transcript instead of navigating prompt history. The
+		// first event of a burst is indistinguishable from a real arrow key,
+		// so it may briefly browse history; once the burst is confirmed the
+		// draft is restored so the input never sticks on an old prompt.
+		if m.isWheelKey(delta) {
+			m.restoreHistoryDraft()
+			m.moveActivityCursorByWheel(delta)
 			return m, nil
 		}
 		if m.moveSlashCursor(delta) {
@@ -306,9 +325,12 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// into per-character key events after the fact; without this, pasting
 	// would double-insert the text. While the incoming runes continue to
 	// prefix-match the remembered paste they are dropped; the first rune
-	// that diverges ends suppression and is processed normally.
+	// that diverges ends suppression and is processed normally. pasteSuppress
+	// may be seeded with the prefix a coalesced paste already consumed
+	// (trackPasteBurst); only the runes after that seed are replayed.
 	if m.pasteTarget != "" && time.Since(m.lastClipboardPaste) < 500*time.Millisecond {
 		if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
+			seedLen := m.pasteSuppressSeed
 			m.pasteSuppress = append(m.pasteSuppress, msg.Runes...)
 			target := []rune(m.pasteTarget)
 			if len(m.pasteSuppress) <= len(target) {
@@ -323,18 +345,24 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					if len(m.pasteSuppress) == len(target) {
 						m.pasteTarget = ""
 						m.pasteSuppress = nil
+						m.pasteSuppressSeed = 0
 					}
 					return m, nil
 				}
 			}
 			// Diverged: this is real typing. Replay the buffered runes as a
 			// single insert (they were never shown) and clear suppression.
+			// The seeded prefix was already inserted by the coalesce, so only
+			// the runes that arrived after it are replayed. The divergent
+			// rune is the tail of that buffer, so the msg is consumed here.
 			m.pasteTarget = ""
-			if len(m.pasteSuppress) > 0 {
-				m.input.InsertString(string(m.pasteSuppress))
-				m.pasteSuppress = nil
+			if len(m.pasteSuppress) > seedLen {
+				m.input.InsertString(string(m.pasteSuppress[seedLen:]))
 				m.resizeAfterInputEdit()
 			}
+			m.pasteSuppress = nil
+			m.pasteSuppressSeed = 0
+			return m, nil
 		}
 	}
 
@@ -368,32 +396,171 @@ type wheelKey struct {
 	dir int // -1 for up, +1 for down
 }
 
-// isWheelKeyBurst reports whether the current up/down key event is part of a
-// rapid same-direction burst (a scroll-wheel emulated as arrow keys by
-// Windows Terminal when mouse capture is off). It records the event and
-// returns true when at least three consecutive same-direction events arrive
-// within a short window. Real arrow-key use (history navigation) rarely
-// produces three same-direction presses that fast, so it is not misread.
-func (m *Model) isWheelKeyBurst(dir int) bool {
+// wheelPairWindow is how close two same-direction up/down keys must arrive to
+// count as a wheel pair. A wheel notch pair at any normal scrolling speed
+// (down to ~3 notches/sec) lands well inside it; two deliberate arrow presses
+// to browse history (typically 300ms+ apart) do not. Once a pair confirms a
+// wheel, the gesture lifetime below keeps it scrolling even if the user slows
+// down further.
+const wheelPairWindow = 300 * time.Millisecond
+
+// wheelBurstWindow bounds the older three-event burst rule.
+const wheelBurstWindow = 400 * time.Millisecond
+
+// wheelGestureLifetime keeps an ongoing wheel gesture recognized after its
+// last notch, so a user who slows down mid-scroll (notches spaced wider than
+// wheelPairWindow) does not flip back into history navigation between
+// notches.
+const wheelGestureLifetime = 700 * time.Millisecond
+
+// moveActivityCursorByWheel moves the activity cursor when the wheel bursts
+// over the activity panel, and scrolls the chat transcript otherwise. The
+// wheel must never cycle the input history — that stays reserved for the
+// arrow keys (historyUp/historyDown).
+func (m *Model) moveActivityCursorByWheel(delta int) {
+	if m.activityContainsCursor() || (m.activityItemsVisible() && m.cursorAtPanelRow()) {
+		m.activityFocused = true
+		m.moveActivityCursor(delta)
+		return
+	}
+	m.scrollBy(delta * m.scrollStep())
+}
+
+// activityItemsVisible reports whether the activity panel currently renders
+// any items (non-empty panel above the prompt).
+func (m *Model) activityItemsVisible() bool {
+	items := m.activityItems()
+	return len(items) > 0 && m.activityPanel() != ""
+}
+
+// activityContainsCursor reports whether the input cursor currently sits on a
+// row that belongs to the activity panel, i.e. the wheel is over the panel
+// rather than over the transcript or the input bar.
+func (m *Model) activityContainsCursor() bool {
+	// Bubble Tea reports the cursor row through the viewport; the activity
+	// panel sits directly below the transcript viewport and above the prompt.
+	// The prompt row is the first row of the input, so a wheel over the
+	// prompt should not move the activity cursor either.
+	return m.cursorAtPanelRow()
+}
+
+// cursorAtPanelRow reports whether the cursor row falls within the activity
+// panel's row range.
+func (m *Model) cursorAtPanelRow() bool {
+	if !m.activityItemsVisible() {
+		return false
+	}
+	top, bottom := m.activityPanelBounds()
+	return bottom > top && m.cursorRow() >= top && m.cursorRow() < bottom
+}
+
+// cursorRow returns the terminal row the text-input cursor currently occupies
+// (relative to the top of the screen).
+func (m *Model) cursorRow() int {
+	return m.inputPosRow()
+}
+
+// inputPosRow returns the on-screen row of the input area's first line.
+func (m *Model) inputPosRow() int {
+	return m.viewport.YPosition + m.viewport.Height
+}
+
+// isWheelKey reports whether the current up/down key event is part of a
+// scroll-wheel gesture (a scroll-wheel emulated as arrow keys by Windows
+// Terminal when mouse capture is off). Three signals:
+//
+//   - Gesture continuation: a same-direction key right after a confirmed
+//     wheel keeps scrolling even when the user slows down (notches spaced
+//     wider than the burst window).
+//   - Pair rule: a same-direction key within wheelPairWindow of the previous
+//     one. This is the second+ notch of a wheel at any normal scrolling
+//     speed; two deliberate arrow presses to browse history rarely land
+//     inside the window.
+//   - Burst rule: three same-direction keys within wheelBurstWindow.
+//
+// A single isolated up/down press is never a wheel, so arrow-key history
+// navigation still works.
+func (m *Model) isWheelKey(dir int) bool {
 	now := time.Now()
-	cutoff := now.Add(-150 * time.Millisecond)
+	// Record this event for the pair/burst rules.
+	m.wheelKeyTimes = append(m.wheelKeyTimes, wheelKey{at: now, dir: dir})
+	cutoff := now.Add(-wheelBurstWindow)
 	kept := m.wheelKeyTimes[:0]
 	for _, e := range m.wheelKeyTimes {
 		if e.at.After(cutoff) {
 			kept = append(kept, e)
 		}
 	}
-	m.wheelKeyTimes = append(kept, wheelKey{at: now, dir: dir})
-	if len(m.wheelKeyTimes) < 3 {
-		return false
+	m.wheelKeyTimes = kept
+
+	// An ongoing gesture: same-direction keys keep scrolling until the user
+	// pauses long enough for the gesture to lapse.
+	if !m.wheelActiveUntil.IsZero() && now.Before(m.wheelActiveUntil) && dir == m.wheelActiveDir {
+		m.extendWheelGesture(dir)
+		return true
 	}
-	// All recorded events in the burst must go the same direction.
-	for _, e := range m.wheelKeyTimes {
-		if e.dir != dir {
-			return false
+
+	// Pair rule: a same-direction key within wheelPairWindow of the previous.
+	if len(m.wheelKeyTimes) >= 2 {
+		prev := m.wheelKeyTimes[len(m.wheelKeyTimes)-2]
+		if prev.dir == dir && now.Sub(prev.at) <= wheelPairWindow {
+			m.extendWheelGesture(dir)
+			return true
 		}
 	}
-	return true
+
+	// Burst rule: three same-direction keys within the window.
+	if len(m.wheelKeyTimes) >= 3 {
+		same := true
+		for _, e := range m.wheelKeyTimes {
+			if e.dir != dir {
+				same = false
+				break
+			}
+		}
+		if same {
+			m.extendWheelGesture(dir)
+			return true
+		}
+	}
+	return false
+}
+
+// extendWheelGesture keeps the wheel recognized as an ongoing gesture for
+// wheelGestureLifetime after this event, in the given direction.
+func (m *Model) extendWheelGesture(dir int) {
+	m.wheelActiveDir = dir
+	m.wheelActiveUntil = time.Now().Add(wheelGestureLifetime)
+}
+
+// wheelPotentialActive reports whether a possible wheel gesture is already
+// underway (a recent same-direction up/down key was seen), so the scroll
+// snapshot is only taken once per gesture.
+func (m *Model) wheelPotentialActive() bool {
+	now := time.Now()
+	for i := len(m.wheelKeyTimes) - 1; i >= 0; i-- {
+		if now.Sub(m.wheelKeyTimes[i].at) > wheelBurstWindow {
+			break
+		}
+		return true
+	}
+	return !m.wheelActiveUntil.IsZero() && now.Before(m.wheelActiveUntil)
+}
+
+// restoreHistoryDraft undoes the history navigation a wheel's early events
+// may have performed before the burst was recognizable. A real arrow key
+// leaves histIdx != -1 intentionally; this is only called once a wheel is
+// confirmed, so it returns the input to the pre-wheel draft and the viewport
+// to the position the gesture started from (historyUp resets it to bottom).
+func (m *Model) restoreHistoryDraft() {
+	if m.histIdx != -1 && len(m.inputHist) > 0 {
+		m.input.SetValue(m.histDraft)
+		m.histIdx = -1
+		m.resizeAfterInputEdit()
+		// resizeAfterInputEdit re-renders the layout and may clamp the
+		// viewport; restore the scroll position after it settles.
+		m.viewport.SetYOffset(m.wheelPreScroll)
+	}
 }
 
 func (m *Model) handleClipboardPaste() {
@@ -418,6 +585,7 @@ func (m *Model) handleClipboardPaste() {
 		// auto-submits.
 		m.pasteTarget = text
 		m.pasteSuppress = nil
+		m.pasteSuppressSeed = 0
 		if strings.Contains(text, "\n") {
 			m.pasteNewlineUntil = time.Now().Add(500 * time.Millisecond)
 		}

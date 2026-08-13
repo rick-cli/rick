@@ -326,7 +326,7 @@ func main() {
 }
 
 // rickVersion is injected at build time; fallback for dev builds.
-var rickVersion = "0.1.16"
+var rickVersion = "0.1.17"
 
 // newServer assembles the shared dependencies once at startup.
 func newServer(dir, sandboxMode, profile string) (*server, error) {
@@ -416,7 +416,7 @@ func newServer(dir, sandboxMode, profile string) (*server, error) {
 	return &server{
 		loaded:         loaded,
 		cwd:            abs,
-		provs:          buildProviders(loaded.Config),
+		provs:          buildProviders(loaded.Config, creds),
 		creds:          creds,
 		tools:          reg,
 		plugins:        plugins,
@@ -525,7 +525,9 @@ func resolveRunReasoning(providerID, modelID, value string, models []provider.Mo
 }
 
 // buildProviders instantiates every configured provider that has credentials.
-func buildProviders(cfg config.Config) map[string]provider.Provider {
+// creds, when non-nil, is used to persist refreshed OAuth tokens for the
+// ChatGPT / Codex provider.
+func buildProviders(cfg config.Config, creds *config.Credentials) map[string]provider.Provider {
 	out := map[string]provider.Provider{}
 	for name, p := range cfg.Providers {
 		if p.Enabled != nil && !*p.Enabled {
@@ -550,12 +552,26 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 				continue
 			}
 			c := openai.New(name, p.APIKey, p.BaseURL)
+			if p.RefreshToken != "" {
+				c.SetCodex(p.RefreshToken, p.AccountID, p.TokenExpiresAt, func(access, refresh string, expiresAt int64) {
+					if creds != nil {
+						_ = creds.SaveTokens(name, access, refresh, expiresAt)
+					}
+				})
+			}
 			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
 			c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 			out[name] = c
 		default:
 			if p.BaseURL != "" {
 				c := openai.New(name, p.APIKey, p.BaseURL)
+				if p.RefreshToken != "" {
+					c.SetCodex(p.RefreshToken, p.AccountID, p.TokenExpiresAt, func(access, refresh string, expiresAt int64) {
+						if creds != nil {
+							_ = creds.SaveTokens(name, access, refresh, expiresAt)
+						}
+					})
+				}
 				c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
 				c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 				out[name] = c
@@ -866,7 +882,7 @@ func (s *server) refreshMissingModels() {
 		if key == "" {
 			continue // no credential to probe with
 		}
-		res := catalog.Probe(context.Background(), cred.BaseURL, key)
+		res := catalog.ProbeWithAccount(context.Background(), cred.BaseURL, key, cred.AccountID)
 		if res.Err != nil || len(res.Models) == 0 {
 			continue // endpoint does not publish a list; leave as-is
 		}
@@ -1783,6 +1799,7 @@ func (s *server) handleRun(ctx context.Context, req Request, out responseEmitter
 		out.emit(Response{Type: "error", SessionID: sid, Error: err.Error()})
 		return
 	}
+	cacheRetention, cacheTTLSeconds, _, cacheWarm := s.loaded.Config.CacheForProvider(prov.Name())
 	models := s.modelsForProvider(prov.Name(), prov)
 	thinking := req.Thinking
 	if thinking == "" {
@@ -1975,8 +1992,9 @@ func (s *server) handleRun(ctx context.Context, req Request, out responseEmitter
 		Plugins:            s.plugins,
 		Parallel:           true,
 		Snapshotter:        snapshotter,
-		CacheRetention:     provider.CacheRetention(s.loaded.Config.CacheRetention),
-		WarmCache:          s.loaded.Config.WarmCache,
+		CacheRetention:     provider.CacheRetention(cacheRetention),
+		CacheTTLSeconds:    cacheTTLSeconds,
+		WarmCache:          cacheWarm,
 		MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
 		MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
 	})
@@ -2198,6 +2216,7 @@ func (s *server) spawnSubagent(sid, cwd string, reasoning provider.ReasoningEffo
 		if !ok {
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
+		cacheRetention, _, _, cacheWarm := s.loaded.Config.CacheForProvider(provID)
 
 		subPerms := agent.SubagentPermissions(spec, perms, cwd)
 		stableSys := spec.Prompt + agent.ProjectContext(cwd, s.loaded.Config.Instructions)
@@ -2228,8 +2247,8 @@ func (s *server) spawnSubagent(sid, cwd string, reasoning provider.ReasoningEffo
 			Depth:              depth,
 			MaxTurns:           0, // unlimited; the repeated-call guard still stops loops
 			Plugins:            s.plugins,
-			CacheRetention:     provider.CacheRetention(s.loaded.Config.CacheRetention),
-			WarmCache:          s.loaded.Config.WarmCache,
+			CacheRetention:     provider.CacheRetention(cacheRetention),
+			WarmCache:          cacheWarm,
 			MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
 			MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
 			Parallel:           true,
@@ -2312,6 +2331,7 @@ func (s *server) spawnSwarm(sid, cwd, model string, reasoning provider.Reasoning
 		if err != nil {
 			return "", err
 		}
+		cacheRetention, _, _, cacheWarm := s.loaded.Config.CacheForProvider(prov.Name())
 		team := swarm.NewSwarmContext(ctx, "swarm-"+session.NewID(), name, goal, topo)
 		for _, spec := range specs {
 			team.AddAgent(spec.Name, spec.Role)
@@ -2366,8 +2386,8 @@ func (s *server) spawnSwarm(sid, cwd, model string, reasoning provider.Reasoning
 				MaxTurns:           0, // unlimited; the repeated-call guard still stops loops
 				Plugins:            s.plugins,
 				Parallel:           true,
-				CacheRetention:     provider.CacheRetention(s.loaded.Config.CacheRetention),
-				WarmCache:          s.loaded.Config.WarmCache,
+				CacheRetention:     provider.CacheRetention(cacheRetention),
+				WarmCache:          cacheWarm,
 				MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
 				MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
 			}

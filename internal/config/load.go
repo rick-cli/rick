@@ -360,6 +360,18 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 			if v.Enabled != nil {
 				cur.Enabled = v.Enabled
 			}
+			if v.CacheRetention != "" {
+				cur.CacheRetention = v.CacheRetention
+			}
+			if v.CacheTTLSeconds != 0 {
+				cur.CacheTTLSeconds = v.CacheTTLSeconds
+			}
+			if v.CacheKeepaliveSeconds != 0 {
+				cur.CacheKeepaliveSeconds = v.CacheKeepaliveSeconds
+			}
+			if v.WarmCache != nil {
+				cur.WarmCache = v.WarmCache
+			}
 			dst.Providers[k] = cur
 		}
 	}

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,109 @@ func TestResumeBrowserFiltersMessagesCategoriesAndBookmarks(t *testing.T) {
 	m.sortAndFilter()
 	if len(m.filtered) != 1 || m.filtered[0].ID != "roblox" {
 		t.Fatalf("bookmark filter returned %+v", m.filtered)
+	}
+}
+
+// TestResumeSearchCacheByteBudget verifies the message-search cache evicts by
+// total bytes, so one oversized transcript cannot evict every other entry and
+// force a reload on the next keystroke.
+func TestResumeSearchCacheByteBudget(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(&session.Session{
+		ID: "small", Title: "Small", Cwd: "G:/x",
+		Messages: []provider.Message{provider.UserText("small needle")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bigText := strings.Repeat("big haystack ", 2000) // ~24KB
+	if err := store.Save(&session.Session{
+		ID: "big", Title: "Big", Cwd: "G:/x",
+		Messages: []provider.Message{provider.UserText(bigText)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &resumeModel{store: store}
+	m.cacheMessageSearchText("small", strings.Repeat("s", 100))
+	m.cacheMessageSearchText("big", strings.Repeat("b", 24*1024))
+	// Both must survive; a byte-agnostic entry-limit cache would drop small.
+	if _, ok := m.messageSearchCache["small"]; !ok {
+		t.Fatal("small entry evicted by a single large entry; byte budget broken")
+	}
+	if _, ok := m.messageSearchCache["big"]; !ok {
+		t.Fatal("big entry missing")
+	}
+	if m.messageSearchCacheBytes <= 0 || m.messageSearchCacheBytes != len(m.messageSearchCache["small"])+len(m.messageSearchCache["big"]) {
+		t.Fatalf("cache byte count out of sync: %d", m.messageSearchCacheBytes)
+	}
+
+	// Entry-limit eviction must also keep the byte count accurate: fill past
+	// maxResumeMessageCacheEntries and confirm the byte counter tracks the
+	// surviving entries.
+	for i := 0; i < maxResumeMessageCacheEntries+8; i++ {
+		id := fmt.Sprintf("filler-%d", i)
+		m.cacheMessageSearchText(id, strings.Repeat("x", 32))
+	}
+	want := 0
+	for _, text := range m.messageSearchCache {
+		want += len(text)
+	}
+	if m.messageSearchCacheBytes != want {
+		t.Fatalf("byte count after entry-limit evictions: got %d want %d", m.messageSearchCacheBytes, want)
+	}
+	if len(m.messageSearchCache) != maxResumeMessageCacheEntries {
+		t.Fatalf("entry count after fill: got %d want %d", len(m.messageSearchCache), maxResumeMessageCacheEntries)
+	}
+}
+
+// TestResumeSearchDebounce verifies live search defers message scans: a
+// single keystroke schedules a tick instead of filtering inline, and the tick
+// fires the filter once the debounce window has elapsed.
+func TestResumeSearchDebounce(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(&session.Session{
+		ID: "a", Title: "Alpha", Cwd: "G:/x",
+		Messages: []provider.Message{provider.UserText("needle alpha")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metas, err := store.List("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &resumeModel{
+		store:      store,
+		metas:      metas,
+		styles:     NewStyles(nil),
+		editMode:   resumeEditSearch,
+		search:     newResumeInput(),
+		editInput:  newResumeInput(),
+		legacyFavs: map[string]bool{},
+	}
+
+	// Typing a real query must not filter synchronously; it returns a tick cmd.
+	m.editInput.SetValue("needl")
+	m.editInput.CursorEnd()
+	m.editInput.Focus()
+	_, cmd := m.handleEditKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	if m.search.Value() != "needle" {
+		t.Fatalf("search value not updated: %q", m.search.Value())
+	}
+	if cmd == nil {
+		t.Fatal("debounce: expected a tick cmd after typing")
+	}
+	// Force the debounce window to have elapsed, then deliver the tick.
+	m.searchDebounce = time.Now().Add(-time.Second)
+	next, _ := m.Update(searchDebounceMsg(time.Now()))
+	rm := next.(*resumeModel)
+	if len(rm.filtered) != 1 || rm.filtered[0].ID != "a" {
+		t.Fatalf("debounced search filtered %+v, want session a", rm.filtered)
 	}
 }
 

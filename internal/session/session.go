@@ -240,10 +240,11 @@ func (s *Store) Save(sess *Session) error {
 	return nil
 }
 
-// searchTextOf builds the search-sidecar payload for a session: the
+// SearchTextOf builds the search-sidecar payload for a session: the
 // lowercased concatenation of every text-bearing block, bounded so the
-// sidecar cannot balloon with a huge transcript.
-func searchTextOf(sess *Session) string {
+// sidecar cannot balloon with a huge transcript. Exported so the resume
+// browser can backfill sidecars for sessions saved before the feature.
+func SearchTextOf(sess *Session) string {
 	const maxSearchSidecarBytes = 1 << 20 // 1 MiB per session is ample for search
 	var b strings.Builder
 	for _, m := range sess.Messages {
@@ -254,6 +255,34 @@ func searchTextOf(sess *Session) string {
 		return strings.ToLower(b.String()[:maxSearchSidecarBytes])
 	}
 	return strings.ToLower(b.String())
+}
+
+// searchTextOf is the unexported alias used by Save.
+func searchTextOf(sess *Session) string { return SearchTextOf(sess) }
+
+// HasSearchText reports whether a search sidecar exists for a session.
+func (s *Store) HasSearchText(id string) bool {
+	if !validID(id) {
+		return false
+	}
+	_, err := os.Stat(s.searchPath(id))
+	return err == nil
+}
+
+// WriteSearchText persists a session's search sidecar so later searches can
+// skip the full-JSON parse. Writes are atomic (tmp + rename).
+func (s *Store) WriteSearchText(id, text string) error {
+	if !validID(id) {
+		return fmt.Errorf("invalid session id")
+	}
+	if text == "" {
+		return nil
+	}
+	tmp := s.searchPath(id) + ".tmp"
+	if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.searchPath(id))
 }
 
 // Load reads a session by id.
@@ -301,11 +330,18 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 	}
 	var out []Meta
 	var legacyEntries []os.DirEntry
+	// known records every session that already has a meta.json, regardless of
+	// the cwd filter. listLegacy skips sessions in this set, so a cwd-filtered
+	// list must not re-parse the full JSON of sessions whose metadata merely
+	// does not match the filter — they can never appear in the result anyway.
+	known := make(map[string]struct{})
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		if strings.HasSuffix(e.Name(), ".meta.json") {
+			id := strings.TrimSuffix(e.Name(), ".meta.json")
+			known[id] = struct{}{}
 			data, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
 			if err != nil {
 				continue
@@ -313,6 +349,9 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 			var meta Meta
 			if json.Unmarshal(data, &meta) != nil {
 				continue
+			}
+			if meta.ID == "" {
+				meta.ID = id
 			}
 			if cwd != "" && meta.Cwd != cwd {
 				continue
@@ -323,10 +362,6 @@ func (s *Store) List(cwd string) ([]Meta, error) {
 		if strings.HasSuffix(e.Name(), ".json") && e.Name() != "current.json" {
 			legacyEntries = append(legacyEntries, e)
 		}
-	}
-	known := make(map[string]struct{}, len(out))
-	for _, meta := range out {
-		known[meta.ID] = struct{}{}
 	}
 	legacy := s.listLegacy(cwd, known, legacyEntries)
 	for _, meta := range legacy {

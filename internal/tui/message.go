@@ -94,9 +94,16 @@ func (m *Model) renderMsg(msg ChatMsg, width int) string {
 		return s.Thinking.Render(body)
 
 	case MsgChoice:
+		// The currently pending menu is re-pinned at the live tail; suppress
+		// this settled copy so it does not render twice. Once the menu is
+		// answered or cancelled, pending clears and this renders normally.
+		if m.pending.livePinned && m.pending.choiceID == msg.choiceID {
+			return ""
+		}
 		var b strings.Builder
 		b.WriteString(s.Accent.Render(msg.Text) + "\n")
-		interactive := m.pending.choiceID != 0 && m.pending.choiceID == msg.choiceID && isChoiceMenu(m.pending.kind) && !m.pending.textInput
+		interactive := isChoiceMenu(m.pending.kind) && !m.pending.textInput &&
+			m.pending.choiceID != 0 && m.pending.choiceID == msg.choiceID
 		for i, o := range msg.Choices {
 			marker := "  "
 			if interactive && i == m.pending.cursor {
@@ -155,6 +162,43 @@ func (m *Model) renderMsg(msg ChatMsg, width int) string {
 		return m.renderTool(msg, width)
 	}
 	return ""
+}
+
+// renderPendingMenu renders the currently armed choice menu as a pinned tail,
+// keeping it visible at the bottom of the viewport even while a long stream
+// arrives after it. It returns "" when there is no pending menu.
+func (m *Model) renderPendingMenu(width int) string {
+	p := m.pending
+	if p.kind == pendingNone || p.textInput || len(p.options) == 0 {
+		return ""
+	}
+	s := m.styles
+	var b strings.Builder
+	b.WriteString(s.Accent.Render(p.title) + "\n")
+	for i, o := range p.options {
+		marker := "  "
+		if i == p.cursor {
+			marker = "▸ "
+		}
+		line := fmt.Sprintf("%s%2d %s", marker, i+1, padRight(o.label, 34))
+		if o.detail != "" {
+			line += o.detail
+		}
+		if o.active {
+			line += "  ← current"
+		}
+		if i == p.cursor {
+			line = s.Accent.Bold(true).Render(line)
+		} else if o.active {
+			line = s.Accent.Render(line)
+		} else {
+			line = s.Base.Render(line)
+		}
+		b.WriteString(strings.TrimRight(line, " ") + "\n")
+	}
+	b.WriteString(s.Faint.Render("  ↑/↓ select · enter confirm · esc/backspace back · type a number") + "\n")
+	b.WriteString(m.renderChoiceButtons())
+	return b.String()
 }
 
 func (m *Model) choiceButtonStyle(active bool) lipgloss.Style {

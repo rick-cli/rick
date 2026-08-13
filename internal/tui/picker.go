@@ -36,6 +36,7 @@ var slashCommands = []slashCmd{
 	{"/undo", "revert the last file changes"},
 	{"/redo", "reapply reverted changes"},
 	{"/details", "toggle full tool output"},
+	{"/think", "toggle thinking sections (on/off)"},
 	{"/thinking", "toggle reasoning display"},
 	{"/tools", "enable/disable tools"},
 	{"/mcp", "manage MCP servers"},

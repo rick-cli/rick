@@ -6,6 +6,41 @@ import (
 	"rick/internal/provider"
 )
 
+// TestParseModelsReadsCodexSlugs covers the ChatGPT Codex backend envelope:
+// {"models":[{"slug":"gpt-5.5","display_name":...,"context_window":...}]}.
+func TestParseModelsReadsCodexSlugs(t *testing.T) {
+	body := []byte(`{"models":[
+		{"slug":"gpt-5.5","display_name":"GPT-5.5","context_window":400000},
+		{"slug":"gpt-5.4","display_name":"GPT-5.4"}
+	]}`)
+	models, _, err := ParseModels(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("parsed %d models, want 2", len(models))
+	}
+	byID := make(map[string]Model, len(models))
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	gpt55 := byID["gpt-5.5"]
+	if gpt55.Name != "GPT-5.5" {
+		t.Fatalf("gpt-5.5 name = %q, want display_name mapping", gpt55.Name)
+	}
+	if gpt55.Context != 400000 || gpt55.ContextSource != provider.ContextSourceAPI {
+		t.Fatalf("gpt-5.5 context = %d/%v, want 400000/API", gpt55.Context, gpt55.ContextSource)
+	}
+	// No context_window: inferred from the model id catalog.
+	gpt54 := byID["gpt-5.4"]
+	if gpt54.Context != provider.KnownContextWindow("gpt-5.4") {
+		t.Fatalf("gpt-5.4 context = %d, want inferred", gpt54.Context)
+	}
+	if gpt54.ContextSource != provider.ContextSourceInferred {
+		t.Fatalf("gpt-5.4 source = %v, want inferred", gpt54.ContextSource)
+	}
+}
+
 func TestParseModelsReadsReasoningCapabilities(t *testing.T) {
 	body := []byte(`{"data":[
 		{"id":"effort-model","reasoning":{"supported_efforts":["high","low"],"default_effort":"high","default_enabled":true,"mandatory":true}},
@@ -125,5 +160,37 @@ func TestParseModelsAcceptsNestedAndQuotedContextLimits(t *testing.T) {
 	modalityModel := byID["architecture-modality"]
 	if !modalityModel.SupportsImages || !modalityModel.ChatCapable {
 		t.Fatalf("modality capability = %+v", modalityModel)
+	}
+}
+
+// TestParseModelsReadsCapabilitiesContextWindow covers 9router-style gateways
+// that report the real deployment limit under capabilities.contextWindow.
+func TestParseModelsReadsCapabilitiesContextWindow(t *testing.T) {
+	body := []byte(`{"models":[
+		{"id":"cx/gpt-5.6-sol","capabilities":{"contextWindow":272000}},
+		{"id":"cx/gpt-5.6-terra","capabilities":{"contextWindow":272000}},
+		{"id":"cx/gpt-5.6-luna","capabilities":{"contextWindow":272000}},
+		{"id":"cx/gpt-5.6-nova"}
+	]}`)
+	models, _, err := ParseModels(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]Model, len(models))
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	for _, id := range []string{"cx/gpt-5.6-sol", "cx/gpt-5.6-terra", "cx/gpt-5.6-luna"} {
+		if byID[id].Context != 272000 {
+			t.Fatalf("%s context = %d, want 272000", id, byID[id].Context)
+		}
+		if byID[id].ContextSource != provider.ContextSourceAPI {
+			t.Fatalf("%s source = %q, want %q", id, byID[id].ContextSource, provider.ContextSourceAPI)
+		}
+	}
+	// No capabilities.contextWindow means the gpt-5 family fallback applies
+	// (the probe leaves inference to KnownContextWindow).
+	if byID["cx/gpt-5.6-nova"].Context != provider.KnownContextWindow("cx/gpt-5.6-nova") {
+		t.Fatalf("fallback for model without contextWindow = %d", byID["cx/gpt-5.6-nova"].Context)
 	}
 }

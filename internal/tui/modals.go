@@ -402,6 +402,8 @@ func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
 	if m.running || m.agentCh != nil {
 		m.interrupt()
 	}
+	m.designMode = false
+	m.sysPartsKey = ""
 	m.cancelCompaction()
 	m.compactionRunID++
 	m.compactionActive = false

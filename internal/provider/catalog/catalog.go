@@ -32,11 +32,11 @@ type Entry struct {
 	Auth    string
 	Flavor  string
 	BaseURL string
-	KeyEnv  []string    // checked in order; first non-empty wins
-	BaseEnv string      // optional base-url override variable
-	Note    string      // shown in the picker when non-empty
-	KeyHint string      // where to get a key
-	OAuth   *DeviceFlow `json:"-"` // RFC 8628 device-code flow, if Auth == AuthDeviceCode
+	KeyEnv  []string   // checked in order; first non-empty wins
+	BaseEnv string     // optional base-url override variable
+	Note    string     // shown in the picker when non-empty
+	KeyHint string     // where to get a key
+	OAuth   DeviceAuth // device-code flow (RFC 8628 DeviceFlow or CodexDeviceFlow)
 	// CopilotExchange marks providers that need a post-OAuth token exchange
 	// (e.g. GitHub OAuth → Copilot API token).
 	CopilotExchange bool `json:"-"`
@@ -66,13 +66,11 @@ var Registry = []Entry{
 		Note:    "sk- API key from the Portal", KeyHint: "portal.nousresearch.com"},
 
 	{ID: "chatgpt", Name: "ChatGPT / Codex", Auth: AuthDeviceCode, Flavor: FlavorOpenAI,
-		BaseURL: "https://api.openai.com/v1",
+		BaseURL: "https://chatgpt.com/backend-api/codex",
 		Note:    "OAuth — sign in with your OpenAI account", KeyHint: "auth.openai.com",
-		OAuth: &DeviceFlow{
-			DeviceAuthURL: "https://auth.openai.com/oauth/device/code",
-			TokenURL:      "https://auth.openai.com/oauth/token",
-			ClientID:      "codex",
-			Scope:         "openid profile email offline_access",
+		OAuth: &CodexBrowserFlow{
+			Issuer:   "https://auth.openai.com",
+			ClientID: "app_EMoamEEZ73f0CkXaXp7hrann",
 		}},
 
 	{ID: "copilot", Name: "GitHub Copilot", Auth: AuthDeviceCode, Flavor: FlavorOpenAI,

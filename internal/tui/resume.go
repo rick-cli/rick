@@ -54,6 +54,13 @@ const (
 	resumeEditCategory
 )
 
+// searchDebounceInterval paces live search: filtering runs only after the
+// user pauses typing, so a fast typist pays for one message-text pass instead
+// of one per keystroke (the first pass may parse sidecar-less sessions).
+const searchDebounceInterval = 150 * time.Millisecond
+
+type searchDebounceMsg time.Time
+
 type resumeButtonSpec struct {
 	id    string
 	label string
@@ -92,6 +99,8 @@ type resumeModel struct {
 
 	messageSearchCache      map[string]string
 	messageSearchCacheOrder []string
+	messageSearchCacheBytes int
+	searchDebounce         time.Time
 
 	cursor       int
 	width        int
@@ -180,6 +189,13 @@ func newResumeModel(styles *Styles) (*resumeModel, error) {
 		sortMode:   sortDate,
 	}
 	m.sortAndFilter()
+
+	// Backfill search sidecars for sessions saved before the feature, off the
+	// UI goroutine: the first message search would otherwise load each of
+	// those full JSON files inline. The browser reads sidecars when present,
+	// so results converge as files land.
+	go backfillSearchSidecars(store, metas)
+
 	return m, nil
 }
 
@@ -208,6 +224,14 @@ func (m *resumeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.recalculateViewport()
+		return m, nil
+	case searchDebounceMsg:
+		// Only run the filter if the query has not changed since the tick
+		// was scheduled — later keystrokes supersede this one.
+		if m.editMode == resumeEditSearch && !time.Time(msg).IsZero() && !m.searchDebounce.IsZero() && !time.Now().Before(m.searchDebounce) {
+			m.searchDebounce = time.Time{}
+			m.sortAndFilter()
+		}
 		return m, nil
 	case tea.MouseMsg:
 		return m, m.handleMouse(msg)
@@ -353,7 +377,17 @@ func (m *resumeModel) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.editInput, cmd = m.editInput.Update(msg)
 	if m.editMode == resumeEditSearch {
 		m.search.SetValue(m.editInput.Value())
-		m.sortAndFilter()
+		// Debounce live search so each keystroke does not re-scan every
+		// session's message text. The result still renders once the pause
+		// elapses; enter runs it immediately.
+		if len(strings.TrimSpace(m.search.Value())) < 2 {
+			m.sortAndFilter()
+		} else {
+			m.searchDebounce = time.Now()
+			cmd = tea.Batch(cmd, tea.Tick(searchDebounceInterval, func(t time.Time) tea.Msg {
+				return searchDebounceMsg(t)
+			}))
+		}
 	}
 	return m, cmd
 }
@@ -707,7 +741,7 @@ func (m *resumeModel) matchesQuery(meta session.Meta, query string) bool {
 
 const (
 	maxResumeMessageCacheEntries = 64
-	maxResumeCachedMessageBytes  = 256 << 10
+	maxResumeMessageCacheBytes   = 4 << 20 // 4 MiB total; big transcripts must not thrash the cache
 )
 
 func (m *resumeModel) cachedMessageSearchText(id string) string {
@@ -734,20 +768,43 @@ func (m *resumeModel) cachedMessageSearchText(id string) string {
 		}
 		text = strings.ToLower(builder.String())
 	}
-	if len(text) > maxResumeCachedMessageBytes {
-		return text
+	m.cacheMessageSearchText(id, text)
+	return text
+}
+
+// cacheMessageSearchText stores a session's search text, evicting by total
+// bytes (not just entry count) so a few multi-hundred-KB transcripts cannot
+// evict everything else and force reloads on the next keystroke.
+func (m *resumeModel) cacheMessageSearchText(id, text string) {
+	if len(text) > maxResumeMessageCacheBytes {
+		return // never cache a single transcript this large
 	}
 	if m.messageSearchCache == nil {
 		m.messageSearchCache = make(map[string]string)
 	}
+	if _, exists := m.messageSearchCache[id]; exists {
+		return
+	}
 	if len(m.messageSearchCacheOrder) >= maxResumeMessageCacheEntries {
 		oldest := m.messageSearchCacheOrder[0]
 		m.messageSearchCacheOrder = m.messageSearchCacheOrder[1:]
+		if dropped, ok := m.messageSearchCache[oldest]; ok {
+			m.messageSearchCacheBytes -= len(dropped)
+		}
+		delete(m.messageSearchCache, oldest)
+	}
+	// Evict cached entries until this one fits the byte budget.
+	for m.messageSearchCacheBytes+len(text) > maxResumeMessageCacheBytes && len(m.messageSearchCacheOrder) > 0 {
+		oldest := m.messageSearchCacheOrder[0]
+		m.messageSearchCacheOrder = m.messageSearchCacheOrder[1:]
+		if dropped, ok := m.messageSearchCache[oldest]; ok {
+			m.messageSearchCacheBytes -= len(dropped)
+		}
 		delete(m.messageSearchCache, oldest)
 	}
 	m.messageSearchCache[id] = text
+	m.messageSearchCacheBytes += len(text)
 	m.messageSearchCacheOrder = append(m.messageSearchCacheOrder, id)
-	return text
 }
 
 // messageSearchSidecar reads the store's lightweight .search.txt sidecar for
@@ -758,6 +815,22 @@ func (m *resumeModel) messageSearchSidecar(id string) string {
 		return ""
 	}
 	return string(data)
+}
+
+// backfillSearchSidecars writes .search.txt sidecars for every session that
+// lacks one, loading each session's JSON once. Running in the background keeps
+// the first interactive search keystroke from paying for the full backfill.
+func backfillSearchSidecars(store *session.Store, metas []session.Meta) {
+	for _, meta := range metas {
+		if store.HasSearchText(meta.ID) {
+			continue
+		}
+		sess, err := store.Load(meta.ID)
+		if err != nil {
+			continue
+		}
+		_ = store.WriteSearchText(meta.ID, session.SearchTextOf(sess))
+	}
 }
 
 func (m *resumeModel) recalculateViewport() {

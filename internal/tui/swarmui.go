@@ -134,6 +134,7 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	cacheRetention, _, _, cacheWarm := m.deps.Loaded.Config.CacheForProvider(prov.Name())
 	for i := range msg.agents {
 		msg.agents[i].Name = strings.TrimSpace(msg.agents[i].Name)
 		msg.agents[i].Role = strings.TrimSpace(msg.agents[i].Role)
@@ -215,8 +216,8 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 			ToolFilter: toolFilter, Perms: m.deps.Perms, Ask: m.makeAsker(),
 			Cwd: m.deps.Cwd, SessionID: m.sessionID(), AgentName: spec.Name,
 			Depth: 1, MaxTurns: 0, Parallel: true, // unlimited; the repeated-call guard still stops loops
-			CacheRetention:     provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
-			WarmCache:          m.deps.Loaded.Config.WarmCache,
+			CacheRetention:     provider.CacheRetention(cacheRetention),
+			WarmCache:          cacheWarm,
 			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
 			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
 		}

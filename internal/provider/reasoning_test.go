@@ -49,6 +49,12 @@ func TestReasoningCapabilitiesUseModelSpecificEfforts(t *testing.T) {
 		{name: "o-series no off", providerID: "openai", modelID: "o3", want: []ReasoningEffort{ReasoningLow, ReasoningMedium, ReasoningHigh}, wantDefault: ReasoningMedium},
 		{name: "gpt-5 minimal", providerID: "openai", modelID: "gpt-5", want: []ReasoningEffort{ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh}, wantDefault: ReasoningMedium},
 		{name: "gpt-5.2 xhigh", providerID: "openai", modelID: "gpt-5.2", want: []ReasoningEffort{ReasoningOff, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, wantDefault: ReasoningMedium},
+		{name: "gpt-5.6-luna through 9router", providerID: "9router", modelID: "cx/gpt-5.6-luna", want: []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh, ReasoningMax}, wantDefault: ReasoningMedium},
+		{name: "gpt-5.4 through 9router", providerID: "9router", modelID: "cx/gpt-5.4", want: []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, wantDefault: ReasoningMedium},
+		{name: "gpt-5.4-mini through 9router", providerID: "9router", modelID: "cx/gpt-5.4-mini", want: []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, wantDefault: ReasoningMedium},
+		{name: "gpt-5.5 through 9router", providerID: "9router", modelID: "cx/gpt-5.5", want: []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, wantDefault: ReasoningMedium},
+		{name: "gpt-oss through 9router", providerID: "9router", modelID: "ag/gpt-oss-120b-medium", want: []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, wantDefault: ReasoningMedium},
+		{name: "codex through 9router", providerID: "9router", modelID: "cx/codex", want: []ReasoningEffort{ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, wantDefault: ReasoningMedium},
 		{name: "unknown generic opt-in", providerID: "gateway", modelID: "vendor/new-model", want: []ReasoningEffort{ReasoningOff, ReasoningOn}, wantDefault: ReasoningOff},
 	}
 

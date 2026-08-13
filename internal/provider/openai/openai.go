@@ -34,6 +34,11 @@ type Client struct {
 	Headers map[string]string
 	HTTP    *http.Client
 
+	// Codex, when non-nil, switches this client to the ChatGPT Codex backend
+	// (chatgpt.com/backend-api/codex) using the Responses-API wire format and
+	// OAuth refresh-token renewal. The APIKey holds the OAuth access token.
+	Codex *CodexConfig
+
 	models []provider.ModelInfo
 
 	// Keep-alive state (SetKeepalive): per-session record of the last stream
@@ -107,7 +112,22 @@ func (c *Client) SetKeepalive(interval time.Duration) {
 	if interval <= 0 {
 		return
 	}
+	// The Codex backend speaks the Responses API; the keep-alive loop replays
+	// chat-completions wire bodies, so it cannot serve codex sessions.
+	if c.Codex != nil {
+		return
+	}
 	c.kaInterval = interval
+}
+
+// ColdKeepalives returns how many keep-alive POSTs observed a cold prefix
+// (zero cache-read tokens), i.e. the provider evicted the session's cache
+// despite the keep-alive loop. A provider whose cold count keeps climbing
+// needs a shorter keep-alive interval; surfacing it makes that tunable.
+func (c *Client) ColdKeepalives() int64 {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	return c.kaColdKeepalives
 }
 
 // SetOpenRouterResponseCache enables OpenRouter's response cache for this
@@ -298,8 +318,18 @@ func (c *Client) keepaliveTick() {
 func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
 	body := s.body
 	body.Stream = true
-	body.StreamOpts = nil
-	if deepseekWire(c.ID) {
+	// Ask for the usage chunk so a cold prefix (cache_read == 0) is
+	// observable: without stream_options.include_usage OpenAI omits usage on
+	// streamed responses and the cold counter would never fire.
+	body.StreamOpts = &streamOpts{IncludeUsage: true}
+	// GPT-5.6+: refresh only the marked (explicit) breakpoints so the keep-
+	// alive never writes the implicit latest-message breakpoint. Cache writes
+	// cost 1.25x on 5.6+, so each idle refresh is one write slot on the
+	// stable head instead of a full-tail write.
+	if c.ID == "openai" && isGPT56(s.body.Model) && body.PromptCacheOptions != nil {
+		body.PromptCacheOptions.Mode = "explicit"
+	}
+	if c.deepseekWire(s.body.Model) {
 		body.MaxTokens = 0
 		body.MaxTokensLegacy = 1
 	} else {
@@ -331,8 +361,10 @@ func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
 }
 
 // parseUsageFields extracts the cache/input token fields from a raw
-// chat-completions JSON payload (non-stream or the final stream chunk). Nil
-// is returned when the payload carries no usage object.
+// chat-completions payload: either a plain JSON body or an SSE stream whose
+// final chunk carries the usage object (keep-alive sends stream=true, so
+// OpenAI returns the usage in an SSE "data:" line). Nil is returned when the
+// payload carries no usage object.
 func parseUsageFields(raw []byte) *provider.Usage {
 	var payload struct {
 		Usage *struct {
@@ -346,7 +378,35 @@ func parseUsageFields(raw []byte) *provider.Usage {
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil || payload.Usage == nil {
-		return nil
+		// Fall back to scanning SSE lines: streamed responses put usage in
+		// the final data chunk, not a top-level JSON object.
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(line[len("data:"):])
+			if data == "" || data == "[DONE]" {
+				continue
+			}
+			payload = struct {
+				Usage *struct {
+					PromptTokens        int `json:"prompt_tokens"`
+					CompletionTokens    int `json:"completion_tokens"`
+					PromptTokensDetails struct {
+						CachedTokens     int `json:"cached_tokens"`
+						CacheWriteTokens int `json:"cache_write_tokens"`
+					} `json:"prompt_tokens_details"`
+					PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+				} `json:"usage"`
+			}{}
+			if err := json.Unmarshal([]byte(data), &payload); err == nil && payload.Usage != nil {
+				break
+			}
+		}
+		if payload.Usage == nil {
+			return nil
+		}
 	}
 	cacheRead := payload.Usage.PromptTokensDetails.CachedTokens
 	if cacheRead == 0 {
@@ -425,8 +485,14 @@ func (c *Client) modelInfo(id string) *provider.ModelInfo {
 // deepseekWire reports whether the endpoint speaks DeepSeek's wire dialect,
 // which reads max_tokens (and thinking switches) rather than OpenAI's
 // max_completion_tokens. Zen's free-tier engines are DeepSeek-line.
-func deepseekWire(id string) bool {
-	return id == "opencode-zen" || id == "opencode-go" || id == "deepseek"
+// deepseekWire reports whether this request speaks DeepSeek's wire dialect,
+// which reads max_tokens (and thinking switches) rather than OpenAI's
+// max_completion_tokens. The provider id alone ("deepseek", opencode-zen/go)
+// is not enough: custom OpenAI-compatible gateways (e.g. commandcode) serve
+// DeepSeek models under their own provider id, so the model id must be
+// consulted too.
+func (c *Client) deepseekWire(modelID string) bool {
+	return provider.IsDeepSeekLine(c.ID, modelID)
 }
 
 // cacheControlMarked reports whether this provider honors an Anthropic-style
@@ -446,8 +512,43 @@ func (c *Client) cacheControlMarked() bool {
 	return false
 }
 
+// isGPT56 reports whether the model is in the GPT-5.6+ family, whose prompt
+// caching uses explicit breakpoints + prompt_cache_options instead of the
+// legacy prompt_cache_retention field. Pre-5.6 models reject
+// prompt_cache_options with a 400, so the gate must be exact.
+func isGPT56(modelID string) bool {
+	return provider.IsGPT56Model(modelID)
+}
+
+// openAICacheTTL is the assumed prompt-cache lifetime for direct OpenAI
+// models: 5-10 minutes of inactivity (in-memory policy) for pre-5.6, and the
+// guaranteed 30-minute minimum for GPT-5.6+. The agent pre-warm decision and
+// cache-miss labels derive from it.
+func openAICacheTTL(modelID string) time.Duration {
+	return provider.CacheTTLForModel("openai", modelID, "")
+}
+
 func (c *Client) SetAPIKey(key string) {
 	c.APIKey = key
+}
+
+// SetCodex switches this client to the ChatGPT Codex backend
+// (chatgpt.com/backend-api/codex) with OAuth token refresh. refreshToken is
+// the OAuth refresh token; tokenExpiresAt is the unix-epoch second the current
+// access token expires (0 = refresh on first request). onRefresh, when
+// non-nil, is called after each successful refresh with the new token pair so
+// the caller can persist it.
+func (c *Client) SetCodex(refreshToken, accountID string, tokenExpiresAt int64, onRefresh func(accessToken, refreshToken string, expiresAt int64)) {
+	if refreshToken == "" && tokenExpiresAt == 0 {
+		return
+	}
+	c.BaseURL = strings.TrimRight(codexBaseURL, "/")
+	c.Codex = &CodexConfig{
+		RefreshToken:   refreshToken,
+		TokenExpiresAt: tokenExpiresAt,
+		AccountID:      accountID,
+		OnTokenRefresh: onRefresh,
+	}
 }
 
 // ---------- wire types ----------
@@ -483,6 +584,10 @@ type wireMessage struct {
 	// MiniMax) honor cache_control on the wire to keep the stable system
 	// prefix cached; plain OpenAI and DeepSeek-line endpoints ignore it.
 	CacheControl *wireCacheControl `json:"cache_control,omitempty"`
+	// CacheBreakpoint marks the exact end of a cached prefix (GPT-5.6+
+	// prompt_cache_breakpoint). Content after it can change without
+	// invalidating the earlier cached prefix.
+	CacheBreakpoint *wireCacheBreakpoint `json:"prompt_cache_breakpoint,omitempty"`
 }
 
 type wireCacheControl struct {
@@ -511,14 +616,32 @@ type wireRequest struct {
 	Temperature     *float64 `json:"temperature,omitempty"`
 	PromptCacheKey  string   `json:"prompt_cache_key,omitempty"`
 	// PromptCacheRetention is the OpenAI chat-completions cache-retention
-	// hint ("24h" for long retention). Gateway providers ignore it.
+	// hint for pre-5.6 models ("in_memory", "24h", or "extended"). Deprecated
+	// on GPT-5.6+; those models use PromptCacheOptions instead.
 	PromptCacheRetention string `json:"prompt_cache_retention,omitempty"`
+	// PromptCacheOptions is the GPT-5.6+ cache policy: mode "implicit"
+	// (default) or "explicit" (only marked breakpoints), plus a ttl of "30m"
+	// (the only supported value).
+	PromptCacheOptions *wireCacheOptions `json:"prompt_cache_options,omitempty"`
 	// Effort is OpenAI's reasoning control; Qwen-style endpoints use the
 	// boolean instead. Only one is ever set.
 	Effort         string         `json:"reasoning_effort,omitempty"`
 	EnableThinking *bool          `json:"enable_thinking,omitempty"`
 	Thinking       *wireThinking  `json:"thinking,omitempty"`
 	Reasoning      *wireReasoning `json:"reasoning,omitempty"`
+}
+
+// wireCacheOptions is the GPT-5.6+ prompt-cache policy object.
+type wireCacheOptions struct {
+	Mode string `json:"mode,omitempty"` // implicit (default) | explicit
+	TTL  string `json:"ttl,omitempty"`  // "30m" (only supported value)
+}
+
+// wireCacheBreakpoint marks the exact end of a cached prefix on a content
+// block (GPT-5.6+). Content after the breakpoint can change without
+// invalidating the earlier cached prefix.
+type wireCacheBreakpoint struct {
+	Mode string `json:"mode"` // explicit
 }
 
 // promptCacheKey derives a cache-key scope for the request. Interactive
@@ -537,6 +660,22 @@ func promptCacheKey(model, sessionID, scopeKey string) string {
 	}
 	digest := sha256.Sum256([]byte(model + "\x00" + scope))
 	return hex.EncodeToString(digest[:])
+}
+
+// promptCacheScope picks the routing-key scope for a request. An explicit
+// CacheScopeKey wins (non-interactive runs); otherwise the byte-stable system
+// head is used so every session sharing a frozen system+tools prefix (same
+// cwd/model chain) derives the same key and routes to the same OpenAI cache
+// machine — the cross-session warm reuse rick already gets from
+// sessionSystemParts now also pins routing. Falls back to the session id.
+func promptCacheScope(req provider.Request) string {
+	if req.CacheScopeKey != "" {
+		return req.CacheScopeKey
+	}
+	if strings.TrimSpace(req.SystemStable) != "" {
+		return req.SystemStable
+	}
+	return req.SessionID
 }
 
 // wireThinking is GLM's native OpenAI-compatible thinking switch.
@@ -639,18 +778,35 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 // marker (Qwen on opencode-go, Kimi/Moonshot, MiniMax) keep the stable prefix
 // cached explicitly; others ignore the field.
 func toWireWithStableMarked(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning, cacheMarked bool) []wireMessage {
+	return toWireWithStableMarkedGPT56(system, stable, msgs, includeReasoning, retainAllReasoning, cacheMarked, false, nil)
+}
+
+// toWireWithStableMarkedGPT56 is toWireWithStableMarked with optional GPT-5.6+
+// prompt-cache breakpoints. When gpt56 is true, the stable system message
+// carries a prompt_cache_breakpoint (explicit end of the cached prefix) and
+// each message index in boundaries also gets one, mirroring Anthropic's
+// cache_control boundary placement. Pre-5.6 models reject the field, so it is
+// only ever emitted behind the isGPT56 gate.
+func toWireWithStableMarkedGPT56(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning, cacheMarked, gpt56 bool, boundaries map[int]bool) []wireMessage {
 	var out []wireMessage
 	if strings.TrimSpace(stable) != "" && strings.HasPrefix(system, stable) {
 		stableMsg := wireMessage{Role: "system", Content: stable}
 		if cacheMarked {
 			stableMsg.CacheControl = &wireCacheControl{Type: "ephemeral"}
 		}
+		if gpt56 {
+			stableMsg.CacheBreakpoint = &wireCacheBreakpoint{Mode: "explicit"}
+		}
 		out = append(out, stableMsg)
 		if tail := strings.TrimPrefix(system, stable); strings.TrimSpace(tail) != "" {
 			out = append(out, wireMessage{Role: "system", Content: tail})
 		}
 	} else if strings.TrimSpace(system) != "" {
-		out = append(out, wireMessage{Role: "system", Content: system})
+		sysMsg := wireMessage{Role: "system", Content: system}
+		if gpt56 {
+			sysMsg.CacheBreakpoint = &wireCacheBreakpoint{Mode: "explicit"}
+		}
+		out = append(out, sysMsg)
 	}
 
 	// DeepSeek/GLM require the *immediately previous* turn's reasoning echoed
@@ -747,6 +903,9 @@ func toWireWithStableMarked(system, stable string, msgs []provider.Message, incl
 			if len(calls) == 0 && wm.Content == nil && wm.ReasoningContent != nil {
 				wm.Content = *wm.ReasoningContent
 			}
+			if gpt56 && boundaries != nil && boundaries[i] {
+				wm.CacheBreakpoint = &wireCacheBreakpoint{Mode: "explicit"}
+			}
 			out = append(out, wm)
 		} else if m.Role == provider.RoleUser && (text.Len() > 0 || len(imageBlocks) > 0) {
 			wm := wireMessage{Role: "user", Content: text.String()}
@@ -766,6 +925,9 @@ func toWireWithStableMarked(system, stable string, msgs []provider.Message, incl
 					})
 				}
 				wm.Content = contentArray
+			}
+			if gpt56 && boundaries != nil && boundaries[i] {
+				wm.CacheBreakpoint = &wireCacheBreakpoint{Mode: "explicit"}
 			}
 			out = append(out, wm)
 		}
@@ -898,6 +1060,11 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 	if c.APIKey == "" && !isLocal(c.BaseURL) {
 		return fmt.Errorf("%s: no API key configured", c.ID)
 	}
+	// The Codex backend uses the Responses-API wire format; the chat
+	// completions warm body would be rejected, so skip warming entirely.
+	if c.Codex != nil {
+		return nil
+	}
 	msgs := req.Messages
 	if len(msgs) == 0 {
 		msgs = []provider.Message{provider.UserText("ack")}
@@ -910,7 +1077,14 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 	// different cache entry and misses.
 	req.Messages = msgs
 	body := c.buildWireBody(req, false, false)
-	if deepseekWire(c.ID) {
+	// GPT-5.6+ warm: use explicit mode so the warm only writes the marked
+	// stable-head breakpoint (1 write slot) and never an implicit breakpoint
+	// on the volatile tail. Cache writes cost 1.25× on 5.6+, so this is the
+	// cheapest warm that still primes the exact prefix the stream will read.
+	if c.ID == "openai" && isGPT56(req.Model) && body.PromptCacheOptions != nil {
+		body.PromptCacheOptions.Mode = "explicit"
+	}
+	if c.deepseekWire(req.Model) {
 		body.MaxTokens = 0
 		body.MaxTokensLegacy = 1
 	} else {
@@ -961,20 +1135,22 @@ func (c *Client) buildWireBody(req provider.Request, streaming, includeUsage boo
 		Tools:          toWireTools(req.Tools),
 		Stream:         streaming,
 		Temperature:    req.Temperature,
-		PromptCacheKey: promptCacheKey(req.Model, req.SessionID, req.CacheScopeKey),
+		PromptCacheKey: promptCacheKey(req.Model, promptCacheScope(req), ""),
 	}
 	if streaming {
 		body.StreamOpts = &streamOpts{IncludeUsage: includeUsage}
 	}
-	if deepseekWire(c.ID) {
+	if c.deepseekWire(req.Model) {
 		// DeepSeek-line endpoints read max_tokens, not max_completion_tokens.
 		body.MaxTokens = 0
 		body.MaxTokensLegacy = req.MaxTokens
 	} else {
 		body.MaxTokens = req.MaxTokens
 	}
-	if c.ID == "openai" || deepseekWire(c.ID) || c.cacheControlMarked() {
-		body.Messages = toWireWithStableMarked(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning, c.cacheControlMarked())
+	if c.ID == "openai" || c.deepseekWire(req.Model) || c.cacheControlMarked() {
+		gpt56 := c.ID == "openai" && isGPT56(req.Model) &&
+			req.CacheRetention != provider.CacheRetentionNone
+		body.Messages = toWireWithStableMarkedGPT56(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning, c.cacheControlMarked(), gpt56, req.CacheBoundaries)
 	}
 	if c.ID != "openai" {
 		// OpenAI-compatible gateways do not all accept OpenAI's cache-routing
@@ -986,9 +1162,33 @@ func (c *Client) buildWireBody(req provider.Request, streaming, includeUsage boo
 		// "none" omits the cache key and retention hint so the one-off call
 		// (distillation, compaction) never reads or writes the session cache.
 		body.PromptCacheKey = ""
+		body.PromptCacheRetention = ""
+		body.PromptCacheOptions = nil
 	case provider.CacheRetentionLong:
 		if c.ID == "openai" {
-			body.PromptCacheRetention = "24h"
+			// GPT-5.6+ uses prompt_cache_options (ttl 30m) and rejects the
+			// legacy prompt_cache_retention field; pre-5.6 uses the legacy
+			// retention hint (default "24h" for non-ZDR orgs).
+			if isGPT56(req.Model) {
+				// GPT-5.6+ caches exact prefixes at cache breakpoints. The
+				// implicit mode places its breakpoint on the latest (changing)
+				// message, so a turn that appends content re-writes the whole
+				// prompt at 1.25x and can report cached_tokens = 0 even when
+				// thousands of leading tokens are identical. Explicit mode
+				// writes/reads only the marked stable breakpoints (the system
+				// message always carries one, plus the budget's boundary
+				// messages) and bills the small volatile tail at the 1x
+				// uncached rate — the configuration OpenAI's Prompt Caching
+				// guide recommends for requests whose tail changes every
+				// turn. With no breakpoints at all (empty system, no
+				// boundaries) explicit simply disables caching, which beats
+				// implicit's forced 1.25x rewrite of a prompt that never
+				// matches. Warm and keep-alive already use explicit, so all
+				// three prime and read the same byte-identical prefixes.
+				body.PromptCacheOptions = &wireCacheOptions{Mode: "explicit", TTL: "30m"}
+			} else {
+				body.PromptCacheRetention = "24h"
+			}
 		}
 	}
 
@@ -1069,6 +1269,25 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	if c.APIKey == "" && !isLocal(c.BaseURL) {
 		emit(provider.Event{Kind: provider.EventError,
 			Err: fmt.Errorf("%s: no API key configured", c.ID)})
+		return
+	}
+
+	// ChatGPT / Codex backend: Responses-API wire format to
+	// chatgpt.com/backend-api/codex/responses, with OAuth token refresh.
+	if c.Codex != nil {
+		resp, err := c.codexStream(ctx, req)
+		if err != nil {
+			emit(provider.Event{Kind: provider.EventError, Err: err})
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+			emit(provider.Event{Kind: provider.EventError,
+				Err: fmt.Errorf("%s: http %d: %s", c.ID, resp.StatusCode, strings.TrimSpace(string(b)))})
+			return
+		}
+		c.readCodexSSE(ctx, resp.Body, emit)
 		return
 	}
 
@@ -1355,6 +1574,11 @@ func (c *Client) readSSE(ctx context.Context, r io.Reader, emit func(provider.Ev
 
 // ListModels queries the /models endpoint.
 func (c *Client) ListModels(ctx context.Context) ([]provider.ModelInfo, error) {
+	// ChatGPT / Codex backend serves its own model catalog at
+	// /codex/models with a different envelope.
+	if c.Codex != nil {
+		return c.codexModels(ctx)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -1386,8 +1610,12 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.ModelInfo, error) {
 		contextWindow := model.Context
 		contextSource := model.ContextSource
 		if override, ok := provider.ProviderContextWindow(c.ID, model.ID); ok {
-			contextWindow = override
-			contextSource = provider.ContextSourceCatalog
+			// The hardcoded override is weaker than an API-reported value;
+			// only fill in when the probe returned nothing or an inferred one.
+			if contextSource != provider.ContextSourceAPI {
+				contextWindow = override
+				contextSource = provider.ContextSourceCatalog
+			}
 		}
 		infos = append(infos, provider.ModelInfo{
 			ID: model.ID, Name: model.Name, ContextWindow: contextWindow,

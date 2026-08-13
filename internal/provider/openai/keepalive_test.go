@@ -254,3 +254,157 @@ func TestKeepaliveMapSizeCap(t *testing.T) {
 		t.Fatalf("keep-alive map grew past cap: %d entries (cap %d)", len(client.kaSessions), kaMaxSessions)
 	}
 }
+
+// TestColdKeepalivesCountsEvictedPrefix verifies the Phase D/F surfacing: a
+// keep-alive POST whose response reports zero cache-read tokens is evidence
+// the provider evicted the prefix despite the loop, and ColdKeepalives()
+// exposes that count so /stats can show it (and the interval can be tuned).
+func TestColdKeepalivesCountsEvictedPrefix(t *testing.T) {
+	var mu sync.Mutex
+	var posts []map[string]any
+	// The keep-alive POST now asks for usage (stream=true +
+	// stream_options.include_usage), so the usage arrives in the final SSE
+	// chunk. cached_tokens = 0 => cold. The first Stream call expects SSE too.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(body, &m)
+		mu.Lock()
+		posts = append(posts, m)
+		mu.Unlock()
+		w.Header().Set("content-type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := kaClient(t, server)
+	client.SetKeepalive(100 * time.Millisecond)
+	defer client.stopKeepalive()
+
+	req := provider.Request{
+		Model:          "test-model",
+		System:         "stable system",
+		Messages:       []provider.Message{provider.UserText("hello")},
+		SessionID:      "sess-cold",
+		CacheRetention: provider.CacheRetentionLong,
+		MaxTokens:      2048,
+	}
+	ch := make(chan provider.Event, 8)
+	go client.Stream(context.Background(), req, ch)
+	for range ch {
+	}
+
+	// The handler always reports cached_tokens: 0, so every keep-alive after
+	// the first should count as a cold refresh.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if n := client.ColdKeepalives(); n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cold keep-alive counter never incremented")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestParseUsageFieldsReadsSSE verifies the keep-alive usage extraction: the
+// keep-alive POST streams, so the usage arrives in the final SSE chunk, not a
+// top-level JSON body. A cold prefix (cached_tokens == 0) must be visible.
+func TestParseUsageFieldsReadsSSE(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}\n\n" +
+		"data: [DONE]\n\n"
+	u := parseUsageFields([]byte(sse))
+	if u == nil {
+		t.Fatal("parseUsageFields returned nil for SSE with usage chunk")
+	}
+	if u.CacheReadTokens != 0 {
+		t.Errorf("cache read = %d, want 0 (cold prefix)", u.CacheReadTokens)
+	}
+	if u.InputTokens != 10 {
+		t.Errorf("input = %d, want 10", u.InputTokens)
+	}
+
+	// A warm prefix reports cached_tokens > 0.
+	warm := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":90,\"cache_write_tokens\":0}}}\n\n"
+	u = parseUsageFields([]byte(warm))
+	if u == nil {
+		t.Fatal("parseUsageFields returned nil for warm SSE")
+	}
+	if u.CacheReadTokens != 90 {
+		t.Errorf("cache read = %d, want 90", u.CacheReadTokens)
+	}
+
+	// A plain JSON body (non-streaming gateway) still works.
+	u = parseUsageFields([]byte(`{"usage":{"prompt_tokens":20,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":0}}}`))
+	if u == nil || u.CacheReadTokens != 5 {
+		t.Fatalf("plain JSON parse = %+v, want cache read 5", u)
+	}
+}
+
+// TestCommandcodeDeepseekKeepaliveUsesMaxTokens pins that a keep-alive POST
+// for a custom gateway serving a deepseek model now uses the DeepSeek dialect
+// (max_tokens: 1) so commandcode's endpoint accepts it as a minimal cache
+// refresh instead of erroring (which would silently skip the refresh and let
+// the prefix evict during idle gaps).
+func TestCommandcodeDeepseekKeepaliveUsesMaxTokens(t *testing.T) {
+	var mu sync.Mutex
+	var posts []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(body, &m)
+		mu.Lock()
+		posts = append(posts, m)
+		mu.Unlock()
+		w.Header().Set("content-type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	c := New("commandcode", "test-key", "https://gateway.test/v1")
+	c.HTTP = &http.Client{Transport: rewriteTransport{base: server.Client().Transport, target: server.URL}}
+	c.SetKeepalive(150 * time.Millisecond)
+	defer c.stopKeepalive()
+
+	req := provider.Request{
+		Model:          "deepseek/deepseek-v4-flash",
+		System:         "stable system",
+		Messages:       []provider.Message{provider.UserText("hello")},
+		SessionID:      "sess-cmd",
+		CacheRetention: provider.CacheRetentionLong,
+		MaxTokens:      2048,
+	}
+	ch := make(chan provider.Event, 8)
+	go c.Stream(context.Background(), req, ch)
+	for range ch {
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := len(posts)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("keep-alive POST never arrived (posts=%d)", n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	ka := posts[1]
+	if _, ok := ka["max_completion_tokens"]; ok {
+		t.Errorf("keepalive sent max_completion_tokens, want max_tokens (DeepSeek dialect)")
+	}
+	if mt, ok := ka["max_tokens"].(float64); !ok || int(mt) != 1 {
+		t.Errorf("keepalive max_tokens=%v, want 1 (tiny output budget)", ka["max_tokens"])
+	}
+}

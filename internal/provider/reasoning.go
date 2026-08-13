@@ -147,7 +147,8 @@ func DetectReasoning(modelID string) (ReasoningStyle, ReasoningEffort) {
 
 	case strings.HasPrefix(id, "o1"), strings.HasPrefix(id, "o3"), strings.HasPrefix(id, "o4"):
 		return ReasoningStyleOpenAI, ReasoningMedium
-	case strings.HasPrefix(id, "gpt-5"), strings.Contains(id, "gpt-5"):
+	case strings.HasPrefix(id, "gpt-5"), strings.Contains(id, "gpt-5"),
+		strings.Contains(id, "gpt-oss"):
 		return ReasoningStyleOpenAI, ReasoningMedium
 	case strings.Contains(id, "codex"):
 		return ReasoningStyleOpenAI, ReasoningMedium
@@ -358,7 +359,15 @@ func openAIEfforts(id string) ([]ReasoningEffort, bool) {
 		return []ReasoningEffort{ReasoningLow, ReasoningMedium, ReasoningHigh}, true
 	case strings.Contains(id, "gemini-2.5"):
 		return []ReasoningEffort{ReasoningOff, ReasoningLow, ReasoningMedium, ReasoningHigh}, false
-	case strings.Contains(id, "gpt-5.2"), strings.Contains(id, "gpt-5.3"), strings.Contains(id, "gpt-5.4"):
+	case strings.Contains(id, "gpt-5.6"):
+		return []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh, ReasoningMax}, false
+	case strings.Contains(id, "gpt-5.4"), strings.Contains(id, "gpt-5.5"):
+		return []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, false
+	case strings.Contains(id, "gpt-oss"):
+		return []ReasoningEffort{ReasoningOff, ReasoningMinimal, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, false
+	case strings.Contains(id, "codex"):
+		return []ReasoningEffort{ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, true
+	case strings.Contains(id, "gpt-5.2"), strings.Contains(id, "gpt-5.3"):
 		return []ReasoningEffort{ReasoningOff, ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, false
 	case strings.Contains(id, "gpt-5.1-codex-max"):
 		return []ReasoningEffort{ReasoningLow, ReasoningMedium, ReasoningHigh, ReasoningXHigh}, true

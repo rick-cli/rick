@@ -87,6 +87,7 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 		if !ok {
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
+		cacheRetention, _, _, cacheWarm := m.deps.Loaded.Config.CacheForProvider(provID)
 
 		perms := agent.SubagentPermissions(spec, m.deps.Perms, m.deps.Loaded.ProjectRoot)
 
@@ -136,8 +137,8 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 			MaxTurns:           0, // unlimited; the repeated-call guard still stops loops
 			Plugins:            m.deps.Plugins,
 			Parallel:           true,
-			CacheRetention:     provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
-			WarmCache:          m.deps.Loaded.Config.WarmCache,
+			CacheRetention:     provider.CacheRetention(cacheRetention),
+			WarmCache:          cacheWarm,
 			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
 			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
 			ArchiveDir:         agentArchiveDir(m.deps.Store),
@@ -208,6 +209,7 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			m.deps.AgentRegistry.ReleaseBackground()
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
+		cacheRetention, _, _, cacheWarm := m.deps.Loaded.Config.CacheForProvider(provID)
 		childCtx, cancel := context.WithCancel(ctx)
 		id, err := m.deps.AgentRegistry.Register(&agent.AgentEntry{
 			Name: kind, ParentID: parentID, Depth: depth, Status: agent.AgentIdle,
@@ -232,8 +234,8 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			Ask: m.makeAsker(), Cwd: m.deps.Cwd, SessionID: m.sessionID(),
 			AgentName: kind, AgentID: id, Depth: depth, MaxTurns: 0, // unlimited; the repeated-call guard still stops loops
 			Plugins: m.deps.Plugins, Parallel: true, Registry: m.deps.AgentRegistry,
-			CacheRetention:     provider.CacheRetention(m.deps.Loaded.Config.CacheRetention),
-			WarmCache:          m.deps.Loaded.Config.WarmCache,
+			CacheRetention:     provider.CacheRetention(cacheRetention),
+			WarmCache:          cacheWarm,
 			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
 			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
 			ArchiveDir:         agentArchiveDir(m.deps.Store),

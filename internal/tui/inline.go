@@ -27,9 +27,19 @@ func (m *Model) modelsFor(id string) []provider.ModelInfo {
 		for _, mid := range cred.Models {
 			contextWindow := cred.ContextWindows[mid]
 			contextSource := cred.ContextSources[mid]
+			if contextWindow > 0 && contextSource == provider.ContextSourceUnknown {
+				// User-configured or written by an older rick: a deliberate
+				// constraint, so it outranks catalogs and id inference.
+				contextSource = provider.ContextSourceConfigured
+			}
 			if override, ok := provider.ProviderContextWindow(id, mid); ok {
-				contextWindow = override
-				contextSource = provider.ContextSourceCatalog
+				// The hardcoded override is weaker than an API-reported or
+				// user-configured value; only fill in a missing/weak one.
+				if contextSource != provider.ContextSourceConfigured &&
+					contextSource != provider.ContextSourceAPI {
+					contextWindow = override
+					contextSource = provider.ContextSourceCatalog
+				}
 			}
 			out = append(out, provider.ModelInfo{
 				ID: mid, Name: mid, ContextWindow: contextWindow,
@@ -131,11 +141,15 @@ const (
 	pendingAgentChat
 	pendingAgentSteer
 	pendingJobManage
+
+	// design mode
+	pendingDesignPrompt // waiting for what to design
 )
 
 // pendingChoice is an armed numbered selection.
 type pendingChoice struct {
 	kind        pendingKind
+	title       string // rendered heading of the armed menu
 	options     []choiceOption
 	context     string // e.g. the provider id while choosing a model
 	edit        *editModal
@@ -143,6 +157,7 @@ type pendingChoice struct {
 	choiceID    uint64
 	cursor      int
 	cursorMoved bool
+	livePinned  bool // menu is re-rendered at the live tail while pending
 }
 
 type choiceOption struct {
@@ -180,8 +195,9 @@ func (m *Model) armChoice(title string, kind pendingKind, ctx string, opts []cho
 			break
 		}
 	}
-	m.pending = pendingChoice{kind: kind, options: opts, context: ctx, choiceID: m.choiceSeq, cursor: cursor}
+	m.pending = pendingChoice{kind: kind, title: title, options: opts, context: ctx, choiceID: m.choiceSeq, cursor: cursor, livePinned: true}
 	m.appendMsg(ChatMsg{Kind: MsgChoice, Text: title, Choices: opts, choiceID: m.choiceSeq, Time: nowFn()})
+	m.refresh()
 }
 
 func (m *Model) movePendingCursor(delta int) {
@@ -579,6 +595,8 @@ func (m *Model) applyTextInput(kind pendingKind, ctx, text string) (tea.Model, t
 		return m, nil
 	case pendingKeyAdd:
 		return m.applyKeyAdd(text)
+	case pendingDesignPrompt:
+		return m.startDesignRun(text)
 	}
 	return m, nil
 }

@@ -55,6 +55,30 @@ func (m *Model) cmdReasoning(args string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// cmdThink toggles visibility of the thinking sections in the transcript.
+// An optional "on"/"off" argument sets the state explicitly instead.
+func (m *Model) cmdThink(args string) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(strings.TrimSpace(args)) {
+	case "on":
+		m.showThinking = true
+	case "off":
+		m.showThinking = false
+	case "":
+		m.showThinking = !m.showThinking
+	default:
+		m.appendMsg(ChatMsg{Kind: MsgError,
+			Text: "usage: /think [on|off] — toggle thinking section visibility",
+			Time: time.Now()})
+		return m, nil
+	}
+	m.tx.invalidateAll(m.contentWidth())
+	m.refresh()
+	m.appendMsg(ChatMsg{Kind: MsgSystem,
+		Text: "thinking: " + onOff(m.showThinking), Time: time.Now()})
+	m.setStatus("thinking " + onOff(m.showThinking))
+	return m, nil
+}
+
 func (m *Model) applyReasoning(lvl provider.ReasoningEffort) (tea.Model, tea.Cmd) {
 	if len(m.reasoningCapabilities.Efforts) > 0 && !containsReasoningEffort(m.reasoningCapabilities.Efforts, lvl) {
 		m.appendMsg(ChatMsg{Kind: MsgError,

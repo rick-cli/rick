@@ -76,6 +76,9 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 	m.resizeForActivity()
 	cfg := m.deps.Loaded.Config
 	cfg.Instructions = append([]string(nil), cfg.Instructions...)
+	// Per-provider cache policy: the active provider's overrides (or global
+	// defaults) drive retention/TTL/warm for this run.
+	cacheRetention, cacheTTLSeconds, _, cacheWarm := cfg.CacheForProvider(prov.Name())
 	agentName := m.agentName
 	reasoning := m.reasoning
 	cwd := m.deps.Cwd
@@ -122,9 +125,9 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 			RepoMapBlock:       m.sessionRepoMap(projectRoot, modelID),
 			EnableDistillation: cfg.DistillEnabled != nil && *cfg.DistillEnabled,
 			DistillModel:       cfg.DistillModelFor(),
-			CacheRetention:     provider.CacheRetention(cfg.CacheRetention),
-			CacheTTLSeconds:    cfg.CacheTTLSeconds,
-			WarmCache:          cfg.WarmCache,
+			CacheRetention:     provider.CacheRetention(cacheRetention),
+			CacheTTLSeconds:    cacheTTLSeconds,
+			WarmCache:          cacheWarm,
 			MaxReasoningTurns:  cfg.CacheMaxReasoningTurns,
 			MaxToolResultBytes: cfg.CacheMaxToolResultBytes,
 			PinnedToolSchemas:  schemas,
@@ -414,15 +417,18 @@ func (m *Model) observeCacheUsage(u *provider.Usage) string {
 // A positive cache_ttl_seconds override wins for gateways that expire far
 // sooner than the vendor table assumes.
 func (m *Model) cacheTTL() time.Duration {
-	if m.deps.Loaded != nil && m.deps.Loaded.Config.CacheTTLSeconds > 0 {
-		return time.Duration(m.deps.Loaded.Config.CacheTTLSeconds) * time.Second
-	}
-	retention := provider.CacheRetentionAuto
+	provID, modelID := config.SplitModel(m.modelID)
 	if m.deps.Loaded != nil {
-		retention = provider.CacheRetention(m.deps.Loaded.Config.CacheRetention)
+		retention, ttlSeconds, _, _ := m.deps.Loaded.Config.CacheForProvider(provID)
+		if ttlSeconds > 0 {
+			return time.Duration(ttlSeconds) * time.Second
+		}
+		// Model-aware refinement: OpenAI GPT-5.6+ guarantees a 30-minute
+		// cache minimum, pre-5.6 in-memory evicts after 5-10 minutes;
+		// DeepSeek-line models (on any gateway) keep their prefix a day.
+		return provider.CacheTTLForModel(provID, modelID, provider.CacheRetention(retention))
 	}
-	provID, _ := config.SplitModel(m.modelID)
-	return provider.DefaultCacheTTL(provID, retention)
+	return provider.CacheTTLForModel(provID, modelID, provider.CacheRetentionAuto)
 }
 
 // cacheMissReason tells apart an idle-gap timeout from a prefix change, so
@@ -897,7 +903,7 @@ func buildSystemPromptParts(agentName, modelID, cwd, projectRoot string, cfg con
 // prefix. The session id in the key prevents a brand-new session from
 // reusing the previous one's frozen volatile bytes.
 func (m *Model) sessionSystemParts(agentName, modelID, cwd, projectRoot string, cfg config.Config, skills []plugin.Skill) (string, string) {
-	key := m.sessionID() + "\x00" + agentName + "\x00" + modelID
+	key := m.sessionID() + "\x00" + agentName + "\x00" + modelID + "\x00" + m.designModeKey()
 	if m.sysPartsStable != "" && m.sysPartsKey == key {
 		return m.sysPartsStable, m.sysPartsStable + m.sysPartsVolatile
 	}
@@ -908,7 +914,11 @@ func (m *Model) sessionSystemParts(agentName, modelID, cwd, projectRoot string, 
 	if a, ok := cfg.Agents[agentName]; ok && a.Prompt != "" {
 		base = a.Prompt
 	}
-	stable := base + agent.ProjectContext(projectRoot, cfg.Instructions)
+	stable := base
+	if m.designModeEnabled() {
+		stable += designBrief()
+	}
+	stable += agent.ProjectContext(projectRoot, cfg.Instructions)
 	volatile := sessionSkillBlock(skills, m.initialPrompt()) +
 		agent.Environment(cwd, modelID, agentName, m.sessionGitInfo())
 	m.sysPartsKey = key

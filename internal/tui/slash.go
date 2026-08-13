@@ -53,6 +53,8 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "thinking":
 		return m.cmdReasoning(args)
+	case "think":
+		return m.cmdThink(args)
 	case "models":
 		return m.cmdModels()
 	case "auth":
@@ -70,6 +72,8 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 		return m.cmdUndo()
 	case "redo":
 		return m.cmdRedo()
+	case "design":
+		return m.cmdDesign(args)
 	case "details":
 		m.toolDetails = !m.toolDetails
 		return m, nil

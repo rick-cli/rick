@@ -81,6 +81,12 @@ type ProbeResult struct {
 //     auth challenge instead (Anthropic rejects a bearer token but accepts
 //     x-api-key, and vice versa) and return a Partial result.
 func Probe(ctx context.Context, baseURL, apiKey string) ProbeResult {
+	return ProbeWithAccount(ctx, baseURL, apiKey, "")
+}
+
+// ProbeWithAccount is Probe for backends that also need a ChatGPT account id
+// header (ChatGPT-Account-ID). Other endpoints ignore the extra argument.
+func ProbeWithAccount(ctx context.Context, baseURL, apiKey, accountID string) ProbeResult {
 	apiKey = CleanSecret(apiKey)
 	bases := candidateBases(baseURL)
 	if len(bases) == 0 {
@@ -91,7 +97,7 @@ func Probe(ctx context.Context, baseURL, apiKey string) ProbeResult {
 
 	for _, base := range bases {
 		for _, flavor := range flavorOrder(base) {
-			models, err := listModels(ctx, base, apiKey, flavor)
+			models, err := listModels(ctx, base, apiKey, flavor, accountID)
 			if err == nil {
 				return ProbeResult{Flavor: flavor, BaseURL: base, Models: models}
 			}
@@ -247,7 +253,7 @@ func authHeaders(req *http.Request, apiKey, flavor string) {
 	req.Header.Set("authorization", "Bearer "+apiKey)
 }
 
-func listModels(ctx context.Context, base, apiKey, flavor string) ([]Model, error) {
+func listModels(ctx context.Context, base, apiKey, flavor, accountID string) ([]Model, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
@@ -257,6 +263,26 @@ func listModels(ctx context.Context, base, apiKey, flavor string) ([]Model, erro
 	}
 	authHeaders(req, apiKey, flavor)
 	req.Header.Set("accept", "application/json")
+	// The ChatGPT Codex backend requires the OAuth bearer token plus the
+	// account id; originator identifies the client for routing/analytics.
+	if strings.Contains(base, "chatgpt.com/backend-api/codex") {
+		// The ChatGPT Codex backend requires client_version on /models
+		// (Pydantic "Field required" 400 without it).
+		q := req.URL.Query()
+		q.Set("client_version", "0.0.0")
+		req.URL.RawQuery = q.Encode()
+		req.Header.Set("originator", "rick-cli")
+		req.Header.Set("User-Agent", "rick-cli")
+		// Raw map assignment preserves the exact casing the backend expects
+		// (Header.Set would emit "Oai-Product-Sku").
+		req.Header["OAI-Product-Sku"] = []string{"codex"}
+		if accountID != "" {
+			// Preserve the exact casing the backend expects. The header is
+			// "ChatGPT-Account-ID" (capital "ID"); Go's Header.Set would
+			// canonicalize it to "Chatgpt-Account-Id", so assign the raw map key.
+			req.Header["ChatGPT-Account-ID"] = []string{accountID}
+		}
+	}
 
 	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
 	if err != nil {
@@ -305,6 +331,7 @@ const (
 func ParseModels(body []byte) ([]Model, payloadShape, error) {
 	type rawModel struct {
 		ID            string          `json:"id"`
+		Slug          string          `json:"slug"`
 		Name          string          `json:"name"`
 		Model         string          `json:"model"`
 		DisplayName   string          `json:"display_name"`
@@ -320,6 +347,10 @@ func ParseModels(body []byte) ([]Model, payloadShape, error) {
 			ContextLength  json.RawMessage `json:"context_length"`
 			MaxInputTokens json.RawMessage `json:"max_input_tokens"`
 		} `json:"top_provider"`
+		Capabilities struct {
+			ContextWindow      json.RawMessage `json:"contextWindow"`
+			ContextWindowSnake json.RawMessage `json:"context_window"`
+		} `json:"capabilities"`
 		Limits struct {
 			Context        json.RawMessage `json:"context"`
 			MaxInputTokens json.RawMessage `json:"max_input_tokens"`
@@ -378,13 +409,14 @@ func ParseModels(body []byte) ([]Model, payloadShape, error) {
 
 	out := make([]Model, 0, len(raws))
 	for _, m := range raws {
-		id := FirstNonEmpty(m.ID, m.Model, m.Name)
+		id := FirstNonEmpty(m.ID, m.Slug, m.Model, m.Name)
 		if id == "" {
 			continue
 		}
 		name := FirstNonEmpty(m.DisplayName, m.Name, id)
 		ctxLen := firstPositiveModelInt(
 			m.ContextLength, m.ContextWindow, m.TopProvider.ContextLength,
+			m.Capabilities.ContextWindow, m.Capabilities.ContextWindowSnake,
 			m.MaxContext, m.MaxModelLen, m.InputLimit, m.MaxTokens,
 			m.TopProvider.MaxInputTokens, m.Limits.Context, m.Limits.MaxInputTokens,
 			m.Limit.Context, m.Limit.MaxInputTokens,

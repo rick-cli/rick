@@ -48,7 +48,10 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 	group("appearance", [][2]string{
 		{"/theme", "switch theme"},
 		{"/details", "toggle full tool output"},
+		{"/think", "toggle thinking sections (on/off)"},
 		{"/thinking", "reasoning effort: off/low/medium/high"},
+		{"/design <task>", "design engineering brief — audit & fix UI"},
+		{"/design off", "remove the design brief from the prompt"},
 		{"/config", "show the resolved settings"},
 	})
 	group("inspect", [][2]string{

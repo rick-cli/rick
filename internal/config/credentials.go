@@ -52,6 +52,17 @@ type Credential struct {
 	// "round-robin" - rotate through keys on each request
 	// "failover" - rotate to next key on rate-limit/quota errors
 	APIKeyMode string `json:"apiKeyMode,omitempty"` // single | round-robin | failover
+
+	// RefreshToken is the OAuth refresh token for OAuth providers (ChatGPT /
+	// Codex). The access token in APIKey is short-lived and must be refreshed
+	// with this before expiry.
+	RefreshToken string `json:"refreshToken,omitempty"`
+	// TokenExpiresAt is the unix-epoch second when APIKey expires. Zero means
+	// the token does not expire (API-key providers).
+	TokenExpiresAt int64 `json:"tokenExpiresAt,omitempty"`
+	// AccountID is the ChatGPT account id the Codex backend requires in the
+	// ChatGPT-Account-ID header. Extracted from the OAuth id_token.
+	AccountID string `json:"accountId,omitempty"`
 }
 
 // AuthPath is the credential file location.
@@ -164,6 +175,27 @@ func (c *Credentials) Remove(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.Providers, id)
+}
+
+// SaveTokens updates a credential's access/refresh token pair and expiry and
+// persists the store. It is a no-op when the provider is not stored. The new
+// access token replaces APIKey so subsequent reads see the refreshed token.
+func (c *Credentials) SaveTokens(id, accessToken, refreshToken string, expiresAt int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cred, ok := c.Providers[id]
+	if !ok {
+		return nil
+	}
+	if accessToken != "" {
+		cred.APIKey = accessToken
+	}
+	if refreshToken != "" {
+		cred.RefreshToken = refreshToken
+	}
+	cred.TokenExpiresAt = expiresAt
+	c.Providers[id] = cred
+	return c.saveLocked()
 }
 
 // AllKeys returns the effective list of API keys for a credential.
@@ -296,6 +328,9 @@ func MergeCredentials(cfg *Config, creds *Credentials) {
 		if p.BaseURL == "" {
 			p.BaseURL = cred.BaseURL
 		}
+		p.RefreshToken = cred.RefreshToken
+		p.TokenExpiresAt = cred.TokenExpiresAt
+		p.AccountID = cred.AccountID
 		cfg.Providers[id] = p
 	}
 }

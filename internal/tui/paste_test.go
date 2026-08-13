@@ -7,6 +7,8 @@ import (
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
+
+	"rick/internal/config"
 )
 
 // TestPasteSuppressionDropsTerminalRedelivery pins the anti-double-paste
@@ -93,7 +95,7 @@ func TestWheelKeyBurstRequiresSameDirection(t *testing.T) {
 	m2.inputHist = []string{"first prompt", "second prompt"}
 	m2.histIdx = -1
 	for i := 0; i < 3; i++ {
-		m2.isWheelKeyBurst(-1)
+		m2.isWheelKey(-1)
 	}
 	m2.handleKey(tea.KeyMsg{Type: tea.KeyUp})
 	if got := m2.input.Value(); got != "" {
@@ -102,10 +104,49 @@ func TestWheelKeyBurstRequiresSameDirection(t *testing.T) {
 
 	// A direction change breaks the burst.
 	m3 := newModelChoiceTestModel()
-	m3.isWheelKeyBurst(-1)
-	m3.isWheelKeyBurst(-1)
-	if m3.isWheelKeyBurst(1) {
+	m3.isWheelKey(-1)
+	m3.isWheelKey(-1)
+	if m3.isWheelKey(1) {
 		t.Fatal("direction change must not be a wheel burst")
+	}
+}
+
+// TestWheelGestureContinuationScrollsThroughSlowdown pins that once a wheel is
+// confirmed, same-direction keys keep scrolling even when the user slows to
+// ~2 notches/sec — the 3-event burst rule alone would have fallen through to
+// history navigation between the spaced-out notches.
+func TestWheelGestureContinuationScrollsThroughSlowdown(t *testing.T) {
+	m := newModelChoiceTestModel()
+	m.deps = Deps{Loaded: &config.Loaded{TUI: config.TUI{ScrollSpeed: 1}}}
+	m.input = textarea.New()
+	m.ready = false
+	for i := 0; i < 60; i++ {
+		m.appendMsg(ChatMsg{Kind: MsgSystem, Text: "chat line " + strings.Repeat("x", i%20), Time: nowFn()})
+	}
+	m.handleResize(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m.viewport.GotoBottom()
+	m.inputHist = []string{"first prompt", "second prompt"}
+	m.histIdx = -1
+	m.input.SetValue("draft")
+	m.histDraft = "draft"
+
+	// Fast start confirms the wheel gesture.
+	for i := 0; i < 3; i++ {
+		m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+		time.Sleep(30 * time.Millisecond)
+	}
+	before := m.viewport.YOffset
+	// Pause, then slow notches (500ms apart): the gesture must keep scrolling.
+	time.Sleep(300 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		m.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+		time.Sleep(500 * time.Millisecond)
+	}
+	if got := m.input.Value(); got != "draft" {
+		t.Fatalf("slow tail of wheel corrupted input to %q", got)
+	}
+	if m.viewport.YOffset >= before {
+		t.Fatalf("slow tail did not keep scrolling (offset %d)", m.viewport.YOffset)
 	}
 }
 

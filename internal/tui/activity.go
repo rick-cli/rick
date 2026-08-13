@@ -172,8 +172,6 @@ func (m *Model) activityPrefix() string {
 		prompt = m.styles.Accent.Render(m.spinnerFrame() + " ")
 	case strings.HasPrefix(m.input.Value(), "!"):
 		prompt = m.styles.Warning.Render("! ")
-	case strings.HasPrefix(m.input.Value(), "/"):
-		prompt = m.styles.Secondary.Render("/ ")
 	}
 	inner := prompt + m.input.View()
 	b.WriteString(border.Width(m.width - 2).Render(inner))

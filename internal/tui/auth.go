@@ -70,10 +70,13 @@ type authState struct {
 	probeGen      int // generation counter to ignore stale probe results
 
 	// OAuth device-code flow state
-	oauthCancel   context.CancelFunc
-	oauthUserCode string
-	oauthVerifURI string
-	oauthGen      int // generation counter to ignore stale async results
+	oauthCancel         context.CancelFunc
+	oauthUserCode       string
+	oauthVerifURI       string
+	oauthGen            int // generation counter to ignore stale async results
+	oauthRefreshToken   string
+	oauthTokenExpiresAt int64
+	oauthAccountID      string
 }
 
 // authRow is one line in the provider list.
@@ -604,6 +607,13 @@ func (m *Model) authDeviceBody(w int) string {
 func (m *Model) authOAuthBody(w int) string {
 	s := m.styles
 	var b strings.Builder
+	if _, ok := m.auth.target.OAuth.(*catalog.CodexBrowserFlow); ok {
+		// Browser login: the OAuth authorize page is open; no user code.
+		b.WriteString(s.Muted.Render("  Sign in to your OpenAI account in the browser tab that opened:") + "\n\n")
+		b.WriteString("  " + s.Primary.Render(m.auth.oauthVerifURI) + "\n\n")
+		b.WriteString("  " + s.Faint.Render(m.spinnerFrame()+" waiting for you to finish signing in…") + "\n")
+		return b.String()
+	}
 	b.WriteString(s.Muted.Render("  Open this URL in your browser:") + "\n")
 	b.WriteString("  " + s.Primary.Render(m.auth.oauthVerifURI) + "\n\n")
 	b.WriteString(s.Muted.Render("  Enter code:") + "\n")
@@ -1216,6 +1226,7 @@ func (m *Model) authStartOAuth() (tea.Model, tea.Cmd) {
 	gen := a.oauthGen
 	a.busy = true
 	a.statusLine = ""
+	a.oauthAccountID = ""
 
 	return m, tea.Batch(m.spinnerCmd(), func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1309,6 +1320,16 @@ func (m *Model) applyOAuthDone(msg oauthDoneMsg) (tea.Model, tea.Cmd) {
 	a.oauthUserCode = ""
 	a.oauthVerifURI = ""
 	a.draftKey = apiKey
+	// Remember the OAuth refresh token so the Codex backend can renew the
+	// short-lived access token after this session ends. Copilot exchanges its
+	// token and has no refresh of its own.
+	if !a.target.CopilotExchange && msg.token.RefreshToken != "" {
+		a.oauthRefreshToken = msg.token.RefreshToken
+		a.oauthAccountID = catalog.CodexAccountID(msg.token.IDToken, msg.token.AccessToken)
+		if msg.token.ExpiresIn > 0 {
+			a.oauthTokenExpiresAt = time.Now().Unix() + int64(msg.token.ExpiresIn)
+		}
+	}
 	a.draftURL = catalog.FirstNonEmpty(a.target.EnvBaseURL(), a.target.BaseURL)
 	return m.authStartProbe()
 }
@@ -1343,12 +1364,12 @@ func (m *Model) authStartProbe() (tea.Model, tea.Cmd) {
 	a.probeErr = nil
 	a.statusLine = ""
 
-	id, url, key := a.draftID, a.draftURL, a.draftKey
+	id, url, key, accountID := a.draftID, a.draftURL, a.draftKey, a.oauthAccountID
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	a.probeCancel = cancel
 	return m, tea.Batch(m.spinnerCmd(), func() tea.Msg {
 		defer cancel()
-		res := catalog.Probe(ctx, url, key)
+		res := catalog.ProbeWithAccount(ctx, url, key, accountID)
 		return authProbeMsg{gen: gen, id: id, key: key, res: res}
 	})
 }
@@ -1437,6 +1458,13 @@ func (m *Model) applyAuthProbe(msg authProbeMsg) {
 		cred.ModalitiesKnown = modalitiesKnown
 	}
 	cred.Custom = a.custom || cred.Custom
+	// Persist the OAuth refresh token from the device flow (ChatGPT / Codex)
+	// so the Codex backend can renew the short-lived access token later.
+	if a.oauthRefreshToken != "" {
+		cred.RefreshToken = a.oauthRefreshToken
+		cred.TokenExpiresAt = a.oauthTokenExpiresAt
+		cred.AccountID = a.oauthAccountID
+	}
 	m.creds.Set(msg.id, cred)
 	if err := m.creds.Save(); err != nil {
 		m.creds.Set(msg.id, oldCred)
@@ -1595,9 +1623,12 @@ func (m *Model) reloadProviders() {
 			continue
 		}
 		cfg.Providers[id] = config.Provider{
-			Type:    cred.Type,
-			APIKey:  m.creds.CurrentKey(id),
-			BaseURL: cred.BaseURL,
+			Type:           cred.Type,
+			APIKey:         m.creds.CurrentKey(id),
+			BaseURL:        cred.BaseURL,
+			RefreshToken:   cred.RefreshToken,
+			TokenExpiresAt: cred.TokenExpiresAt,
+			AccountID:      cred.AccountID,
 		}
 	}
 	m.deps.Loaded.Config = cfg
@@ -1634,15 +1665,28 @@ func (m *Model) reloadProviders() {
 				continue
 			}
 			c := openai.New(id, p.APIKey, p.BaseURL)
+			if p.RefreshToken != "" {
+				c.SetCodex(p.RefreshToken, p.AccountID, p.TokenExpiresAt, func(access, refresh string, expiresAt int64) {
+					if m.creds != nil {
+						_ = m.creds.SaveTokens(id, access, refresh, expiresAt)
+					}
+				})
+			}
 			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
 			if cred, ok := creds[id]; ok && len(cred.Models) > 0 {
 				infos := make([]provider.ModelInfo, 0, len(cred.Models))
 				for _, mid := range cred.Models {
 					contextWindow := cred.ContextWindows[mid]
 					contextSource := cred.ContextSources[mid]
+					if contextWindow > 0 && contextSource == provider.ContextSourceUnknown {
+						contextSource = provider.ContextSourceConfigured
+					}
 					if override, ok := provider.ProviderContextWindow(id, mid); ok {
-						contextWindow = override
-						contextSource = provider.ContextSourceCatalog
+						if contextSource != provider.ContextSourceConfigured &&
+							contextSource != provider.ContextSourceAPI {
+							contextWindow = override
+							contextSource = provider.ContextSourceCatalog
+						}
 					}
 					infos = append(infos, provider.ModelInfo{
 						ID: mid, Name: mid, ContextWindow: contextWindow,

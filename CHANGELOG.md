@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.1.16 — 2026-08-13
+
+### ChatGPT / Codex sign-in is fixed
+
+- **Browser login replaces the deprecated device-code flow.** OpenAI retired
+  the device-code endpoints the old flow used; tokens it minted were rejected
+  by the chatgpt.com backend with `missing_end_user_auth`, so sign-in
+  dead-ended after authorization. The `chatgpt` provider now uses the same
+  browser login the official Codex CLI and opencode use: a localhost OAuth
+  callback server (port 1455, fallback 1457) with PKCE S256 and the
+  `codex_cli_simplified_flow` authorize page. Sign in in the browser tab that
+  opens; rick picks up the callback and exchanges the code automatically.
+- **Probe now sends `client_version` to the Codex backend.** `GET /models`
+  without it is rejected with a Pydantic `Field required` 400, so the
+  provider check failed even with a valid token. Verified live: the probe now
+  returns the model list (gpt-5.6-sol, …) instead of a 400.
+- **ChatGPT streaming no longer sends `max_output_tokens`.** The chatgpt.com
+  backend rejects both `max_output_tokens` and `max_completion_tokens` with
+  "Unsupported parameter"; the official Codex CLI sends no output-token limit
+  (the model's truncation policy governs). Verified live: the responses
+  stream now returns `response.created` instead of a 400.
+- **ChatGPT streams now send session-affinity + prompt-cache routing.**
+  `codexStream` was sending no `session_id`/`x-client-request-id` headers and
+  no `prompt_cache_key`, so every request landed in a fresh cache bucket on
+  the ChatGPT router — the cache-hit rate dropped from the usual 99%+ into
+  the mid-90s. The codex path now mirrors the direct-OpenAI path: stable
+  session headers plus a `prompt_cache_key` derived from the session/system
+  scope (clamped to 64 chars), so a conversation's turns stay on one warm
+  bucket. Verified live: the backend accepts both and returns 200.
+
+### Cache hit-rate regression fixed (the <96% sessions)
+
+- **Head-trim now re-warms the new prefix even when general warming is off.**
+  The recent sessions showed 96–97% instead of the usual 99.7%. Root cause:
+  long reasoning-heavy turns overflowed the context window, triggering the
+  stable-head trim; the trim replaces the dropped head with a sentinel, which
+  rewrites the provider-facing prefix bytes, so the provider's cached prefix
+  no longer matches and the next turn re-bills cold (~90k–190k tokens each).
+  The `warmNeeded` gate for a head-trim existed but was gated behind
+  `WarmCache` (off by default) and compared `lastMutation == "head-trim"`
+  while the real value is `"head-trim+archive"` — so the warm never fired.
+  The trim-triggered warm is now unconditional (a trim is a *forced* cache
+  invalidation; warming is the only way to avoid the re-bill it causes) and
+  matches the `head-trim+` prefix like `inferReason` does.
+
 ## v0.1.15 — 2026-08-10
 
 ### Vision for text-only models

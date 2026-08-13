@@ -103,6 +103,15 @@ type Model struct {
 	agentName string
 	agentID   string
 	modelID   string
+	designMode         bool
+	wheelPreScroll     int
+	wheelActiveUntil   time.Time
+	wheelActiveDir     int
+	pasteSuppressSeed  int
+	lastRuneAt         time.Time
+	pasteBurstRunes    []rune
+	pasteBurstInserted int
+	pasteBurstAt       time.Time
 	// pendingDivergence carries the prefix-divergence diagnostics from an
 	// agent event until the next usage row arrives (they precede EvUsage).
 	pendingDivergence string
@@ -1298,6 +1307,18 @@ func (m *Model) refresh() {
 		}
 		live.WriteString(wrapIndent(m.streamBuf.String(), w, ""))
 	}
+	// While a choice menu is pending, re-render its option block at the tail
+	// so streaming after it cannot push the menu out of the viewport. The
+	// settled MsgChoice message stays in history for scrollback; the live
+	// tail re-pins the interactive menu to the bottom.
+	if isChoiceMenu(m.pending.kind) && !m.pending.textInput {
+		if blk := m.renderPendingMenu(w); blk != "" {
+			if live.Len() > 0 {
+				live.WriteString("\n")
+			}
+			live.WriteString(blk)
+		}
+	}
 	m.tx.live = live.String()
 
 	m.tx.render(len(m.msgs), w, func(i int) string {
@@ -1351,25 +1372,19 @@ func (m *Model) rebuildChoiceButtonMap() {
 	if !isChoiceMenu(m.pending.kind) || m.pending.textInput {
 		return
 	}
+	// The pending menu is pinned as the live tail, so its button row is the
+	// last rendered line of the content.
 	backWidth, selectWidth := m.choiceButtonWidths()
-	row := 0
-	for i, msg := range m.msgs {
-		if i >= len(m.tx.blocks) || m.tx.blocks[i] == "" {
-			continue
-		}
-		block := m.tx.blocks[i]
-		lineCount := strings.Count(block, "\n") + 1
-		if msg.Kind == MsgChoice && msg.choiceID == m.pending.choiceID {
-			buttonY := row + lineCount - 1
-			backX := 2
-			m.choiceButtons = append(m.choiceButtons,
-				choiceButtonZone{id: choiceButtonBack, x: backX, y: buttonY, width: backWidth},
-				choiceButtonZone{id: choiceButtonSelect, x: backX + backWidth + 1, y: buttonY, width: selectWidth},
-			)
-			return
-		}
-		row += lineCount + 1
+	lines := strings.Split(strings.TrimRight(m.chatContent, "\n"), "\n")
+	buttonY := len(lines) - 1
+	if buttonY < 0 {
+		return
 	}
+	backX := 2
+	m.choiceButtons = append(m.choiceButtons,
+		choiceButtonZone{id: choiceButtonBack, x: backX, y: buttonY, width: backWidth},
+		choiceButtonZone{id: choiceButtonSelect, x: backX + backWidth + 1, y: buttonY, width: selectWidth},
+	)
 }
 
 // handleMouseClick processes a left-button press in the transcript area.

@@ -122,6 +122,8 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 	stableSystem := agent.BuildPrompt + agent.ProjectContext(opts.ProjectRoot, nil)
 	system := stableSystem + agent.Environment(opts.Cwd, opts.Model, opts.AgentName, "")
 
+	cacheRetention, cacheTTLSeconds, _, cacheWarm := deps.Config.CacheForProvider(deps.Provider.Name())
+
 	runner := agent.New(agent.Config{
 		Provider:           deps.Provider,
 		Model:              deps.ModelID,
@@ -140,8 +142,9 @@ func Run(ctx context.Context, opts Options, deps Deps, stdout, stderr io.Writer)
 		RepoMapRoot:        opts.ProjectRoot,
 		EnableDistillation: deps.Config.DistillEnabled != nil && *deps.Config.DistillEnabled,
 		DistillModel:       deps.Config.DistillModelFor(),
-		CacheRetention:     provider.CacheRetention(deps.Config.CacheRetention),
-		WarmCache:          deps.Config.WarmCache,
+		CacheRetention:     provider.CacheRetention(cacheRetention),
+		CacheTTLSeconds:    cacheTTLSeconds,
+		WarmCache:          cacheWarm,
 		MaxReasoningTurns:  deps.Config.CacheMaxReasoningTurns,
 		MaxToolResultBytes: deps.Config.CacheMaxToolResultBytes,
 		CacheScopeKey:      agent.CacheScopeKeyFor(deps.ModelID, stableSystem, deps.Tools.Schemas(nil)),

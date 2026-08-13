@@ -39,7 +39,7 @@ import (
 	"rick/pkg/contextbudget"
 )
 
-var Version = "0.1.16"
+var Version = "0.1.17"
 
 func main() {
 	var (
@@ -375,7 +375,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 		_, _ = maintenance.PruneSnapshotDirs(config.DataDir(), maintenance.SnapshotRetentionMaxAge)
 	}()
 
-	provs := buildProviders(loaded.Config)
+	provs := buildProviders(loaded.Config, creds)
 
 	resume := o.resume
 	if resume == "" && o.cont {
@@ -399,7 +399,9 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 }
 
 // buildProviders instantiates every configured provider that has credentials.
-func buildProviders(cfg config.Config) map[string]provider.Provider {
+// creds, when non-nil, is used to persist refreshed OAuth tokens for the
+// ChatGPT / Codex provider.
+func buildProviders(cfg config.Config, creds *config.Credentials) map[string]provider.Provider {
 	out := map[string]provider.Provider{}
 	for name, p := range cfg.Providers {
 		if p.Enabled != nil && !*p.Enabled {
@@ -413,6 +415,20 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 				kind = name
 			}
 		}
+		// Per-provider cache policy: provider-level overrides beat the global
+		// knobs, so each backend runs its optimal keep-alive profile. The
+		// retention/TTL/warm values are consumed when the agent config is
+		// built (TUI/headless/rickserve resolve them per active provider).
+		_, _, keepaliveSeconds, _ := p.CacheFor(cfg)
+		// OpenAI's in-memory cache evicts after 5-10 min of inactivity, so a
+		// session that idles must be refreshed before then. When no explicit
+		// keep-alive is configured anywhere, default the OpenAI client to a
+		// 4-minute refresh so the prefix survives idle gaps (the only way to
+		// hold a near-100% hit rate on minutes-scale TTLs).
+		if (name == "openai" || strings.Contains(name, "openai")) && keepaliveSeconds == 0 &&
+			cfg.CacheKeepaliveSeconds == 0 {
+			keepaliveSeconds = 240
+		}
 		switch kind {
 		case "anthropic":
 			if p.APIKey == "" && p.BaseURL == "" {
@@ -424,13 +440,27 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 				continue
 			}
 			c := openai.New(name, p.APIKey, p.BaseURL)
-			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+			if p.RefreshToken != "" {
+				c.SetCodex(p.RefreshToken, p.AccountID, p.TokenExpiresAt, func(access, refresh string, expiresAt int64) {
+					if creds != nil {
+						_ = creds.SaveTokens(name, access, refresh, expiresAt)
+					}
+				})
+			}
+			c.SetKeepalive(time.Duration(keepaliveSeconds) * time.Second)
 			c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 			out[name] = c
 		default:
 			if p.BaseURL != "" {
 				c := openai.New(name, p.APIKey, p.BaseURL)
-				c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+				if p.RefreshToken != "" {
+					c.SetCodex(p.RefreshToken, p.AccountID, p.TokenExpiresAt, func(access, refresh string, expiresAt int64) {
+						if creds != nil {
+							_ = creds.SaveTokens(name, access, refresh, expiresAt)
+						}
+					})
+				}
+				c.SetKeepalive(time.Duration(keepaliveSeconds) * time.Second)
 				c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 				out[name] = c
 			}
@@ -438,7 +468,6 @@ func buildProviders(cfg config.Config) map[string]provider.Provider {
 	}
 	return out
 }
-
 func runTUI(dir string, o opts) error {
 	deps, err := buildDeps(dir, o)
 	if err != nil {
@@ -701,7 +730,12 @@ func modelsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			provs := buildProviders(loaded.Config)
+			var creds *config.Credentials
+			if c, cerr := config.LoadCredentials(); cerr == nil {
+				creds = c
+				config.MergeCredentials(&loaded.Config, creds)
+			}
+			provs := buildProviders(loaded.Config, creds)
 			if len(provs) == 0 {
 				return fmt.Errorf("no providers configured (set ANTHROPIC_API_KEY)")
 			}
@@ -785,8 +819,9 @@ func execCmd() *cobra.Command {
 				loaded.Config.Instructions = append(loaded.Config.Instructions, cavemanInstruction)
 			}
 			// Merge saved credentials.
-			creds, cerr := config.LoadCredentials()
-			if cerr == nil {
+			var creds *config.Credentials
+			if c, cerr := config.LoadCredentials(); cerr == nil {
+				creds = c
 				config.MergeCredentials(&loaded.Config, creds)
 				if loaded.Config.Model == "" {
 					for _, id := range creds.IDs() {
@@ -803,7 +838,7 @@ func execCmd() *cobra.Command {
 
 			// Resolve provider.
 			provID, modelID := config.SplitModel(loaded.Config.Model)
-			provs := buildProviders(loaded.Config)
+			provs := buildProviders(loaded.Config, creds)
 			prov, ok := provs[provID]
 			if !ok {
 				// Try later slash positions for multi-segment model ids.

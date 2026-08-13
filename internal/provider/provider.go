@@ -8,6 +8,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -163,10 +164,16 @@ const (
 //
 // DeepSeek-line endpoints (deepseek, opencode-zen, opencode-go) keep their
 // prefix cache for a day; Anthropic's ephemeral cache lives ~5 minutes (1h
-// with explicit long retention); OpenAI's requested retention is 24h. The
-// unknown-provider default is the conservative 5 minutes — re-warming is
-// cheap, a surprise cold re-bill is not.
+// with explicit long retention); OpenAI's in-memory policy evicts after 5-10
+// minutes (24h requested retention only pins a maximum, not a guaranteed
+// lifetime). The unknown-provider default is the conservative 5 minutes —
+// re-warming is cheap, a surprise cold re-bill is not.
 func DefaultCacheTTL(providerName string, retention CacheRetention) time.Duration {
+	if strings.Contains(providerName, "openai") {
+		// GPT-5.6+ is covered by CacheTTLForModel (30m guarantee); pre-5.6
+		// in-memory prefixes are evicted after 5-10 minutes of inactivity.
+		return 5 * time.Minute
+	}
 	switch retention {
 	case CacheRetentionLong:
 		if strings.Contains(providerName, "anthropic") {
@@ -180,6 +187,90 @@ func DefaultCacheTTL(providerName string, retention CacheRetention) time.Duratio
 		}
 		return 5 * time.Minute
 	}
+}
+
+// CacheTTLForModel is DefaultCacheTTL refined by the model id, for providers
+// whose cache lifetime varies by generation. Direct OpenAI GPT-5.6+ prefixes
+// are guaranteed at least 30 minutes (prompt_cache_options.ttl), so an idle
+// gap under that can reuse the warm prefix instead of re-priming.
+func CacheTTLForModel(providerName, modelID string, retention CacheRetention) time.Duration {
+	// Direct OpenAI GPT-5.6+: the explicit prompt_cache_options contract
+	// guarantees a 30-minute minimum, so idle gaps under that reuse the warm
+	// prefix. A gpt-5.6+ model on any other gateway has no such guarantee —
+	// the gateway does plain automatic prefix caching (rick sends no
+	// prompt_cache_options to non-OpenAI endpoints), so it gets the same
+	// conservative 5-minute default as any unknown automatic-cache provider.
+	if IsGPT56Model(modelID) {
+		if strings.Contains(providerName, "openai") {
+			return 30 * time.Minute
+		}
+		return 5 * time.Minute
+	}
+	// A custom gateway (e.g. commandcode) serving a DeepSeek model keeps the
+	// DeepSeek automatic prefix cache for a day — the provider name alone
+	// would fall through to the conservative 5-minute default and re-warm
+	// (and mislabel idle gaps) on a cache that is still warm.
+	if IsDeepSeekLine(providerName, modelID) {
+		return 24 * time.Hour
+	}
+	return DefaultCacheTTL(providerName, retention)
+}
+
+// IsGPT56Model reports whether the model id is in the GPT-5.6+ family, whose
+// prompt caching uses prompt_cache_options + explicit breakpoints instead of
+// the legacy prompt_cache_retention field. Pre-5.6 models reject the new
+// fields with a 400, so the gate must be exact (gpt-5.5 and plain gpt-5 are
+// 5.5/5.1-era and must not match).
+func IsGPT56Model(modelID string) bool {
+	id := strings.ToLower(modelID)
+	// Strip a provider prefix like "openai/" so "openai/gpt-5.6" matches.
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	for _, prefix := range []string{"gpt-5.6", "gpt-5.7", "gpt-5.8", "gpt-5.9"} {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	// "gpt-5.10+" and future 5.x minors at or past 5.6, but never "gpt-5.5"
+	// or plain "gpt-5". Parse the minor when it is numeric.
+	if strings.HasPrefix(id, "gpt-5.") {
+		rest := id[len("gpt-5."):]
+		minor := 0
+		if _, err := fmt.Sscanf(rest, "%d", &minor); err == nil && minor >= 6 {
+			return true
+		}
+	}
+	return false
+}
+
+// IsDeepSeekModel reports whether the model id is in the DeepSeek family
+// ("deepseek-v4-*", "deepseek-chat", "deepseek-reasoner", ...). Custom
+// OpenAI-compatible gateways (e.g. commandcode) serve DeepSeek models under
+// their own provider id while keeping the DeepSeek model namespace, so the
+// wire dialect and cache behavior must be detected from the model id too —
+// not just from the provider name.
+func IsDeepSeekModel(modelID string) bool {
+	id := strings.ToLower(modelID)
+	// Strip a provider prefix like "deepseek/" so "deepseek/deepseek-v4" and
+	// "accounts/fireworks/models/deepseek-v4" both match on the tail.
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	return strings.HasPrefix(id, "deepseek")
+}
+
+// IsDeepSeekLine reports whether the provider id or model id indicates a
+// DeepSeek-line endpoint (provider "deepseek", opencode-zen/go, or a custom
+// gateway serving a "deepseek/*" model). These read max_tokens rather than
+// max_completion_tokens and keep an append-only reasoning prompt for their
+// automatic prefix cache.
+func IsDeepSeekLine(providerID, modelID string) bool {
+	switch providerID {
+	case "deepseek", "opencode-zen", "opencode-go":
+		return true
+	}
+	return IsDeepSeekModel(modelID)
 }
 
 // Request is a single completion request.
@@ -273,11 +364,12 @@ type Event struct {
 type ContextSource string
 
 const (
-	ContextSourceUnknown  ContextSource = ""
-	ContextSourceAPI      ContextSource = "api"
-	ContextSourceCatalog  ContextSource = "catalog"
-	ContextSourceInferred ContextSource = "inferred"
-	ContextSourceBuiltin  ContextSource = "builtin"
+	ContextSourceUnknown    ContextSource = ""
+	ContextSourceAPI        ContextSource = "api"
+	ContextSourceCatalog    ContextSource = "catalog"
+	ContextSourceConfigured ContextSource = "configured"
+	ContextSourceInferred   ContextSource = "inferred"
+	ContextSourceBuiltin    ContextSource = "builtin"
 )
 
 // ModelInfo is a model advertised by a provider.
@@ -333,4 +425,12 @@ type ModelLister interface {
 // best-effort: the agent logs and continues.
 type CacheWarmber interface {
 	Warm(ctx context.Context, req Request) error
+}
+
+// KeepaliveColdCounter is optionally implemented by providers whose keep-alive
+// loop can observe a cold prefix (the provider evicted the session cache
+// despite the loop). The count is surfaced so a provider that keeps going cold
+// under load is visible and its keep-alive interval tunable.
+type KeepaliveColdCounter interface {
+	ColdKeepalives() int64
 }
