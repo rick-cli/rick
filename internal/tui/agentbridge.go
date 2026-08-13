@@ -15,7 +15,11 @@ import (
 	"rick/internal/agent"
 	"rick/internal/cache"
 	"rick/internal/config"
+	"rick/internal/distill"
 	"rick/internal/glob"
+	"rick/internal/memory"
+	"rick/internal/prefixstore"
+
 	"rick/internal/permission"
 	"rick/internal/plugin"
 	"rick/internal/provider"
@@ -34,6 +38,112 @@ func agentArchiveDir(store *session.Store) string {
 	return filepath.Join(store.Dir(), "archive")
 }
 
+// agentDistillOptions builds the distillation fold policy for one run from
+// the resolved per-model policy table: DistillRatio is the share of the
+// oldest history actually distilled (a retain ratio maps to 1-retain, since
+// distillablePrefix folds messages up to len*ratio). Zero values inherit the
+// package default (oldest 40%).
+func agentDistillOptions(cfg config.Config, providerID, modelID string) distill.Options {
+	retainRatio := cfg.DistillRetainRatioFor(providerID, modelID)
+	opts := distill.Options{}
+	if retainRatio > 0 {
+		opts.DistillRatio = 1 - retainRatio
+	}
+	// Token-priced live tail (harness-style token-meter): when configured,
+	// the newest messages kept after the fold cost at most this many tokens,
+	// so the surviving tail stays inside the provider's cached region.
+	opts.LiveZoneTokens = cfg.DistillLiveZoneTokensFor(providerID, modelID)
+	return opts
+}
+
+// loadCrossSessionPrefix returns the pinned goal-state snapshot from a
+// previous session for the same (project, model, agent), if cross-session
+// memory is enabled and a pin exists. The snapshot becomes the first user
+// message of the new session, so the byte-stable prefix (system + tools +
+// snippet) stays warm across sessions instead of re-priming cold.
+func (m *Model) loadCrossSessionPrefix(agentName, modelID string) *provider.Message {
+	if m.sess != nil || !m.deps.CrossSessionMemoryEnabled() {
+		return nil
+	}
+	key := prefixstore.LoadKey(m.deps.Cwd, modelID, agentName)
+	snap, ok := m.deps.PrefixStore.LoadPinned(key)
+	if !ok || strings.TrimSpace(snap.Text) == "" {
+		return nil
+	}
+	m.appendMsg(ChatMsg{Kind: MsgSystem,
+		Text: fmt.Sprintf("cross-session cache reuse: loaded goal-state snapshot (%d messages covered)", snap.MessageCount),
+		Time: time.Now()})
+	msg := provider.UserText(snap.Text)
+	return &msg
+}
+
+// persistCrossSessionSnapshot derives the deterministic goal-state snapshot
+// from the current transcript and pins it under the (project, model, agent)
+// load key, so the next session for the same route can reuse the warm prefix.
+// Best-effort: a failure never blocks the session save.
+func (m *Model) persistCrossSessionSnapshot() {
+	if !m.deps.CrossSessionMemoryEnabled() || len(m.history) == 0 {
+		return
+	}
+	likes := make([]memory.MessageLike, 0, len(m.history))
+	for _, message := range m.history {
+		likes = append(likes, memory.MessageLike{
+			Role:    message.Role,
+			Text:    message.Text(),
+			IsError: messageHasErrorBlock(message),
+		})
+	}
+	snap := memory.Derive(likes, memory.Options{})
+	key := prefixstore.LoadKey(m.deps.Cwd, m.modelID, m.agentName)
+	if _, err := m.deps.PrefixStore.PutSnapshot(snap); err != nil {
+		return
+	}
+	_ = m.deps.PrefixStore.Pin(key, snap.ID)
+}
+
+// messageHasErrorBlock reports whether any tool_result block of a message is
+// an error, so the snapshot can surface failures.
+func messageHasErrorBlock(message provider.Message) bool {
+	for _, block := range message.Content {
+		if block.Type == "tool_result" && block.IsError {
+			return true
+		}
+	}
+	return false
+}
+
+// cacheStrategyFor resolves the pluggable prompt-cache strategy for a
+// provider/model route. A cache_strategies config entry wins; otherwise a
+// plugin CacheStrategyHook; otherwise nil (the runner uses the flat knobs).
+func (m *Model) cacheStrategyFor(providerID, modelID, retention string, ttlSeconds int, warm, warmTurn bool) provider.CacheStrategy {
+	cfg := m.deps.Loaded.Config
+	strategyName, strategyRetention, strategyTTL, strategyKeepalive, strategyWarm, strategyWarmTurn, strategyPassback, strategyMaxReasoning, strategyDivergence := cfg.CacheStrategyFor(providerID, modelID)
+	hasConfigEntry := strategyName != "" || strategyRetention != retention || strategyTTL != ttlSeconds ||
+		strategyWarm != warm || strategyWarmTurn != warmTurn || strategyPassback ||
+		strategyMaxReasoning > 0 || strategyKeepalive > 0 || strategyDivergence != ""
+	if hasConfigEntry {
+		return provider.DefaultStrategy{
+			NameVal:         strategyName,
+			RetentionVal:    provider.CacheRetention(strategyRetention),
+			TTLVal:          time.Duration(strategyTTL) * time.Second,
+			KeepaliveVal:    time.Duration(strategyKeepalive) * time.Second,
+			WarmVal:         strategyWarm,
+			WarmTurnVal:     strategyWarmTurn,
+			PassbackVal:     strategyPassback,
+			MaxReasoningVal: strategyMaxReasoning,
+			DivergenceVal:   strategyDivergence,
+		}
+	}
+	if m.deps.Plugins != nil {
+		if candidate := m.deps.Plugins.CacheStrategyHooks(providerID, modelID); candidate != nil {
+			if strategy, ok := candidate.(provider.CacheStrategy); ok {
+				return strategy
+			}
+		}
+	}
+	return nil
+}
+
 // startAgent kicks off a run and returns the drain command.
 //
 // The goroutine NEVER touches *Model — it only writes to m.agentCh, which the
@@ -47,6 +157,16 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 
 	if prompt != "" {
 		m.history = append(m.history, provider.UserText(prompt))
+	}
+
+	// Cross-session cache reuse: for a brand-new session (no resumed sess)
+	// on a route that has a pinned snapshot from a previous session, inject
+	// the snapshot as the leading user message so the byte-stable prefix
+	// stays warm across sessions.
+	if len(m.history) == 1 && m.agentName != "" && m.modelID != "" {
+		if snapshot := m.loadCrossSessionPrefix(m.agentName, m.modelID); snapshot != nil {
+			m.history = append([]provider.Message{*snapshot}, m.history...)
+		}
 	}
 
 	ch := make(chan agent.Event, 128)
@@ -78,7 +198,7 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 	cfg.Instructions = append([]string(nil), cfg.Instructions...)
 	// Per-provider cache policy: the active provider's overrides (or global
 	// defaults) drive retention/TTL/warm for this run.
-	cacheRetention, cacheTTLSeconds, _, cacheWarm := cfg.CacheForProvider(prov.Name())
+	cacheRetention, cacheTTLSeconds, _, cacheWarm, cacheWarmTurn := cfg.CacheForProvider(prov.Name())
 	agentName := m.agentName
 	reasoning := m.reasoning
 	cwd := m.deps.Cwd
@@ -99,39 +219,69 @@ func (m *Model) startAgent(prompt string) tea.Cmd {
 	skills := m.deps.Skills
 	stableSystem, systemPrompt := m.sessionSystemParts(agentName, modelID, cwd, projectRoot, cfg, skills)
 	schemas := m.pinnedToolSchemas()
+	// Durable request-header epoch: freeze the exact bytes this run routes
+	// with so saveSession can persist them and a resume can prove the
+	// provider prefix is byte-identical (or detect drift).
+	m.sessionEpoch = session.EpochHeader{
+		Model:        modelID,
+		System:       systemPrompt,
+		SystemStable: stableSystem,
+		Tools:        append([]provider.ToolSchema(nil), schemas...),
+		Hash:         agent.CacheScopeKeyFor(modelID, stableSystem, schemas),
+	}
+	// A resumed session carries the durable epoch of its last run; feed it
+	// to the runner so a header drift (repo-map block changed with cwd,
+	// model switched, tools changed) is detected up front and re-warmed
+	// instead of silently cold-starting a new cache bucket.
+	var priorEpoch *session.EpochHeader
+	if m.sess != nil && m.sess.Epoch.Hash != "" {
+		epochCopy := m.sess.Epoch
+		priorEpoch = &epochCopy
+	}
+	// Pluggable cache strategy: a cache_strategies config entry for this
+	// route wins; otherwise a plugin CacheStrategyHook; otherwise the flat
+	// per-provider knobs resolved above.
+	cacheStrategy := m.cacheStrategyFor(prov.Name(), modelID, cacheRetention, cacheTTLSeconds, cacheWarm, cacheWarmTurn)
 	go func() {
 		runner := agent.New(agent.Config{
-			Provider:           prov,
-			Model:              modelID,
-			System:             systemPrompt,
-			SystemStable:       stableSystem,
-			MaxTokens:          cfg.MaxTokens,
-			Reasoning:          reasoning,
-			Tools:              registry,
-			ToolFilter:         toolFilter,
-			Perms:              perms,
-			Ask:                ask,
-			Cwd:                cwd,
-			SessionID:          sessionID,
-			AgentName:          agentName,
-			AgentID:            agentID,
-			Registry:           m.deps.AgentRegistry,
-			Snapshotter:        snapshotter,
-			Plugins:            plugins,
-			Parallel:           true,
-			Goals:              m.deps.Goals,
-			Budget:             m.deps.Budget,
-			RepoMapRoot:        projectRoot,
-			RepoMapBlock:       m.sessionRepoMap(projectRoot, modelID),
-			EnableDistillation: cfg.DistillEnabled != nil && *cfg.DistillEnabled,
-			DistillModel:       cfg.DistillModelFor(),
-			CacheRetention:     provider.CacheRetention(cacheRetention),
-			CacheTTLSeconds:    cacheTTLSeconds,
-			WarmCache:          cacheWarm,
-			MaxReasoningTurns:  cfg.CacheMaxReasoningTurns,
-			MaxToolResultBytes: cfg.CacheMaxToolResultBytes,
-			PinnedToolSchemas:  schemas,
-			ArchiveDir:         agentArchiveDir(m.deps.Store),
+			Provider:                prov,
+			Model:                   modelID,
+			System:                  systemPrompt,
+			SystemStable:            stableSystem,
+			MaxTokens:               cfg.MaxTokens,
+			Reasoning:               reasoning,
+			Tools:                   registry,
+			ToolFilter:              toolFilter,
+			Perms:                   perms,
+			Ask:                     ask,
+			Cwd:                     cwd,
+			SessionID:               sessionID,
+			AgentName:               agentName,
+			AgentID:                 agentID,
+			Registry:                m.deps.AgentRegistry,
+			Snapshotter:             snapshotter,
+			Plugins:                 plugins,
+			Parallel:                true,
+			Goals:                   m.deps.Goals,
+			Budget:                  m.deps.Budget,
+			RepoMapRoot:             projectRoot,
+			RepoMapBlock:            m.sessionRepoMap(projectRoot, modelID),
+			EnableDistillation:      cfg.DistillEnabled != nil && *cfg.DistillEnabled,
+			DistillModel:            cfg.DistillModelFor(),
+			DistillOptions:          agentDistillOptions(cfg, prov.Name(), modelID),
+			DistillThresholdPercent: cfg.DistillThresholdPercentFor(prov.Name(), modelID),
+			CacheRetention:          provider.CacheRetention(cacheRetention),
+			CacheTTLSeconds:         cacheTTLSeconds,
+			WarmCache:               cacheWarm,
+			WarmTurn:                cacheWarmTurn,
+			CacheStrategy:           cacheStrategy,
+			PassbackReasoning:       cfg.PassbackReasoningFor(prov.Name()),
+			MaxReasoningTurns:       cfg.CacheMaxReasoningTurns,
+			MaxToolResultBytes:      cfg.CacheMaxToolResultBytes,
+			SpillBytes:              cfg.CacheSpillBytes,
+			PinnedToolSchemas:       schemas,
+			PriorEpoch:              priorEpoch,
+			ArchiveDir:              agentArchiveDir(m.deps.Store),
 		})
 		appended, _ := runner.Run(ctx, history, ch)
 		// Results are delivered through the channel; the appended slice is
@@ -267,10 +417,45 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 
 	case agent.EvCacheDivergence:
 		if ev.Divergence != nil {
+			where := fmt.Sprintf("%s;%s", ev.Divergence.Kind, ev.Divergence.Reason)
 			if ev.Divergence.Index >= 0 {
-				m.pendingDivergence = fmt.Sprintf("%s@%d;%s", ev.Divergence.Kind, ev.Divergence.Index, ev.Divergence.Reason)
-			} else {
-				m.pendingDivergence = fmt.Sprintf("%s;%s", ev.Divergence.Kind, ev.Divergence.Reason)
+				where = fmt.Sprintf("%s@%d;%s", ev.Divergence.Kind, ev.Divergence.Index, ev.Divergence.Reason)
+			}
+			// Surface the estimated still-cached prefix when the rewrite is
+			// only partial (the provider keeps the surviving blocks): a
+			// mid-prefix change that keeps >4K tokens cached is a different
+			// class of miss than a total cold re-bill.
+			if ev.Divergence.CachedPrefixTokens >= agent.CachePrefixWarnTokens {
+				where += fmt.Sprintf(";cached~%d", ev.Divergence.CachedPrefixTokens)
+			}
+			m.pendingDivergence = where
+		}
+
+	case agent.EvCacheBoundary:
+		// A deliberate cache boundary (prune/distill commit or shadow-price
+		// deferral) is a planned, at-most-once invalidation — record it on
+		// the pending request telemetry so the audit trail shows why a
+		// prefix was rewritten (or deliberately not).
+		if ev.Boundary != nil {
+			m.pendingBoundary = ev.Boundary
+			// Durable per-node shadow-price ledger (harness-style
+			// compaction/prune event): persist every replaced tool result's
+			// content address + sizes so a pruned result stays replay-safe
+			// from the content-addressed store.
+			if ev.Boundary.Transform == "tool-prune" && ev.Boundary.Committed && m.sess != nil {
+				for _, original := range ev.Boundary.Originals {
+					if original.ContentHash == "" {
+						continue
+					}
+					m.sess.Prunes = append(m.sess.Prunes, session.PruneRecord{
+						Time:        time.Now().Format(time.RFC3339Nano),
+						ToolUseID:   original.ToolUseID,
+						ContentHash: original.ContentHash,
+						OriginalLen: original.OriginalLen,
+						SummaryLen:  original.SummaryLen,
+						Request:     m.requestSeq + 1, // the pending request's index
+					})
+				}
 			}
 		}
 
@@ -299,6 +484,13 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 			// cache-hit/miss behavior can be measured from the session file.
 			if m.sess != nil {
 				m.requestSeq++
+				boundary := ""
+				if m.pendingBoundary != nil {
+					boundary = m.pendingBoundary.Transform + ";" + map[bool]string{true: "committed", false: "deferred"}[m.pendingBoundary.Committed]
+					if m.pendingBoundary.Reason != "" {
+						boundary += ";" + m.pendingBoundary.Reason
+					}
+				}
 				m.sess.Requests = append(m.sess.Requests, session.RequestUsage{
 					Index:            m.requestSeq,
 					Agent:            m.agentName,
@@ -310,8 +502,10 @@ func (m *Model) applyAgentEvent(ev agent.Event) (tea.Cmd, bool) {
 					Eviction:         eviction,
 					ReasoningTokens:  ev.ReasoningTokens,
 					ResponseCacheHit: ev.Usage.ResponseCacheHit,
+					Boundary:         boundary,
 				})
 				m.pendingDivergence = ""
+				m.pendingBoundary = nil
 			}
 			if m.deps.Usage != nil {
 				_ = m.deps.Usage.Record(m.modelID,
@@ -419,7 +613,7 @@ func (m *Model) observeCacheUsage(u *provider.Usage) string {
 func (m *Model) cacheTTL() time.Duration {
 	provID, modelID := config.SplitModel(m.modelID)
 	if m.deps.Loaded != nil {
-		retention, ttlSeconds, _, _ := m.deps.Loaded.Config.CacheForProvider(provID)
+		retention, ttlSeconds, _, _, _ := m.deps.Loaded.Config.CacheForProvider(provID)
 		if ttlSeconds > 0 {
 			return time.Duration(ttlSeconds) * time.Second
 		}
@@ -529,6 +723,12 @@ func (m *Model) finishRun(err error) tea.Cmd {
 		if compactCmd != nil {
 			m.lastAutoCompact = time.Now()
 		}
+		return compactCmd
+	}
+	if m.compactQueued {
+		// The user's queued /compact runs now that the turn is idle.
+		m.compactQueued = false
+		_, compactCmd := m.cmdCompact()
 		return compactCmd
 	}
 	return nil

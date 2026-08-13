@@ -63,3 +63,35 @@ func TestCacheTTLCommandcodeDeepseek(t *testing.T) {
 		t.Fatalf("cacheTTL() for bare deepseek-v4-pro = %v, want 24h", got)
 	}
 }
+
+// TestCacheTTLAdaptsToObservedEvictionGap pins the adaptive warm threshold
+// (Step 1): once a run provably evicted the provider prefix after an idle gap
+// of G, cacheTTL() drops to ~90% of G so the next re-warm fires before the
+// eviction point — beating both the vendor table and an explicit override,
+// because the override is a static guess while the observed gap is measured.
+func TestCacheTTLAdaptsToObservedEvictionGap(t *testing.T) {
+	runner := New(Config{
+		Model:           "deepseek/deepseek-v4-flash",
+		CacheRetention:  provider.CacheRetentionLong,
+		CacheTTLSeconds: 3600, // static override says "an hour"
+	})
+	// Baseline: the explicit override wins before any observation.
+	if got := runner.cacheTTL(); got != time.Hour {
+		t.Fatalf("cacheTTL() before observation = %v, want the 1h override", got)
+	}
+	// A 90-second idle gap provably evicted the prefix.
+	runner.observedEvictionGap = 90 * time.Second
+	if got := runner.cacheTTL(); got != 81*time.Second {
+		t.Fatalf("cacheTTL() after 90s eviction gap = %v, want 81s (90%% margin)", got)
+	}
+	// A shorter observed gap tightens further.
+	runner.observedEvictionGap = 30 * time.Second
+	if got := runner.cacheTTL(); got != 27*time.Second {
+		t.Fatalf("cacheTTL() after 30s eviction gap = %v, want 27s", got)
+	}
+	// Sub-second gaps floor at 1s.
+	runner.observedEvictionGap = 500 * time.Millisecond
+	if got := runner.cacheTTL(); got != time.Second {
+		t.Fatalf("cacheTTL() after 500ms gap = %v, want the 1s floor", got)
+	}
+}

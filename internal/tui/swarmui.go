@@ -134,7 +134,7 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	cacheRetention, _, _, cacheWarm := m.deps.Loaded.Config.CacheForProvider(prov.Name())
+	cacheRetention, _, _, cacheWarm, cacheWarmTurn := m.deps.Loaded.Config.CacheForProvider(prov.Name())
 	for i := range msg.agents {
 		msg.agents[i].Name = strings.TrimSpace(msg.agents[i].Name)
 		msg.agents[i].Role = strings.TrimSpace(msg.agents[i].Role)
@@ -218,7 +218,9 @@ func (m *Model) beginSwarm(msg swarmStartMsg) (*swarmRunPlan, error) {
 			Depth: 1, MaxTurns: 0, Parallel: true, // unlimited; the repeated-call guard still stops loops
 			CacheRetention:     provider.CacheRetention(cacheRetention),
 			WarmCache:          cacheWarm,
+			WarmTurn:           cacheWarmTurn,
 			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
+			PassbackReasoning:  m.deps.Loaded.Config.PassbackReasoningFor(prov.Name()),
 			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
 		}
 		cfg = inheritSwarmWorkerRuntime(cfg, snapshotter, m.deps.Plugins, m.deps.Goals)

@@ -94,7 +94,9 @@ func TestPerProviderCacheConfig(t *testing.T) {
 				"cache_retention": "none",
 				"cache_ttl_seconds": 30,
 				"cache_keepalive_seconds": 240,
-				"cache_warm": false
+				"cache_warm": false,
+				"cache_warm_turn": true,
+				"cache_passback_reasoning": true
 			}
 		}
 	}`), "", "probe.json")
@@ -120,18 +122,25 @@ func TestPerProviderCacheConfig(t *testing.T) {
 	}
 
 	// CacheForProvider resolves the override for openai.
-	retention, ttl, keepalive, warm := c.CacheForProvider("openai")
-	if retention != "none" || ttl != 30 || keepalive != 240 || warm {
-		t.Fatalf("openai resolved = (%q,%d,%d,%v), want (none,30,240,false)", retention, ttl, keepalive, warm)
+	retention, ttl, keepalive, warm, warmTurn := c.CacheForProvider("openai")
+	if retention != "none" || ttl != 30 || keepalive != 240 || warm || !warmTurn {
+		t.Fatalf("openai resolved = (%q,%d,%d,%v,%v), want (none,30,240,false,true)", retention, ttl, keepalive, warm, warmTurn)
+	}
+	// PassbackReasoningFor resolves the per-provider override too.
+	if !c.PassbackReasoningFor("openai") {
+		t.Fatal("openai passback_reasoning should be true")
+	}
+	if c.PassbackReasoningFor("deepseek") {
+		t.Fatal("deepseek passback_reasoning should inherit the global default (false)")
 	}
 	// deepseek has no override -> global values.
-	retention, ttl, keepalive, warm = c.CacheForProvider("deepseek")
-	if retention != "long" || ttl != 300 || keepalive != 120 || !warm {
-		t.Fatalf("deepseek resolved = (%q,%d,%d,%v), want (long,300,120,true)", retention, ttl, keepalive, warm)
+	retention, ttl, keepalive, warm, warmTurn = c.CacheForProvider("deepseek")
+	if retention != "long" || ttl != 300 || keepalive != 120 || !warm || warmTurn {
+		t.Fatalf("deepseek resolved = (%q,%d,%d,%v,%v), want (long,300,120,true,false)", retention, ttl, keepalive, warm, warmTurn)
 	}
 	// Unknown provider -> global values.
-	retention, ttl, keepalive, warm = c.CacheForProvider("nope")
-	if retention != "long" || ttl != 300 || keepalive != 120 || !warm {
-		t.Fatalf("unknown resolved = (%q,%d,%d,%v), want globals", retention, ttl, keepalive, warm)
+	retention, ttl, keepalive, warm, warmTurn = c.CacheForProvider("nope")
+	if retention != "long" || ttl != 300 || keepalive != 120 || !warm || warmTurn {
+		t.Fatalf("unknown resolved = (%q,%d,%d,%v,%v), want globals", retention, ttl, keepalive, warm, warmTurn)
 	}
 }

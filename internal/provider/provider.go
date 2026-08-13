@@ -216,6 +216,27 @@ func CacheTTLForModel(providerName, modelID string, retention CacheRetention) ti
 	return DefaultCacheTTL(providerName, retention)
 }
 
+// KeepaliveAdaptiveFloor derives the adaptive keep-alive floor from the
+// configured keep-alive and cache-TTL seconds: the loop must never fall below
+// the point where the provider's cache expires, so the floor is half the TTL
+// (capped at the keep-alive itself) with a small absolute minimum. Zero when
+// either knob is unset — the caller keeps the interval fixed.
+func KeepaliveAdaptiveFloor(keepaliveSeconds, ttlSeconds int) time.Duration {
+	if keepaliveSeconds <= 0 || ttlSeconds <= 0 {
+		return 0
+	}
+	keepalive := time.Duration(keepaliveSeconds) * time.Second
+	floor := time.Duration(ttlSeconds) * time.Second / 2
+	if floor > keepalive {
+		floor = keepalive
+	}
+	const minFloor = 5 * time.Second
+	if floor < minFloor {
+		floor = minFloor
+	}
+	return floor
+}
+
 // IsGPT56Model reports whether the model id is in the GPT-5.6+ family, whose
 // prompt caching uses prompt_cache_options + explicit breakpoints instead of
 // the legacy prompt_cache_retention field. Pre-5.6 models reject the new
@@ -305,6 +326,15 @@ type Request struct {
 	// but costs one cache invalidation. Tune with the per-request telemetry
 	// (session "requests") to find the local optimum.
 	MaxReasoningTurns int
+	// PassbackReasoning is the DeepSeek reasoning-passback rule. When true,
+	// reasoning_content is echoed back only for assistant turns that carried
+	// tool calls (the exchange the API demands it for); reasoning from
+	// tool-call-free turns is dropped — those turns are ignored anyway, so
+	// the fresh tail shrinks without rewriting the cached prefix. When
+	// false (default), every turn's reasoning is echoed so the serialized
+	// prefix stays byte-identical and append-only, which is cache-optimal
+	// when the provider bills cached reasoning cheaply.
+	PassbackReasoning bool
 	// SessionID names the session for session-keyed prompt caches and
 	// session-affinity routing hints. Stable across resume so a restarted
 	// session keeps hitting the same cache.
@@ -316,7 +346,33 @@ type Request struct {
 	// identical runs share a warm bucket while separate conversations never
 	// collide. Empty falls back to SessionID.
 	CacheScopeKey string
+	// EpochHash is the content-addressed identity of this request's frozen
+	// header (model + stable system prefix + canonical tool list). It is the
+	// epoch-scoped cache key that survives resume: a restarted session with
+	// an identical stable head derives the same hash and routes to the same
+	// provider cache bucket (mirrors the harness's request-header epoch).
+	EpochHash string
+	// Purpose names the traffic class of this request so providers can
+	// attribute it and telemetry can separate cache-maintenance calls
+	// (warm, keep-alive, distill) from real turns. Empty means a normal
+	// streaming turn. Providers that expose attribution on the wire forward
+	// it as a header; the value never changes the request body bytes, so the
+	// cached prefix is unaffected.
+	Purpose RequestPurpose
 }
+
+// RequestPurpose names the traffic class of a provider request. It rides as
+// wire attribution only — never in the message body — so adding it cannot
+// invalidate a cached prefix.
+type RequestPurpose string
+
+// Request purposes.
+const (
+	PurposeTurn      RequestPurpose = ""        // normal streaming turn
+	PurposeWarm      RequestPurpose = "warm"    // session-start cache prime
+	PurposeKeepalive RequestPurpose = "keepalive" // idle-gap cache refresh
+	PurposeDistill   RequestPurpose = "distill" // background compaction summary call
+)
 
 // Usage reports token accounting for a turn.
 type Usage struct {
@@ -433,4 +489,91 @@ type CacheWarmber interface {
 // under load is visible and its keep-alive interval tunable.
 type KeepaliveColdCounter interface {
 	ColdKeepalives() int64
+}
+
+// CacheStrategy is the pluggable prompt-cache policy for one run. A strategy
+// answers every prompt-cache question the agent loop asks, so swapping the
+// strategy (per provider, per model, or from a harness) changes cache
+// behaviour without touching the loop. The zero strategy is not usable;
+// use DefaultStrategy.
+type CacheStrategy interface {
+	// Name identifies the strategy for telemetry and /stats.
+	Name() string
+	// Retention returns the provider prompt-cache retention policy.
+	Retention() CacheRetention
+	// CacheTTL is how long a warm prefix is assumed to survive at the
+	// provider before an idle gap forces a re-warm.
+	CacheTTL() time.Duration
+	// KeepaliveInterval is the prompt-cache keep-alive interval (0 disables).
+	KeepaliveInterval() time.Duration
+	// WarmCache reports whether a session-start warm request should prime
+	// the frozen system+tools prefix before the first real turn.
+	WarmCache() bool
+	// WarmTurn reports whether the full prefix is re-primed before every
+	// real turn (for providers that evict mid-session).
+	WarmTurn() bool
+	// MaxReasoningTurns caps how many prior turns' reasoning blocks are
+	// echoed to a DeepSeek-line provider (0 = keep all).
+	MaxReasoningTurns() int
+	// PassbackReasoning enables the DeepSeek reasoning-passback rule:
+	// reasoning_content is echoed only for assistant turns that carried
+	// tool calls; tool-call-free reasoning is dropped.
+	PassbackReasoning() bool
+	// DivergenceReason overrides the classified cause of a provider-prefix
+	// divergence. Return "" to keep the runner's own inference.
+	DivergenceReason() string
+}
+
+// DefaultStrategy implements CacheStrategy from the flat cache knobs every
+// run already carries. It is the strategy used when no custom strategy is
+// configured, so existing behaviour is unchanged.
+type DefaultStrategy struct {
+	NameVal         string
+	RetentionVal    CacheRetention
+	TTLVal          time.Duration
+	KeepaliveVal    time.Duration
+	WarmVal         bool
+	WarmTurnVal     bool
+	MaxReasoningVal int
+	PassbackVal     bool
+	DivergenceVal   string
+}
+
+func (s DefaultStrategy) Name() string {
+	if s.NameVal == "" {
+		return "default"
+	}
+	return s.NameVal
+}
+func (s DefaultStrategy) Retention() CacheRetention        { return s.RetentionVal }
+func (s DefaultStrategy) CacheTTL() time.Duration          { return s.TTLVal }
+func (s DefaultStrategy) KeepaliveInterval() time.Duration { return s.KeepaliveVal }
+func (s DefaultStrategy) WarmCache() bool                  { return s.WarmVal }
+func (s DefaultStrategy) WarmTurn() bool                   { return s.WarmTurnVal }
+func (s DefaultStrategy) MaxReasoningTurns() int           { return s.MaxReasoningVal }
+func (s DefaultStrategy) PassbackReasoning() bool          { return s.PassbackVal }
+func (s DefaultStrategy) DivergenceReason() string         { return s.DivergenceVal }
+
+// StrategyRegistry holds named CacheStrategies for a run. A custom strategy
+// configured for the active provider/model wins; otherwise the default
+// strategy carries the flat knobs.
+type StrategyRegistry struct {
+	// Default is the strategy used when no named strategy matches.
+	Default CacheStrategy
+	// ByProvider maps a provider id (or "provider/model") to a strategy.
+	ByProvider map[string]CacheStrategy
+}
+
+// For returns the strategy for a provider/model route.
+func (r *StrategyRegistry) For(providerID, modelID string) CacheStrategy {
+	if r == nil {
+		return nil
+	}
+	if s, ok := r.ByProvider[providerID+"/"+modelID]; ok {
+		return s
+	}
+	if s, ok := r.ByProvider[providerID]; ok {
+		return s
+	}
+	return r.Default
 }

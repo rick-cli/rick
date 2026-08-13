@@ -238,3 +238,44 @@ func TestCancelCompactionInvalidatesLateResult(t *testing.T) {
 		t.Fatalf("cancelCompaction state = active:%v run:%d cancelled:%v", model.compactionActive, model.compactionRunID, cancelled)
 	}
 }
+
+// TestCompactSurfaceStabilityPinsHarnessRecheck pins the harness-style
+// surface-stability re-check: the compact snapshot matches the live head when
+// nothing changed, and mismatches when the conversation grew while the
+// summarizer ran — so the commit is rejected against a stale span.
+func TestCompactSurfaceStabilityPinsHarnessRecheck(t *testing.T) {
+	history := []provider.Message{
+		provider.UserText("turn 1"),
+		provider.AssistantText("reply 1"),
+		provider.UserText("turn 2"),
+		provider.AssistantText("reply 2"),
+		provider.UserText("turn 3"),
+		provider.AssistantText("reply 3"),
+		provider.UserText("current"),
+	}
+	snapshot := compactSurfaceSnapshot(history)
+	if snapshot == "" {
+		t.Fatal("compact snapshot is empty for a multi-message history")
+	}
+	if !compactSurfaceStable(snapshot, history) {
+		t.Fatal("identical history reported unstable")
+	}
+	// The conversation grew while the summarizer ran: the head (oldest
+	// len-keep messages) is unchanged, so the snapshot still matches — only
+	// the tail grew, which is append-only and cache-safe.
+	grown := append(append([]provider.Message(nil), history...), provider.UserText("new question"))
+	if !compactSurfaceStable(snapshot, grown) {
+		t.Fatal("append-only growth should keep the compaction span stable")
+	}
+	// The head changed (a message was inserted mid-history while the
+	// summarizer ran): the snapshot no longer matches, rejecting the commit.
+	changed := append([]provider.Message(nil), history...)
+	changed[0] = provider.UserText("rewritten turn 1")
+	if compactSurfaceStable(snapshot, changed) {
+		t.Fatal("rewritten head reported stable; the compaction span moved")
+	}
+	// Tiny history: no snapshot, always stable (nothing to verify).
+	if !compactSurfaceStable("", history[:3]) {
+		t.Fatal("empty snapshot should be trivially stable")
+	}
+}

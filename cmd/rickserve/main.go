@@ -546,7 +546,11 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
 			}
-			out[name] = anthropic.New(p.APIKey, p.BaseURL)
+			c := anthropic.New(p.APIKey, p.BaseURL)
+			c.SetKeepaliveAdaptive(
+				time.Duration(cfg.CacheKeepaliveSeconds)*time.Second,
+				provider.KeepaliveAdaptiveFloor(cfg.CacheKeepaliveSeconds, cfg.CacheTTLSeconds))
+			out[name] = c
 		case "openai", "openrouter", "groq", "deepseek", "together", "openai-compatible":
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
@@ -559,7 +563,9 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 					}
 				})
 			}
-			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+			c.SetKeepaliveAdaptive(
+				time.Duration(cfg.CacheKeepaliveSeconds)*time.Second,
+				provider.KeepaliveAdaptiveFloor(cfg.CacheKeepaliveSeconds, cfg.CacheTTLSeconds))
 			c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 			out[name] = c
 		default:
@@ -572,7 +578,9 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 						}
 					})
 				}
-				c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+				c.SetKeepaliveAdaptive(
+				time.Duration(cfg.CacheKeepaliveSeconds)*time.Second,
+				provider.KeepaliveAdaptiveFloor(cfg.CacheKeepaliveSeconds, cfg.CacheTTLSeconds))
 				c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 				out[name] = c
 			}
@@ -1799,7 +1807,7 @@ func (s *server) handleRun(ctx context.Context, req Request, out responseEmitter
 		out.emit(Response{Type: "error", SessionID: sid, Error: err.Error()})
 		return
 	}
-	cacheRetention, cacheTTLSeconds, _, cacheWarm := s.loaded.Config.CacheForProvider(prov.Name())
+	cacheRetention, cacheTTLSeconds, _, cacheWarm, cacheWarmTurn := s.loaded.Config.CacheForProvider(prov.Name())
 	models := s.modelsForProvider(prov.Name(), prov)
 	thinking := req.Thinking
 	if thinking == "" {
@@ -1995,8 +2003,11 @@ func (s *server) handleRun(ctx context.Context, req Request, out responseEmitter
 		CacheRetention:     provider.CacheRetention(cacheRetention),
 		CacheTTLSeconds:    cacheTTLSeconds,
 		WarmCache:          cacheWarm,
+		WarmTurn:           cacheWarmTurn,
 		MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
+		PassbackReasoning:  s.loaded.Config.PassbackReasoningFor(prov.Name()),
 		MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
+		SpillBytes:              s.loaded.Config.CacheSpillBytes,
 	})
 
 	ch := make(chan agent.Event, 256)
@@ -2216,7 +2227,7 @@ func (s *server) spawnSubagent(sid, cwd string, reasoning provider.ReasoningEffo
 		if !ok {
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
-		cacheRetention, _, _, cacheWarm := s.loaded.Config.CacheForProvider(provID)
+		cacheRetention, _, _, cacheWarm, _ := s.loaded.Config.CacheForProvider(provID)
 
 		subPerms := agent.SubagentPermissions(spec, perms, cwd)
 		stableSys := spec.Prompt + agent.ProjectContext(cwd, s.loaded.Config.Instructions)
@@ -2250,7 +2261,9 @@ func (s *server) spawnSubagent(sid, cwd string, reasoning provider.ReasoningEffo
 			CacheRetention:     provider.CacheRetention(cacheRetention),
 			WarmCache:          cacheWarm,
 			MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
+			PassbackReasoning:  s.loaded.Config.PassbackReasoningFor(provID),
 			MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
+			SpillBytes:              s.loaded.Config.CacheSpillBytes,
 			Parallel:           true,
 			Registry:           reg,
 		}, prompt, func(ev agent.Event) {
@@ -2331,7 +2344,7 @@ func (s *server) spawnSwarm(sid, cwd, model string, reasoning provider.Reasoning
 		if err != nil {
 			return "", err
 		}
-		cacheRetention, _, _, cacheWarm := s.loaded.Config.CacheForProvider(prov.Name())
+		cacheRetention, _, _, cacheWarm, _ := s.loaded.Config.CacheForProvider(prov.Name())
 		team := swarm.NewSwarmContext(ctx, "swarm-"+session.NewID(), name, goal, topo)
 		for _, spec := range specs {
 			team.AddAgent(spec.Name, spec.Role)
@@ -2389,7 +2402,9 @@ func (s *server) spawnSwarm(sid, cwd, model string, reasoning provider.Reasoning
 				CacheRetention:     provider.CacheRetention(cacheRetention),
 				WarmCache:          cacheWarm,
 				MaxReasoningTurns:  s.loaded.Config.CacheMaxReasoningTurns,
+				PassbackReasoning:  s.loaded.Config.PassbackReasoningFor(prov.Name()),
 				MaxToolResultBytes: s.loaded.Config.CacheMaxToolResultBytes,
+				SpillBytes:              s.loaded.Config.CacheSpillBytes,
 			}
 			taskID := spec.TaskID
 			if taskID == "" {

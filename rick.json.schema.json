@@ -267,11 +267,45 @@
       "type": "string",
       "description": "Cheap model used for the background distillation summary. Falls back to small_model, then model."
     },
+    "distill_threshold_percent": {
+      "type": "integer",
+      "description": "Share of the context window at which the oldest stable prefix folds into a summary (0 = default 55). Per-model policies override this."
+    },
+    "distill_retain_ratio": {
+      "type": "number",
+      "description": "Share of the newest history left untouched by distillation (0 = default 0.4). Larger keeps more verbatim context at the cost of a smaller fold."
+    },
+    "distill_model_policies": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "threshold_percent": { "type": "integer", "description": "Fold trigger as a percent of the context window (0 = inherit global)." },
+          "retain_ratio": { "type": "number", "description": "Share of the newest history kept verbatim (0 = inherit global)." }
+        }
+      },
+      "description": "Per-model distillation policy. Keys are "provider/model" (e.g. "deepseek/deepseek-v4-flash")."
+    },
     "cache_retention": {
       "type": "string",
       "enum": ["", "long", "none"],
       "description": "Prompt-cache retention for every request: empty (provider default, ~5 min), \"long\" (extended TTL: Anthropic 1h / OpenAI 24h), or \"none\" (caching off).",
       "default": ""
+    },
+    "cache_warm": {
+      "type": "boolean",
+      "description": "When true, submits a small non-blocking request at session start so the provider populates its prompt cache for the frozen system+tools prefix before the first real turn. Lifts cache-hit ratios for short sessions.",
+      "default": false
+    },
+    "cache_warm_turn": {
+      "type": "boolean",
+      "description": "When true, primes the full provider-facing prefix before every real turn, not just at session start. Providers whose cache evicts mid-session (free flash tiers, short in-memory TTLs) then never pay a full uncached re-bill; costs one cheap non-streaming request per turn, billed at the cached rate when the prefix is still warm.",
+      "default": false
+    },
+    "cache_passback_reasoning": {
+      "type": "boolean",
+      "description": "When true, drops reasoning_content from tool-call-free turns on DeepSeek-line providers. DeepSeek only requires the previous turn's reasoning echoed back while a tool-call exchange is open; dropping it elsewhere shrinks the fresh tail without rewriting the cached prefix. Defaults to false (keep every reasoning block for a byte-identical append-only prefix).",
+      "default": false
     },
     "cache_ttl_seconds": {
       "type": "integer",
@@ -302,6 +336,36 @@
       "description": "Caps each tool_result payload sent to the model (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the provider prompt-cache hit ratio high on tool-heavy turns.",
       "default": 16384,
       "minimum": 0
+    },
+    "cache_spill_bytes": {
+      "type": "integer",
+      "description": "When positive, tool results larger than this many bytes are spilled to the content-addressed store and the model sees a bounded preview plus a retrieval locator (retrieve_uncompressed_context) instead of the full payload. Keeps the cached prefix small without losing the bytes. 0 disables spilling (truncate in place).",
+      "default": 0,
+      "minimum": 0
+    },
+    "cross_session_memory": {
+      "type": "boolean",
+      "description": "When true (default), a brand-new session for the same (project, model, agent) loads the previous session's deterministic goal-state snapshot as its leading user message, so the byte-stable prefix (system + tools + snapshot) stays warm across sessions instead of re-priming cold. The snapshot is derived from the transcript — no LLM calls.",
+      "default": true
+    },
+    "cache_strategies": {
+      "type": "object",
+      "description": "Maps a provider id (or provider/model) to a named prompt-cache strategy. Each entry overrides the flat cache knobs for that route: retention, TTL, keep-alive, warm, warm-turn, passback reasoning, reasoning cap, and the divergence reason.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "description": "Strategy name surfaced in telemetry and /stats." },
+          "retention": { "type": "string", "description": "Prompt-cache retention: \"\" (default/short), \"long\" (extended TTL), or \"none\" (caching off)." },
+          "ttl_seconds": { "type": "integer", "minimum": 0, "description": "Assumed warm-prefix lifetime before an idle gap forces a re-warm (0 = inherit global)." },
+          "keepalive_seconds": { "type": "integer", "minimum": 0, "description": "Prompt-cache keep-alive interval (0 = inherit global, disabled)." },
+          "warm": { "type": "boolean", "description": "Enable the session-start warm request." },
+          "warm_turn": { "type": "boolean", "description": "Prime the full prefix before every real turn." },
+          "passback_reasoning": { "type": "boolean", "description": "DeepSeek reasoning-passback rule: drop reasoning_content from tool-call-free turns." },
+          "max_reasoning_turns": { "type": "integer", "minimum": 0, "description": "Cap echoed reasoning (0 = keep all)." },
+          "divergence_reason": { "type": "string", "description": "Override the classified divergence cause for telemetry." }
+        }
+      }
     },
     "subagent_depth": {
       "type": "integer",
@@ -341,6 +405,33 @@
           "enabled": {
             "type": "boolean",
             "default": true
+          },
+          "cache_retention": {
+            "type": "string",
+            "enum": ["", "long", "none"],
+            "description": "Per-provider override of cache_retention (empty = inherit global)."
+          },
+          "cache_ttl_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Per-provider override of cache_ttl_seconds (0 = inherit global)."
+          },
+          "cache_keepalive_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Per-provider override of cache_keepalive_seconds (0 = inherit global)."
+          },
+          "cache_warm": {
+            "type": "boolean",
+            "description": "Per-provider override of cache_warm."
+          },
+          "cache_warm_turn": {
+            "type": "boolean",
+            "description": "Per-provider override of cache_warm_turn: prime the full prefix before every real turn."
+          },
+          "cache_passback_reasoning": {
+            "type": "boolean",
+            "description": "Per-provider override of cache_passback_reasoning: drop reasoning_content from tool-call-free turns on DeepSeek-line providers."
           }
         }
       }

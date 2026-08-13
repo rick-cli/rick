@@ -87,7 +87,7 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 		if !ok {
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
-		cacheRetention, _, _, cacheWarm := m.deps.Loaded.Config.CacheForProvider(provID)
+		cacheRetention, _, _, cacheWarm, cacheWarmTurn := m.deps.Loaded.Config.CacheForProvider(provID)
 
 		perms := agent.SubagentPermissions(spec, m.deps.Perms, m.deps.Loaded.ProjectRoot)
 
@@ -139,8 +139,11 @@ func (m *Model) spawnSubagent(specs map[string]agent.SubagentSpec, maxDepth int)
 			Parallel:           true,
 			CacheRetention:     provider.CacheRetention(cacheRetention),
 			WarmCache:          cacheWarm,
+			WarmTurn:           cacheWarmTurn,
 			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
+			PassbackReasoning:  m.deps.Loaded.Config.PassbackReasoningFor(provID),
 			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
+			SpillBytes:              m.deps.Loaded.Config.CacheSpillBytes,
 			ArchiveDir:         agentArchiveDir(m.deps.Store),
 		}
 
@@ -209,7 +212,7 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			m.deps.AgentRegistry.ReleaseBackground()
 			return "", fmt.Errorf("subagent: unknown provider %q", provID)
 		}
-		cacheRetention, _, _, cacheWarm := m.deps.Loaded.Config.CacheForProvider(provID)
+		cacheRetention, _, _, cacheWarm, cacheWarmTurn := m.deps.Loaded.Config.CacheForProvider(provID)
 		childCtx, cancel := context.WithCancel(ctx)
 		id, err := m.deps.AgentRegistry.Register(&agent.AgentEntry{
 			Name: kind, ParentID: parentID, Depth: depth, Status: agent.AgentIdle,
@@ -236,8 +239,11 @@ func (m *Model) spawnSubagentBackground(specs map[string]agent.SubagentSpec, max
 			Plugins: m.deps.Plugins, Parallel: true, Registry: m.deps.AgentRegistry,
 			CacheRetention:     provider.CacheRetention(cacheRetention),
 			WarmCache:          cacheWarm,
+			WarmTurn:           cacheWarmTurn,
 			MaxReasoningTurns:  m.deps.Loaded.Config.CacheMaxReasoningTurns,
+			PassbackReasoning:  m.deps.Loaded.Config.PassbackReasoningFor(provID),
 			MaxToolResultBytes: m.deps.Loaded.Config.CacheMaxToolResultBytes,
+			SpillBytes:              m.deps.Loaded.Config.CacheSpillBytes,
 			ArchiveDir:         agentArchiveDir(m.deps.Store),
 		}
 		if p := m.program; p != nil {

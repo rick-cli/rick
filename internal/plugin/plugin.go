@@ -103,6 +103,13 @@ type Hooks struct {
 	SubagentEnd   func(ctx context.Context, ev *SubagentEndEvent) error
 	SessionStart  func(ctx context.Context, ev *SessionStartEvent) error
 	SessionEnd    func(ctx context.Context, ev *SessionEndEvent) error
+
+	// CacheStrategyHook, when set, returns a named prompt-cache strategy for
+	// a provider/model route, or nil to fall through to the config/default.
+	// This is the plugin seam for cache strategy: a plugin can tune the
+	// cache profile of a backend it knows without touching the agent loop.
+	// The returned value must implement provider.CacheStrategy.
+	CacheStrategyHook func(providerID, modelID string) any
 }
 
 // Registry holds every loaded plugin.
@@ -363,6 +370,28 @@ func (r *Registry) DispatchSessionEnd(ctx context.Context, ev *SessionEndEvent) 
 		}
 		return p.SessionEnd(ctx, ev)
 	})
+}
+
+// CacheStrategyHooks returns the first non-nil strategy from the enabled
+// plugins' CacheStrategyHook callbacks for a provider/model route. Plugins
+// run in registration order; the first hit wins. A nil result means no
+// plugin overrides this route.
+func (r *Registry) CacheStrategyHooks(providerID, modelID string) any {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	active := append([]Hooks(nil), r.active...)
+	r.mu.RUnlock()
+	for _, hooks := range active {
+		if hooks.CacheStrategyHook == nil {
+			continue
+		}
+		if strategy := hooks.CacheStrategyHook(providerID, modelID); strategy != nil {
+			return strategy
+		}
+	}
+	return nil
 }
 
 // knownHookNames enumerates valid hook keys in a manifest.

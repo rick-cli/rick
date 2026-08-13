@@ -1,5 +1,136 @@
 # Changelog
 
+## v0.1.18 — 2026-08-14
+
+### Image generation via ChatGPT (gpt-image-2)
+
+- **New `imagegen` tool.** With a ChatGPT account connected via the browser
+  login, rick can now generate images from a text prompt through the Codex
+  backend's `image_generation` tool (gpt-image-2). The tool saves the PNG to
+  the requested directory (or `~/Downloads` by default) and returns the path
+  as a clickable OSC 8 link in the terminal. It resolves the saved ChatGPT
+  OAuth credential at call time, so a mid-session login is picked up
+  immediately, and fails with a clear "ChatGPT not connected" error otherwise.
+  (`internal/tools/imagegen.go`, `internal/provider/openai/codex.go`)
+
+### Cache-hit rate maxxing: cross-session reuse, DeepSeek tuning, shadow pricing, strategy seam
+
+- **Cross-session cache reuse.** A brand-new session for the same
+  (project, model, agent) now loads the previous session's deterministic
+  goal-state snapshot as its leading user message, so the byte-stable prefix
+  (system + tools + snapshot) stays warm across sessions instead of
+  re-priming cold. The snapshot is derived entirely from the transcript —
+  no LLM calls, no embeddings — with fixed Goal/Facts/Errors/Next-Step
+  sections, stored in a content-addressed disk store under `<data>/memory/`.
+  New packages `internal/memory` and `internal/prefixstore`; config
+  `cross_session_memory` (default on).
+- **DeepSeek partial-eviction inference.** A per-turn usage ring detects
+  when a bounded-LRU cache drops a mid-prefix region without zeroing the
+  whole cache (`inferredEvictionPoint`), and the re-warm fires before the
+  next request instead of re-billing the dropped wave cold.
+- **Usage-anchored distillation now requires cache-read reporting.** A
+  provider that omits cache metrics (DeepSeek reports no cache-write) no
+  longer fires distillation on a garbage zero; the byte-estimated plan
+  carries the decision until real cache reads are observed.
+- **Distill shadow pricing.** The planned cached-prefix estimate
+  (`cachePrefixTokens`) is recorded every request and passed to
+  `distill.Distill`: when the warm prefix still covers the region being
+  folded, distillation defers instead of rewriting warm bytes for no gain.
+- **Pluggable `CacheStrategy` seam.** `provider.CacheStrategy` /
+  `provider.DefaultStrategy` / `provider.StrategyRegistry` let a
+  `cache_strategies` block in rick.json (per provider or provider/model)
+  override retention, TTL, keep-alive, warm, warm-turn, passback reasoning,
+  reasoning cap, and the divergence reason — no code change per backend. A
+  plugin `CacheStrategyHook` can also supply a strategy per route.
+- **Harness.** `cmd/cachehit` gains `-strategy <route>` (resolve a named
+  `cache_strategies` entry) and `-shared-memory` (two passes: pin a snapshot,
+  then measure the cross-session prefix reuse).
+
+
+### Cache-hit rate maxxing (DeepSeek focus)
+
+- **Adaptive eviction-gap warm (cache_warm no longer guesses the TTL).**
+  When a turn observes a provider prefix eviction (a cache-read shortfall past
+  the noise floor), the idle gap before that turn is recorded as the endpoint's
+  real eviction point. `cacheTTL()` then re-warms at 90% of the shortest
+  provable eviction gap — beating both the vendor table (which assumes a day
+  for DeepSeek-line endpoints) and a static `cache_ttl_seconds` override, so a
+  free flash tier that evicts after minutes is re-primed *before* the eviction
+  instead of after it. (`internal/agent/agent.go`, `cache_ttl_test.go`)
+- **DeepSeek reasoning passback rule (`cache_passback_reasoning`).** Opt-in
+  knob that mirrors the reference deepseek-harness adapter: `reasoning_content`
+  is echoed back only for assistant turns that carried tool calls (the exchange
+  the API demands it for); reasoning from tool-call-free turns is dropped. The
+  per-message decision is stable (history never gains/loses a tool call), so
+  the serialized prefix stays byte-identical — the cached prefix is never
+  rewritten — while the fresh-tail cost of long reasoning chains shrinks.
+  Default off: rick keeps every reasoning block for a byte-identical
+  append-only prefix, which stays cache-optimal when cached reasoning is billed
+  cheaply. (`internal/provider/openai/openai.go`, `reasoning_test.go`)
+- **`cache_warm_turn`: prime before every real turn.** When enabled, the full
+  provider-facing prefix is warmed before each request (not just at session
+  start), so a provider that evicts mid-session never pays a full uncached
+  re-bill. Costs one cheap non-streaming request per turn, billed at the cached
+  rate when the prefix is still warm. Wired through TUI, subagents, swarm,
+  headless, rickserve, and the `cmd/cachehit -warm-turn` benchmark flag.
+- **Net-cost hit rate.** `usage.Day.NetCostHitRate()` weights `cache_write` at
+  1.25x (OpenAI GPT-5.6+ bills writes above uncached input), so a write-heavy
+  turn scores honestly; `/stats` now shows both `hit%` and `net%` per model and
+  per day. (`internal/usage/tracker.go`, `internal/tui/mcpui.go`)
+- **Per-provider knobs.** `cache_warm_turn` and `cache_passback_reasoning`
+  gained per-provider overrides (`providers.<name>.cache_warm_turn` /
+  `cache_passback_reasoning`) with merge + resolution tests, and the JSON schema
+  documents all cache keys.
+- **Cache-impact documentation contract.** `docs/cache-contract.md` states the
+  append-only invariant, the one-deliberate-invalidation rule, and each
+  module's cache impact (history, contextbudget, delta, agent, provider/openai,
+  config, tui, cachehit), so future edits state their prompt-cache effect.
+
+### Cache-hit rate maxxing, part 2 (harness-aligned structural invariants)
+
+- **Pre-send structural invariant (fail-closed).** Within one run the provider
+  view may only grow at the tail. A mid-prefix byte divergence with no
+  declared transform (head-trim, distill, reasoning-cut, tool-prune) now fails
+  the turn instead of silently re-billing the provider cache cold — the
+  harness-style guarantee that a prefix rewrite is either deliberate or a bug.
+  (`internal/agent/agent.go`)
+- **Epoch-scoped cache keys.** Every request now carries an `EpochHash` — the
+  content address of the frozen model+system+tools header — used as the
+  prompt-cache routing scope and the OpenAI session-affinity hint. A resumed
+  session with an identical header derives the same hash and rides the same
+  warm bucket even though its session id changed, so restarts never cold-write
+  a fresh prefix. (`internal/provider/provider.go`,
+  `internal/provider/openai/openai.go`)
+- **Usage-anchored distillation.** Once a provider has reported a real token
+  footprint, the distill decision fires on that measured occupancy
+  (`input + cache_read + cache_write`) instead of the byte estimate, so
+  compaction happens when the provider actually sits at the window's edge.
+  (`internal/agent/agent.go`, `internal/agent/distill.go`)
+- **Per-model distillation policy table.** New
+  `distill_threshold_percent`, `distill_retain_ratio`, and
+  `distill_model_policies` ("provider/model" → `{threshold_percent,
+  retain_ratio}`) knobs let each exact route tune when it folds and how much
+  newest history it keeps verbatim — mirroring the harness's per-model
+  compaction policy table. Resolved in `config.DistillPolicyFor` and wired
+  through the TUI and headless runners. (`internal/config/config.go`,
+  `internal/tui/agentbridge.go`, `internal/headless/headless.go`)
+- **Durable compaction transaction.** Every `/compact` now records a
+  `CompactionRecord` in the session file (replaced message span, summary token
+  cost, and the summarization call's usage), so the aux cost of folding is
+  measurable and a resumed session knows exactly what was replaced.
+  (`internal/session/session.go`, `internal/tui/model.go`)
+- **Tightened reasoning passback.** The DeepSeek passback rule now echoes
+  `reasoning_content` for *every* tool-call assistant turn (what a continuing
+  exchange demands) rather than only the single most recent thinking turn —
+  the previously-previous tool turn no longer loses its required echo when the
+  newest turn is tool-call-free. (`internal/provider/openai/openai.go`)
+- **Live cache-hit e2e (key-gated).** `TestLiveCacheHitE2E` and
+  `TestLiveKeepaliveCacheHitE2E` replay two growing turns against the real
+  DeepSeek API and assert the second reads the shared prefix from the provider
+  cache (`cacheReadTokens > 0`) — the harness's "request-cache e2e", skipped
+  unless `RICK_LIVE_CACHE_TEST=1` and a DeepSeek key are present.
+  (`internal/provider/openai/live_cache_e2e_test.go`)
+
 ## v0.1.16 — 2026-08-13
 
 ### ChatGPT / Codex sign-in is fixed
@@ -390,3 +521,89 @@
 - Patched the NousPortal provider in the Provider List.
 - Fixed `/yolo` availability.
 - Fixed the broken chatbar after submitting a prompt.
+
+## v0.1.18 — 2026-08-13
+
+### Cache-hit rate maxxing (DeepSeek focus)
+
+- **Adaptive eviction-gap warm (cache_warm no longer guesses the TTL).**
+  When a turn observes a provider prefix eviction (a cache-read shortfall past
+  the noise floor), the idle gap before that turn is recorded as the endpoint's
+  real eviction point. `cacheTTL()` then re-warms at 90% of the shortest
+  provable eviction gap — beating both the vendor table (which assumes a day
+  for DeepSeek-line endpoints) and a static `cache_ttl_seconds` override, so a
+  free flash tier that evicts after minutes is re-primed *before* the eviction
+  instead of after it. (`internal/agent/agent.go`, `cache_ttl_test.go`)
+- **DeepSeek reasoning passback rule (`cache_passback_reasoning`).** Opt-in
+  knob that mirrors the reference deepseek-harness adapter: `reasoning_content`
+  is echoed back only for assistant turns that carried tool calls (the exchange
+  the API demands it for); reasoning from tool-call-free turns is dropped. The
+  per-message decision is stable (history never gains/loses a tool call), so
+  the serialized prefix stays byte-identical — the cached prefix is never
+  rewritten — while the fresh-tail cost of long reasoning chains shrinks.
+  Default off: rick keeps every reasoning block for a byte-identical
+  append-only prefix, which stays cache-optimal when cached reasoning is billed
+  cheaply. (`internal/provider/openai/openai.go`, `reasoning_test.go`)
+- **`cache_warm_turn`: prime before every real turn.** When enabled, the full
+  provider-facing prefix is warmed before each request (not just at session
+  start), so a provider that evicts mid-session never pays a full uncached
+  re-bill. Costs one cheap non-streaming request per turn, billed at the cached
+  rate when the prefix is still warm. Wired through TUI, subagents, swarm,
+  headless, rickserve, and the `cmd/cachehit -warm-turn` benchmark flag.
+- **Net-cost hit rate.** `usage.Day.NetCostHitRate()` weights `cache_write` at
+  1.25x (OpenAI GPT-5.6+ bills writes above uncached input), so a write-heavy
+  turn scores honestly; `/stats` now shows both `hit%` and `net%` per model and
+  per day. (`internal/usage/tracker.go`, `internal/tui/mcpui.go`)
+- **Per-provider knobs.** `cache_warm_turn` and `cache_passback_reasoning`
+  gained per-provider overrides (`providers.<name>.cache_warm_turn` /
+  `cache_passback_reasoning`) with merge + resolution tests, and the JSON schema
+  documents all cache keys.
+- **Cache-impact documentation contract.** `docs/cache-contract.md` states the
+  append-only invariant, the one-deliberate-invalidation rule, and each
+  module's cache impact (history, contextbudget, delta, agent, provider/openai,
+  config, tui, cachehit), so future edits state their prompt-cache effect.
+
+### Cache-hit rate maxxing, part 2 (harness-aligned structural invariants)
+
+- **Pre-send structural invariant (fail-closed).** Within one run the provider
+  view may only grow at the tail. A mid-prefix byte divergence with no
+  declared transform (head-trim, distill, reasoning-cut, tool-prune) now fails
+  the turn instead of silently re-billing the provider cache cold — the
+  harness-style guarantee that a prefix rewrite is either deliberate or a bug.
+  (`internal/agent/agent.go`)
+- **Epoch-scoped cache keys.** Every request now carries an `EpochHash` — the
+  content address of the frozen model+system+tools header — used as the
+  prompt-cache routing scope and the OpenAI session-affinity hint. A resumed
+  session with an identical header derives the same hash and rides the same
+  warm bucket even though its session id changed, so restarts never cold-write
+  a fresh prefix. (`internal/provider/provider.go`,
+  `internal/provider/openai/openai.go`)
+- **Usage-anchored distillation.** Once a provider has reported a real token
+  footprint, the distill decision fires on that measured occupancy
+  (`input + cache_read + cache_write`) instead of the byte estimate, so
+  compaction happens when the provider actually sits at the window's edge.
+  (`internal/agent/agent.go`, `internal/agent/distill.go`)
+- **Per-model distillation policy table.** New
+  `distill_threshold_percent`, `distill_retain_ratio`, and
+  `distill_model_policies` ("provider/model" → `{threshold_percent,
+  retain_ratio}`) knobs let each exact route tune when it folds and how much
+  newest history it keeps verbatim — mirroring the harness's per-model
+  compaction policy table. Resolved in `config.DistillPolicyFor` and wired
+  through the TUI and headless runners. (`internal/config/config.go`,
+  `internal/tui/agentbridge.go`, `internal/headless/headless.go`)
+- **Durable compaction transaction.** Every `/compact` now records a
+  `CompactionRecord` in the session file (replaced message span, summary token
+  cost, and the summarization call's usage), so the aux cost of folding is
+  measurable and a resumed session knows exactly what was replaced.
+  (`internal/session/session.go`, `internal/tui/model.go`)
+- **Tightened reasoning passback.** The DeepSeek passback rule now echoes
+  `reasoning_content` for *every* tool-call assistant turn (what a continuing
+  exchange demands) rather than only the single most recent thinking turn —
+  the previously-previous tool turn no longer loses its required echo when the
+  newest turn is tool-call-free. (`internal/provider/openai/openai.go`)
+- **Live cache-hit e2e (key-gated).** `TestLiveCacheHitE2E` and
+  `TestLiveKeepaliveCacheHitE2E` replay two growing turns against the real
+  DeepSeek API and assert the second reads the shared prefix from the provider
+  cache (`cacheReadTokens > 0`) — the harness's "request-cache e2e", skipped
+  unless `RICK_LIVE_CACHE_TEST=1` and a DeepSeek key are present.
+  (`internal/provider/openai/live_cache_e2e_test.go`)

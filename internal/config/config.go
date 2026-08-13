@@ -72,16 +72,29 @@ type Provider struct {
 	// WarmCache overrides the global cache_warm for this provider (nil =
 	// inherit global).
 	WarmCache *bool `json:"cache_warm,omitempty"`
+	// WarmTurn overrides the global cache_warm_turn for this provider (nil =
+	// inherit global). When true the agent primes the full prefix before
+	// every real turn, so a provider whose cache evicts mid-session (short
+	// TTL free tiers) never pays a full uncached re-bill.
+	WarmTurn *bool `json:"cache_warm_turn,omitempty"`
+	// PassbackReasoning overrides the global cache_passback_reasoning for
+	// this provider (nil = inherit global). DeepSeek's API requires the
+	// previous turn's reasoning_content echoed back only while a tool-call
+	// exchange is open; when true, reasoning from tool-call-free turns is
+	// dropped (they are ignored anyway), shrinking the fresh tail without
+	// touching the cached prefix.
+	PassbackReasoning *bool `json:"cache_passback_reasoning,omitempty"`
 }
 
 // CacheFor returns this provider's resolved prompt-cache policy, applying its
 // per-provider overrides on top of the global defaults. The returned values
 // are what the agent and client should use for this provider.
-func (p Provider) CacheFor(global Config) (retention string, ttlSeconds, keepaliveSeconds int, warm bool) {
+func (p Provider) CacheFor(global Config) (retention string, ttlSeconds, keepaliveSeconds int, warm, warmTurn bool) {
 	retention = global.CacheRetention
 	ttlSeconds = global.CacheTTLSeconds
 	keepaliveSeconds = global.CacheKeepaliveSeconds
 	warm = global.WarmCache
+	warmTurn = global.CacheWarmTurn
 	if p.CacheRetention != "" {
 		retention = p.CacheRetention
 	}
@@ -94,17 +107,29 @@ func (p Provider) CacheFor(global Config) (retention string, ttlSeconds, keepali
 	if p.WarmCache != nil {
 		warm = *p.WarmCache
 	}
-	return retention, ttlSeconds, keepaliveSeconds, warm
+	if p.WarmTurn != nil {
+		warmTurn = *p.WarmTurn
+	}
+	return retention, ttlSeconds, keepaliveSeconds, warm, warmTurn
 }
 
 // CacheForProvider resolves the prompt-cache policy for a named provider,
 // falling back to the global knobs when the provider has no overrides.
 // providerID is the config provider key (e.g. "openai", "deepseek").
-func (c *Config) CacheForProvider(providerID string) (retention string, ttlSeconds, keepaliveSeconds int, warm bool) {
+func (c *Config) CacheForProvider(providerID string) (retention string, ttlSeconds, keepaliveSeconds int, warm, warmTurn bool) {
 	if p, ok := c.Providers[providerID]; ok {
 		return p.CacheFor(*c)
 	}
-	return c.CacheRetention, c.CacheTTLSeconds, c.CacheKeepaliveSeconds, c.WarmCache
+	return c.CacheRetention, c.CacheTTLSeconds, c.CacheKeepaliveSeconds, c.WarmCache, c.CacheWarmTurn
+}
+
+// PassbackReasoningFor resolves the DeepSeek reasoning-passback policy for a
+// named provider: the per-provider override, else the global knob.
+func (c *Config) PassbackReasoningFor(providerID string) bool {
+	if p, ok := c.Providers[providerID]; ok && p.PassbackReasoning != nil {
+		return *p.PassbackReasoning
+	}
+	return c.CachePassbackReasoning
 }
 
 // Permission is the allow/ask/deny policy set.
@@ -298,6 +323,126 @@ type ContextBudgetConfig struct {
 	LiveZoneCapBytes int `json:"live_zone_cap_bytes,omitempty"`
 }
 
+// DistillModelPolicy tunes state distillation for one exact provider/model
+// route. Keys in Config.DistillModelPolicies are "provider/model". Zero values
+// inherit the global knobs, mirroring the harness's per-model compaction
+// policy table (thresholdRatio/retainRatio per model capacity).
+type DistillModelPolicy struct {
+	// ThresholdPercent is the share of the context window at which the
+	// oldest stable prefix folds into a summary (0 = inherit global).
+	ThresholdPercent int `json:"threshold_percent,omitempty"`
+	// RetainRatio is the share of the newest history left verbatim (0 =
+	// inherit global).
+	RetainRatio float64 `json:"retain_ratio,omitempty"`
+	// LiveZoneTokens is the token-priced live-tail budget: the newest
+	// messages kept after the fold cost at most this many tokens (4
+	// chars/token heuristic). Zero = inherit the global knob; a global zero
+	// falls back to the ratio-based boundary.
+	LiveZoneTokens int `json:"live_zone_tokens,omitempty"`
+}
+
+// CacheStrategyConfig is one named prompt-cache strategy for a provider (or
+// provider/model) route. Zero fields inherit the flat global knobs, so a
+// strategy only overrides what it names.
+type CacheStrategyConfig struct {
+	// Name is the strategy name surfaced in telemetry and /stats.
+	Name string `json:"name,omitempty"`
+	// Retention is the prompt-cache retention policy: "" (default/short),
+	// "long" (extended TTL), or "none" (caching off).
+	Retention string `json:"retention,omitempty"`
+	// TTLSeconds is how long a warm prefix is assumed to survive at the
+	// provider before an idle gap forces a re-warm.
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+	// KeepaliveSeconds is the prompt-cache keep-alive interval (0 disables).
+	KeepaliveSeconds int `json:"keepalive_seconds,omitempty"`
+	// Warm enables the session-start warm request.
+	Warm *bool `json:"warm,omitempty"`
+	// WarmTurn primes the full prefix before every real turn.
+	WarmTurn *bool `json:"warm_turn,omitempty"`
+	// PassbackReasoning enables the DeepSeek reasoning-passback rule.
+	PassbackReasoning *bool `json:"passback_reasoning,omitempty"`
+	// MaxReasoningTurns caps echoed reasoning (0 = keep all).
+	MaxReasoningTurns int `json:"max_reasoning_turns,omitempty"`
+	// DivergenceReason overrides the classified divergence cause.
+	DivergenceReason string `json:"divergence_reason,omitempty"`
+}
+
+// CacheStrategyFor resolves the prompt-cache strategy for one exact
+// provider/model route. A matching cache_strategies entry wins; fields it
+// leaves unset are inherited from the provider-only entry, then from the flat
+// global knobs (per-field merging, like the harness's settings layering).
+func (c *Config) CacheStrategyFor(providerID, modelID string) (name string, retention string, ttlSeconds, keepaliveSeconds int, warm, warmTurn, passback bool, maxReasoning int, divergence string) {
+	cfg := CacheStrategyConfig{}
+	base := CacheStrategyConfig{}
+	if c != nil {
+		if entry, ok := c.CacheStrategies[providerID+"/"+modelID]; ok {
+			cfg = entry
+			base = c.CacheStrategies[providerID]
+		} else if entry, ok := c.CacheStrategies[providerID]; ok {
+			cfg = entry
+		}
+	}
+	// Per-field inheritance from the provider-only entry.
+	if cfg.Name == "" {
+		cfg.Name = base.Name
+	}
+	if cfg.Retention == "" {
+		cfg.Retention = base.Retention
+	}
+	if cfg.TTLSeconds == 0 {
+		cfg.TTLSeconds = base.TTLSeconds
+	}
+	if cfg.KeepaliveSeconds == 0 {
+		cfg.KeepaliveSeconds = base.KeepaliveSeconds
+	}
+	if cfg.Warm == nil {
+		cfg.Warm = base.Warm
+	}
+	if cfg.WarmTurn == nil {
+		cfg.WarmTurn = base.WarmTurn
+	}
+	if cfg.PassbackReasoning == nil {
+		cfg.PassbackReasoning = base.PassbackReasoning
+	}
+	if cfg.MaxReasoningTurns == 0 {
+		cfg.MaxReasoningTurns = base.MaxReasoningTurns
+	}
+	if cfg.DivergenceReason == "" {
+		cfg.DivergenceReason = base.DivergenceReason
+	}
+	name = cfg.Name
+	retention = cfg.Retention
+	if retention == "" && c != nil {
+		retention = c.CacheRetention
+	}
+	ttlSeconds = cfg.TTLSeconds
+	if ttlSeconds == 0 && c != nil {
+		ttlSeconds = c.CacheTTLSeconds
+	}
+	keepaliveSeconds = cfg.KeepaliveSeconds
+	if keepaliveSeconds == 0 && c != nil {
+		keepaliveSeconds = c.CacheKeepaliveSeconds
+	}
+	warm = cfg.Warm != nil && *cfg.Warm
+	if cfg.Warm == nil && c != nil {
+		warm = c.WarmCache
+	}
+	warmTurn = cfg.WarmTurn != nil && *cfg.WarmTurn
+	if cfg.WarmTurn == nil && c != nil {
+		warmTurn = c.CacheWarmTurn
+	}
+	passback = cfg.PassbackReasoning != nil && *cfg.PassbackReasoning
+	if cfg.PassbackReasoning == nil && c != nil {
+		passback = c.CachePassbackReasoning
+	}
+	maxReasoning = cfg.MaxReasoningTurns
+	if maxReasoning == 0 && c != nil {
+		maxReasoning = c.CacheMaxReasoningTurns
+	}
+	divergence = cfg.DivergenceReason
+	return name, retention, ttlSeconds, keepaliveSeconds, warm, warmTurn, passback, maxReasoning, divergence
+}
+
 // ContextBudgetOptions renders the knobs as contextbudget.Options; zero
 // values become defaults inside contextbudget.New.
 func (c *ContextBudgetConfig) ContextBudgetOptions() contextbudget.Options {
@@ -347,12 +492,33 @@ type Config struct {
 	DistillEnabled *bool `json:"distill_enabled,omitempty"`
 	// DistillModel is the fast model used for the background summary call.
 	// Empty falls back to the primary model.
-	DistillModel     string           `json:"distill_model,omitempty"`
-	SubagentDepth    *int             `json:"subagent_depth,omitempty"`
-	BackgroundNotify bool             `json:"background_notify,omitempty"`
-	MaxBackground    int              `json:"max_background,omitempty"`
-	Plugins          []string         `json:"plugin,omitempty"`
-	WebSearch        *WebSearchConfig `json:"web_search,omitempty"`
+	DistillModel string `json:"distill_model,omitempty"`
+	// DistillThresholdPercent is the share of the context window at which
+	// the oldest stable prefix is folded into a summary (0 = default 55).
+	// Per-model policies in DistillModelPolicies override this when the
+	// active model matches.
+	DistillThresholdPercent int `json:"distill_threshold_percent,omitempty"`
+	// DistillRetainRatio is the share of the newest history left untouched
+	// by distillation: the oldest (1-ratio) share is distilled (0 = default
+	// 0.4). A larger retain keeps more verbatim context at the cost of a
+	// smaller fold.
+	DistillRetainRatio float64 `json:"distill_retain_ratio,omitempty"`
+	// DistillLiveZoneTokens is the token-priced live-tail budget for
+	// distillation (0 = ratio-based boundary): the newest messages kept
+	// after the fold cost at most this many tokens (4 chars/token
+	// heuristic), so the surviving tail stays inside the provider's cached
+	// region and the next fold never cuts a cached block.
+	DistillLiveZoneTokens int `json:"distill_live_zone_tokens,omitempty"`
+	// DistillModelPolicies tunes distillation per exact provider/model
+	// route. Keys are "provider/model" (e.g. "deepseek/deepseek-v4-flash").
+	// Each entry may override the threshold percent and retain ratio; empty
+	// entries inherit the global knobs.
+	DistillModelPolicies map[string]DistillModelPolicy `json:"distill_model_policies,omitempty"`
+	SubagentDepth        *int                          `json:"subagent_depth,omitempty"`
+	BackgroundNotify     bool                          `json:"background_notify,omitempty"`
+	MaxBackground        int                           `json:"max_background,omitempty"`
+	Plugins              []string                      `json:"plugin,omitempty"`
+	WebSearch            *WebSearchConfig              `json:"web_search,omitempty"`
 	// Vision bridges images to a vision-capable model so text-only models
 	// (DeepSeek) can "see". Enabled, the TUI replaces image attachments with
 	// the vision engine's structured text evidence before the agent turn.
@@ -365,6 +531,22 @@ type Config struct {
 	// system+tools prefix before the first real turn. This lifts cache-hit
 	// ratios for short sessions. Defaults to off until its cost is measured.
 	WarmCache bool `json:"cache_warm,omitempty"`
+	// CacheWarmTurn, when true, primes the full provider-facing prefix
+	// before every real turn, not just at session start. Providers whose
+	// cache evicts mid-session (free flash tiers, short in-memory TTLs)
+	// then never pay a full uncached re-bill; the cost is one cheap
+	// non-streaming request per turn, billed at the cached rate when the
+	// prefix is still warm. Disabled by default.
+	CacheWarmTurn bool `json:"cache_warm_turn,omitempty"`
+	// CachePassbackReasoning, when true, drops reasoning_content from
+	// tool-call-free turns on DeepSeek-line providers. DeepSeek only
+	// requires the previous turn's reasoning echoed back while a tool-call
+	// exchange is open; dropping it elsewhere shrinks the fresh tail
+	// without touching the cached prefix (the tail is appended, never
+	// rewritten). Disabled by default: rick keeps every reasoning block so
+	// the serialized prefix is byte-identical, which is cache-optimal when
+	// the provider bills cached reasoning cheaply.
+	CachePassbackReasoning bool `json:"cache_passback_reasoning,omitempty"`
 	// CacheMaxReasoningTurns caps how many prior turns' reasoning blocks are
 	// echoed to DeepSeek-line providers as reasoning_content (0 = keep all).
 	// Keeps the serialized prefix byte-identical by default; a positive value
@@ -374,6 +556,14 @@ type Config struct {
 	// (0 = default 16 KiB). Bounding the per-turn fresh tail keeps the
 	// provider prompt-cache hit ratio high on tool-heavy turns.
 	CacheMaxToolResultBytes int `json:"cache_max_tool_result_bytes,omitempty"`
+	// CacheSpillBytes, when positive, is the tool-result size above which the
+	// full output is persisted to the content-addressed store (spill) and the
+	// model sees only a bounded head+marker+tail preview plus a retrieval
+	// locator. Keeps the cached prefix small even when a single tool dumps a
+	// huge blob, without losing the bytes: the model pulls them back with
+	// retrieve_uncompressed_context. 0 disables spilling (truncate in place,
+	// as today).
+	CacheSpillBytes int `json:"cache_spill_bytes,omitempty"`
 	// CacheTTLSeconds overrides how long a warm prompt prefix is assumed to
 	// survive at the provider before an idle gap forces a re-warm. Zero uses
 	// the per-vendor table (provider.DefaultCacheTTL), which assumes a day
@@ -398,6 +588,21 @@ type Config struct {
 	CacheOpenRouterResponseTTL int `json:"cache_openrouter_response_ttl,omitempty"`
 	// ContextBudget exposes the session context manager knobs.
 	ContextBudget *ContextBudgetConfig `json:"context_budget,omitempty"`
+	// CrossSessionMemory enables cross-session context reuse: when a new
+	// session starts for the same (project, model, agent), rick injects the
+	// previous session's deterministic goal-state snapshot as the pinned
+	// first user message, so the byte-stable prefix (system + tools +
+	// snippet) stays warm across sessions instead of re-priming cold.
+	// Defaults to true: the snapshot is deterministic and LLM-free, so the
+	// only cost is a fixed small prefix that a resumed session would pay
+	// anyway. Set false to disable.
+	CrossSessionMemory *bool `json:"cross_session_memory,omitempty"`
+	// CacheStrategies maps a provider id (or "provider/model") to a named
+	// prompt-cache strategy. Each entry overrides the flat cache knobs
+	// (retention, TTL, keep-alive, warm, passback reasoning, reasoning cap)
+	// for that route, letting each backend run its optimal cache profile
+	// without code changes. The strategy name is surfaced in telemetry.
+	CacheStrategies map[string]CacheStrategyConfig `json:"cache_strategies,omitempty"`
 }
 
 // DistillModelFor returns the model used for the background distillation
@@ -410,6 +615,58 @@ func (c *Config) DistillModelFor() string {
 		return c.SmallModel
 	}
 	return c.Model
+}
+
+// DistillPolicyFor resolves the distillation policy for one exact
+// provider/model route: the per-model override when present, else the global
+// knobs (zero values mean "use the package default").
+func (c *Config) DistillPolicyFor(providerID, modelID string) (thresholdPercent int, retainRatio float64, liveZoneTokens int) {
+	if c != nil {
+		if policy, ok := c.DistillModelPolicies[providerID+"/"+modelID]; ok {
+			if policy.ThresholdPercent > 0 {
+				thresholdPercent = policy.ThresholdPercent
+			}
+			if policy.RetainRatio > 0 {
+				retainRatio = policy.RetainRatio
+			}
+			if policy.LiveZoneTokens > 0 {
+				liveZoneTokens = policy.LiveZoneTokens
+			}
+		}
+		if thresholdPercent == 0 && c.DistillThresholdPercent > 0 {
+			thresholdPercent = c.DistillThresholdPercent
+		}
+		if retainRatio == 0 && c.DistillRetainRatio > 0 {
+			retainRatio = c.DistillRetainRatio
+		}
+		if liveZoneTokens == 0 && c.DistillLiveZoneTokens > 0 {
+			liveZoneTokens = c.DistillLiveZoneTokens
+		}
+	}
+	return thresholdPercent, retainRatio, liveZoneTokens
+}
+
+// DistillRetainRatioFor resolves the distillation retain ratio (share of the
+// newest history kept verbatim) for one exact provider/model route. Zero
+// means "use the package default".
+func (c *Config) DistillRetainRatioFor(providerID, modelID string) float64 {
+	_, retainRatio, _ := c.DistillPolicyFor(providerID, modelID)
+	return retainRatio
+}
+
+// DistillLiveZoneTokensFor resolves the token-priced live-tail budget for one
+// exact provider/model route. Zero means "use the ratio-based boundary".
+func (c *Config) DistillLiveZoneTokensFor(providerID, modelID string) int {
+	_, _, liveZoneTokens := c.DistillPolicyFor(providerID, modelID)
+	return liveZoneTokens
+}
+
+// DistillThresholdPercentFor resolves the distillation fold trigger (share of
+// the context window, as a percent) for one exact provider/model route. Zero
+// means "use the package default (55)".
+func (c *Config) DistillThresholdPercentFor(providerID, modelID string) int {
+	thresholdPercent, _, _ := c.DistillPolicyFor(providerID, modelID)
+	return thresholdPercent
 }
 
 // Keybinds is the tui.json keybind block.

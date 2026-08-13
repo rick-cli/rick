@@ -24,6 +24,7 @@ import (
 	"rick/internal/mcp"
 	"rick/internal/permission"
 	"rick/internal/plugin"
+	"rick/internal/prefixstore"
 	"rick/internal/provider"
 	"rick/internal/provider/anthropic"
 	"rick/internal/provider/catalog"
@@ -327,6 +328,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	reg.Register(tools.WebSearchTool{Restrictions: loaded.Config.WebSearch})
 	reg.Register(tools.RetrieveUncompressedTool{Store: ctxBudget})
 	reg.Register(tools.VisionTool{Loaded: loaded})
+	reg.Register(tools.ImageGenTool{Loaded: loaded})
 
 	goals, _ := goal.NewStore(filepath.Join(config.DataDir(), "goals"))
 	if goals != nil {
@@ -368,6 +370,12 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 	}
 	snaps, _ := session.NewSnapshotter(loaded.ProjectRoot, config.DataDir())
 
+	// Cross-session context reuse: the shared prefix store persists the
+	// deterministic goal-state snapshot so a resumed or forked session can
+	// replay byte-identical bytes and keep the provider prompt cache warm
+	// across sessions. Best-effort: a failure only disables the reuse.
+	prefixStore, _ := prefixstore.New(filepath.Join(config.DataDir(), "memory"))
+
 	// Snapshot retention runs once per start, off the startup path: stale
 	// shadow-repo trees (e.g. a session that shadow-repo'd a personal folder
 	// before the guard existed) are pruned in the background.
@@ -394,7 +402,7 @@ func buildDeps(dir string, o opts) (tui.Deps, error) {
 		Cwd: abs, Version: "v" + Version, ResumeID: resume, InitialMsg: o.prompt,
 		SwarmManager: swarm.NewSwarmManager(),
 		Goals:        goals, Usage: usageTracker, AgentRegistry: agentRegistry,
-		Budget: ctxBudget,
+		Budget: ctxBudget, PrefixStore: prefixStore,
 	}, nil
 }
 
@@ -419,14 +427,22 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 		// knobs, so each backend runs its optimal keep-alive profile. The
 		// retention/TTL/warm values are consumed when the agent config is
 		// built (TUI/headless/rickserve resolve them per active provider).
-		_, _, keepaliveSeconds, _ := p.CacheFor(cfg)
+		_, ttlSeconds, keepaliveSeconds, _, _ := p.CacheFor(cfg)
+		// A per-route cache_strategies entry can override the keep-alive
+		// interval for this provider; the client-level keep-alive loop is
+		// configured here at build time.
+		if _, _, strategyKeepalive, _, _, _, _, _, _ := cfg.CacheStrategyFor(name, ""); strategyKeepalive > 0 {
+			keepaliveSeconds = strategyKeepalive
+		}
 		// OpenAI's in-memory cache evicts after 5-10 min of inactivity, so a
 		// session that idles must be refreshed before then. When no explicit
 		// keep-alive is configured anywhere, default the OpenAI client to a
 		// 4-minute refresh so the prefix survives idle gaps (the only way to
-		// hold a near-100% hit rate on minutes-scale TTLs).
-		if (name == "openai" || strings.Contains(name, "openai")) && keepaliveSeconds == 0 &&
-			cfg.CacheKeepaliveSeconds == 0 {
+		// hold a near-100% hit rate on minutes-scale TTLs). Anthropic's
+		// cache_control TTL is 5m (default) / 1h (extended beta), so the
+		// same default applies to it.
+		if (name == "openai" || strings.Contains(name, "openai") || name == "anthropic") &&
+			keepaliveSeconds == 0 && cfg.CacheKeepaliveSeconds == 0 {
 			keepaliveSeconds = 240
 		}
 		switch kind {
@@ -434,7 +450,9 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
 			}
-			out[name] = anthropic.New(p.APIKey, p.BaseURL)
+			c := anthropic.New(p.APIKey, p.BaseURL)
+			c.SetKeepaliveAdaptive(time.Duration(keepaliveSeconds)*time.Second, provider.KeepaliveAdaptiveFloor(keepaliveSeconds, ttlSeconds))
+			out[name] = c
 		case "openai", "openrouter", "groq", "deepseek", "together", "openai-compatible":
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
@@ -447,7 +465,7 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 					}
 				})
 			}
-			c.SetKeepalive(time.Duration(keepaliveSeconds) * time.Second)
+			c.SetKeepaliveAdaptive(time.Duration(keepaliveSeconds)*time.Second, provider.KeepaliveAdaptiveFloor(keepaliveSeconds, ttlSeconds))
 			c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 			out[name] = c
 		default:
@@ -460,7 +478,7 @@ func buildProviders(cfg config.Config, creds *config.Credentials) map[string]pro
 						}
 					})
 				}
-				c.SetKeepalive(time.Duration(keepaliveSeconds) * time.Second)
+				c.SetKeepaliveAdaptive(time.Duration(keepaliveSeconds)*time.Second, provider.KeepaliveAdaptiveFloor(keepaliveSeconds, ttlSeconds))
 				c.SetOpenRouterResponseCache(cfg.CacheOpenRouterResponse, cfg.CacheOpenRouterResponseTTL)
 				out[name] = c
 			}
@@ -893,6 +911,7 @@ func execCmd() *cobra.Command {
 			reg.Register(tools.FetchTool{})
 			reg.Register(tools.MemoryTool{})
 			reg.Register(tools.WebSearchTool{Restrictions: loaded.Config.WebSearch})
+			reg.Register(tools.ImageGenTool{Loaded: loaded})
 
 			plugins := plugin.NewRegistry()
 

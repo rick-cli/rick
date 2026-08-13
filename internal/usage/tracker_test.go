@@ -66,6 +66,32 @@ func TestDayCacheHitRate(t *testing.T) {
 	}
 }
 
+func TestDayNetCostHitRate(t *testing.T) {
+	cases := []struct {
+		day  Day
+		want float64
+	}{
+		{Day{Input: 100, CacheRead: 0}, 0},
+		{Day{Input: 100, CacheRead: 900}, 90},
+		// No writes: net == count-based hit rate.
+		{Day{Input: 300, CacheRead: 700}, 70},
+		// Writes are weighted at 1.25x: the denominator grows, so the net
+		// rate is below the count-based rate on write-heavy turns (OpenAI
+		// GPT-5.6+ bills writes at 1.25x uncached input).
+		{Day{Input: 300, CacheRead: 700, CacheWrite: 100}, 700.0 / (300.0 + 700.0 + 125.0) * 100},
+	}
+	for _, c := range cases {
+		if got := c.day.NetCostHitRate(); got != c.want {
+			t.Errorf("NetCostHitRate(%+v) = %v, want %v", c.day, got, c.want)
+		}
+	}
+	// Write-heavy: net must be strictly below the count-based rate.
+	heavy := Day{Input: 100, CacheRead: 100, CacheWrite: 200}
+	if net, count := heavy.NetCostHitRate(), heavy.CacheHitRate(); net >= count {
+		t.Errorf("NetCostHitRate(%+v) = %v should be < CacheHitRate %v", heavy, net, count)
+	}
+}
+
 func TestRecordRepairPersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	tracker := New(dir)

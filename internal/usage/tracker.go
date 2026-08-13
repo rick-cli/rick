@@ -63,6 +63,27 @@ func (d Day) CacheHitRate() float64 {
 	return float64(d.CacheRead) * 100 / float64(denom)
 }
 
+// CacheWriteWeight is the relative billed cost of a cache-write token versus
+// an uncached input token. OpenAI GPT-5.6+ bills writes at 1.25x uncached
+// input, so a naive count-based hit rate overstates the savings there. DeepSeek
+// reports no cache-write metric, so the weight only bites on write-reporting
+// providers. Exported so callers can mirror the same economics in /stats.
+const CacheWriteWeight = 1.25
+
+// NetCostHitRate is the billed-cost-aware hit rate: the share of the prompt's
+// *cost* that cache reads saved. Cache reads are the discounted bucket, cache
+// writes are weighted at CacheWriteWeight × their uncached cost, and uncached
+// input is the baseline — so on OpenAI GPT-5.6+ a write-heavy turn scores lower
+// than the count-based CacheHitRate would suggest. The honest number to display
+// when cache writes are billable.
+func (d Day) NetCostHitRate() float64 {
+	denom := float64(d.Input+d.CacheRead) + float64(d.CacheWrite)*CacheWriteWeight
+	if denom <= 0 {
+		return 0
+	}
+	return float64(d.CacheRead) * 100 / denom
+}
+
 // Add merges another day into d.
 func (d *Day) Add(o Day) {
 	d.Input += o.Input

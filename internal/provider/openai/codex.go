@@ -64,6 +64,179 @@ type codexRefreshResponse struct {
 	ExpiresIn    int    `json:"expires_in"`
 }
 
+// CodexImageRequest asks the ChatGPT Codex backend to generate an image with
+// the image_generation tool (the same tool the chat UI's picture mode uses).
+// The backend requires the mainline chat model (gpt-5.5) plus the tool; it
+// bills the generation through the account's ChatGPT plan, not the API.
+type CodexImageRequest struct {
+	// Prompt is the natural-language image prompt.
+	Prompt string
+	// Size is one of the image_generation tool sizes ("1024x1024", "1536x1024",
+	// ...). Empty uses the backend default.
+	Size string
+	// Quality is "auto" (default), "low", "medium", or "high".
+	Quality string
+}
+
+// CodexImageResult is one generated image: the raw base64 payload (either a
+// bare base64 blob or a "data:image/...;base64,..." data URI) plus the
+// revised prompt when the backend rewrote the user's wording.
+type CodexImageResult struct {
+	Base64        string
+	RevisedPrompt string
+}
+
+// codexImageModel is the mainline chat model that hosts the image_generation
+// tool. The tool picks the actual GPT-Image model ("gpt-image-2").
+const codexImageModel = "gpt-5.5"
+
+// codexImageInstructions keeps the chat model on the image task; without it
+// the model may answer in text instead of invoking the tool.
+const codexImageInstructions = "Use the image_generation tool to create exactly one image for the user's request. Return the generated image result."
+
+// GenerateImage generates one or more images through the ChatGPT backend and
+// returns the base64 payloads. It streams the Responses-API request so the
+// tool result arrives in an image_generation_call item.
+func (c *Client) GenerateImage(ctx context.Context, req CodexImageRequest) ([]CodexImageResult, error) {
+	if c.Codex == nil {
+		return nil, fmt.Errorf("image generation requires the ChatGPT OAuth login (provider \"chatgpt\")")
+	}
+	token, err := c.codexToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	quality := req.Quality
+	if quality == "" {
+		quality = "auto"
+	}
+	size := req.Size
+	if size == "" {
+		size = "1024x1024"
+	}
+	payload := map[string]any{
+		"model":        codexImageModel,
+		"instructions": codexImageInstructions,
+		"store":        false,
+		"stream":       true,
+		"input": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": req.Prompt},
+			},
+		}},
+		"tools": []any{map[string]any{
+			"type":          "image_generation",
+			"model":         "gpt-image-2",
+			"action":        "generate",
+			"size":          size,
+			"quality":       quality,
+			"output_format": "png",
+		}},
+		"tool_choice": map[string]any{"type": "image_generation"},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		codexBaseURL+"/responses", strings.NewReader(string(raw)))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	c.codexHeaders(httpReq, token)
+	resp, err := (&http.Client{Timeout: 15 * time.Minute}).Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		return nil, fmt.Errorf("codex image generation: http %d: %s", resp.StatusCode, codexSnippet(body))
+	}
+	results, err := c.readCodexImageSSE(ctx, resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("codex image generation: %w", err)
+	}
+	return results, nil
+}
+
+// readCodexImageSSE scans the Responses-API stream for image_generation_call
+// items and collects their base64 results.
+func (c *Client) readCodexImageSSE(ctx context.Context, r io.Reader) ([]CodexImageResult, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+	var out []CodexImageResult
+	for sc.Scan() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		line := strings.TrimRight(sc.Text(), "\r")
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(line[len("data:"):])
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Type  string          `json:"type"`
+			Item  json.RawMessage `json:"item"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		switch chunk.Type {
+		case "response.output_item.done":
+			var item struct {
+				Type   string `json:"type"`
+				Result string `json:"result"`
+			}
+			if len(chunk.Item) == 0 || json.Unmarshal(chunk.Item, &item) != nil || item.Type != "image_generation_call" {
+				continue
+			}
+			result := strings.TrimSpace(item.Result)
+			if result != "" {
+				out = append(out, CodexImageResult{Base64: stripDataURIPrefix(result)})
+			}
+		case "response.failed":
+			if chunk.Error != nil && chunk.Error.Message != "" {
+				return nil, fmt.Errorf("%s", chunk.Error.Message)
+			}
+			return nil, fmt.Errorf("codex response failed")
+		case "response.completed":
+			if len(out) == 0 {
+				return nil, fmt.Errorf("no image result in response")
+			}
+			return out, nil
+		}
+	}
+	if err := sc.Err(); err != nil && ctx.Err() == nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("stream ended without an image result")
+	}
+	return out, nil
+}
+
+// stripDataURIPrefix turns "data:image/png;base64,<b64>" into just <b64>.
+func stripDataURIPrefix(s string) string {
+	if idx := strings.Index(s, ";base64,"); idx >= 0 {
+		return s[idx+len(";base64,"):]
+	}
+	if idx := strings.Index(s, ","); idx >= 0 && strings.HasPrefix(s, "data:") {
+		return s[idx+1:]
+	}
+	return s
+}
+
 // refreshAccessToken exchanges the refresh token for a fresh access token at
 // the OpenAI auth server (the same endpoint the device flow uses to exchange
 // the authorization code).

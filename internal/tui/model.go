@@ -33,6 +33,7 @@ import (
 	"rick/internal/theme"
 	"rick/internal/tools"
 	"rick/internal/usage"
+	"rick/internal/prefixstore"
 	"rick/pkg/contextbudget"
 )
 
@@ -66,6 +67,19 @@ type Deps struct {
 	// Usage persists cumulative token usage per model per day.
 	Usage         *usage.Tracker
 	AgentRegistry *agent.Registry
+	// PrefixStore persists session-stable provider-prefix artifacts (the
+	// deterministic goal-state snapshot) so a resumed or forked session can
+	// replay byte-identical bytes and keep the provider prompt cache warm
+	// across sessions. Nil disables cross-session memory.
+	PrefixStore *prefixstore.Store
+}
+
+// CrossSessionMemoryEnabled reports whether cross-session context reuse is
+// active: the prefix store must exist and the config must not opt out.
+func (d Deps) CrossSessionMemoryEnabled() bool {
+	return d.PrefixStore != nil && d.Loaded != nil &&
+		d.Loaded.Config.CrossSessionMemory != nil &&
+		*d.Loaded.Config.CrossSessionMemory
 }
 
 // modal identifies the active overlay, if any.
@@ -98,11 +112,11 @@ type Model struct {
 	chatContent string
 
 	// conversation state
-	history   []provider.Message
-	sess      *session.Session
-	agentName string
-	agentID   string
-	modelID   string
+	history            []provider.Message
+	sess               *session.Session
+	agentName          string
+	agentID            string
+	modelID            string
 	designMode         bool
 	wheelPreScroll     int
 	wheelActiveUntil   time.Time
@@ -115,6 +129,15 @@ type Model struct {
 	// pendingDivergence carries the prefix-divergence diagnostics from an
 	// agent event until the next usage row arrives (they precede EvUsage).
 	pendingDivergence string
+	// pendingBoundary carries the deliberate cache-boundary decision (prune/
+	// distill commit or shadow-price deferral) from an EvCacheBoundary event
+	// until the next usage row persists it.
+	pendingBoundary *agent.CacheBoundary
+	// sessionEpoch is the durable provider-request header identity of this
+	// session (model + system + canonical tools + epoch hash), captured at
+	// the first turn and persisted on save so a resume can verify the
+	// provider prefix is byte-identical (or detect drift).
+	sessionEpoch session.EpochHeader
 
 	// repoMapOnce/repoMapBlock build the RepoMap once per session so every
 	// turn sends a byte-identical system suffix (provider cache stays warm).
@@ -219,6 +242,11 @@ type Model struct {
 	compactionActive   bool
 	compactionRunID    uint64
 	compactionCancel   context.CancelFunc
+	// compactQueued is true when the user ran /compact while a turn was
+	// active. The compaction runs the moment the turn finishes, so a
+	// user-invoked compact is never lost to a busy rejection and never races
+	// the live stream. Mirrors autoCompactPending for manual requests.
+	compactQueued bool
 	// compactIneffectiveStrikes counts consecutive compactions that saved
 	// less than 10% of the context. After two strikes automatic compaction
 	// is skipped and the reason surfaced, so a dead-end session stops
@@ -519,6 +547,11 @@ func (m *Model) updateContextWindow() {
 		if cred, ok := m.creds.Providers[provID]; ok {
 			stored = cred.ContextWindows[modelID]
 			storedSource = cred.ContextSources[modelID]
+			// A stored window with no persisted source is a user constraint;
+			// it must override id inference (e.g. gpt-5 400k).
+			if stored > 0 && storedSource == provider.ContextSourceUnknown {
+				storedSource = provider.ContextSourceConfigured
+			}
 		}
 	}
 	bestValue, bestSource = betterContextCandidate(bestValue, bestSource, stored, storedSource)
@@ -547,6 +580,8 @@ func betterContextCandidate(current int, currentSource provider.ContextSource, c
 
 func contextSourceRank(source provider.ContextSource) int {
 	switch source {
+	case provider.ContextSourceConfigured:
+		return 5
 	case provider.ContextSourceAPI:
 		return 4
 	case provider.ContextSourceBuiltin, provider.ContextSourceCatalog:
@@ -942,6 +977,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applySwarmComplete(msg)
 		return m, nil
 
+	case refMsg:
+		if msg.err != nil {
+			m.appendMsg(ChatMsg{Kind: MsgError, Text: "ref: " + msg.err.Error(), Time: nowFn()})
+			m.setStatus("session reference failed")
+			return m, nil
+		}
+		m.applyRef(msg.refs)
+		return m, nil
+
 	case compactDoneMsg:
 		if !m.compactionActive || msg.runID != m.compactionRunID {
 			return m, nil
@@ -966,6 +1010,17 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		summary := strings.TrimSpace(msg.summary)
 		if summary == "" {
 			m.setStatus("compact produced no summary")
+			return m, nil
+		}
+		// Surface-stability re-check (harness-style SurfaceChangedError): the
+		// conversation head this summary was built from must still be the
+		// live head. If the user sent messages while the summarizer ran, the
+		// span it would replace moved; committing against the stale span
+		// rewrites the provider prefix at the wrong position. Reject the
+		// compact and let the caller retry against the current surface.
+		if !compactSurfaceStable(msg.snapshot, m.history) {
+			m.compactionActive = false
+			m.setStatus("compact rejected: conversation changed during summarization — retry")
 			return m, nil
 		}
 		// Keep the stable cached prefix intact: insert the summary right
@@ -1008,6 +1063,24 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.compactIneffectiveStrikes = 0
 		}
 		m.history = newHistory
+		// Durable compaction transaction: record the exact span replaced and
+		// the summary call's cost so resume keeps the summary position
+		// stable and never re-compacts the same span.
+		if m.sess != nil {
+			summaryTokens := msg.usage.InputTokens + msg.usage.CacheReadTokens + msg.usage.CacheWriteTokens
+			m.sess.Compactions = append(m.sess.Compactions, session.CompactionRecord{
+				Time:          time.Now().Format(time.RFC3339Nano),
+				ReplacedStart: insert,
+				ReplacedEnd:   insert + removed,
+				SummaryTokens: summaryTokens,
+				Usage: session.RequestUsage{
+					Input:      msg.usage.InputTokens,
+					Output:     msg.usage.OutputTokens,
+					CacheRead:  msg.usage.CacheReadTokens,
+					CacheWrite: msg.usage.CacheWriteTokens,
+				},
+			})
+		}
 		m.msgs = append([]ChatMsg{{Kind: MsgSystem,
 			Text: "context compacted\n\n" + summary, Time: time.Now()}},
 			messagesToChat(msg.tail)...)

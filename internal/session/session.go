@@ -41,6 +41,13 @@ type Session struct {
 	EnvGit    string     `json:"env_git,omitempty"`
 	Snapshots []Snapshot `json:"snapshots,omitempty"`
 	Usage     Usage      `json:"usage"`
+	// TotalUsage is the durable whole-log cumulative token accounting: the
+	// sum of every request's usage across the session, persisted at turn/end
+	// (saveSession). Unlike Usage (context occupancy of the latest request),
+	// TotalUsage survives compaction and resume so /stats and the analyzer
+	// can compute the true whole-session cache hit rate without replaying
+	// per-request rows.
+	TotalUsage Usage `json:"total_usage,omitempty"`
 	// Requests records provider per-request token accounting (one entry per
 	// provider request / EvUsage event), not just the cumulative totals. This
 	// makes per-turn cache-hit/miss behavior observable so cache changes
@@ -51,6 +58,73 @@ type Session struct {
 	// restore an accurate context gauge.
 	ContextUsed  int               `json:"context_used,omitempty"`
 	Optimization OptimizationUsage `json:"optimization,omitempty"`
+	// Epoch is the durable provider-request header identity (harness-style
+	// request/header event): the frozen model, system prompt bytes, canonical
+	// tool list, and derived epoch hash. Persisted when the first request is
+	// built so a resumed session can prove its header is byte-identical (or
+	// detect drift — e.g. the repo-map block changed with cwd) instead of
+	// recomputing from config silently and cold-starting a new cache bucket.
+	Epoch EpochHeader `json:"epoch,omitempty"`
+	// Prunes is the durable per-node shadow-price ledger of every proactive
+	// tool-result prune: the content address and sizes of each replaced
+	// result. Persisted so a pruned tool result stays replay-safe — the
+	// original bytes are recoverable from the content-addressed store and
+	// the reclaim is auditable per node (harness-style compaction/prune
+	// event).
+	Prunes []PruneRecord `json:"prunes,omitempty"`
+	// Compactions records every durable compaction transaction: the exact
+	// message span replaced, the summary's token cost, and the provider
+	// usage of the summarization call. Resume uses it to keep the summary
+	// at byte-identical position and to never re-compact the same span.
+	Compactions []CompactionRecord `json:"compactions,omitempty"`
+}
+
+// CompactionRecord is one durable compaction transaction. ReplacedRange is
+// the inclusive message-index span folded into the summary; SummaryTokens is
+// the provider-reported cost of the summarization call; Usage carries the
+// summary call's token accounting so the aux cost is measurable.
+type CompactionRecord struct {
+	Time          string       `json:"time,omitempty"`
+	ReplacedStart int          `json:"replaced_start"`
+	ReplacedEnd   int          `json:"replaced_end"`
+	SummaryTokens int          `json:"summary_tokens,omitempty"`
+	Usage         RequestUsage `json:"usage,omitempty"`
+}
+
+// EpochHeader is the durable provider-request header identity of a session
+// (harness-style request/header event): the frozen model, the byte-stable
+// system prompt, the canonical tool schema list, and the content-addressed
+// epoch hash derived from them. Persisted with the first built request so a
+// resumed session can verify its header is byte-identical to what the
+// provider still has cached — or detect drift and re-prime — instead of
+// recomputing silently and cold-starting a new cache bucket.
+type EpochHeader struct {
+	// Model is the routed model id at the time the header was frozen.
+	Model string `json:"model,omitempty"`
+	// System is the full provider-facing system prompt bytes (stable +
+	// volatile) frozen at the first request.
+	System string `json:"system,omitempty"`
+	// SystemStable is the stable system-prefix half (cached region).
+	SystemStable string `json:"system_stable,omitempty"`
+	// Tools is the canonical (sorted, deep-normalized) tool schema list.
+	Tools []provider.ToolSchema `json:"tools,omitempty"`
+	// Hash is the content-addressed epoch hash derived from Model + System +
+	// Tools (agent.CacheScopeKeyFor). A resumed session whose recomputed
+	// header produces a different hash knows the provider prefix drifted.
+	Hash string `json:"hash,omitempty"`
+}
+
+// PruneRecord is one durable tool-result prune (harness-style
+// compaction/prune shadow-price event): the content address of the original
+// payload, its size, the provider-facing size of the summary that replaced
+// it, and the request that committed the prune.
+type PruneRecord struct {
+	Time        string `json:"time,omitempty"`
+	ToolUseID   string `json:"tool_use_id,omitempty"`
+	ContentHash string `json:"content_hash,omitempty"`
+	OriginalLen int    `json:"original_len,omitempty"`
+	SummaryLen  int    `json:"summary_len,omitempty"`
+	Request     int    `json:"request,omitempty"`
 }
 
 // RequestUsage is one request's provider-reported token accounting.
@@ -85,6 +159,11 @@ type RequestUsage struct {
 	// byte-identical repeated request billed at zero. Counted separately from
 	// prompt-cache reads so the response-cache hit rate is measurable.
 	ResponseCacheHit bool `json:"response_cache_hit,omitempty"`
+	// Boundary records the deliberate cache-boundary decision this request's
+	// build made ("tool-prune;committed;reclaim-gated episodic prune" or
+	// "distill;deferred;planned prefix still warm"). It is the audit trail
+	// for every deliberate prefix rewrite (or shadow-price deferral).
+	Boundary string `json:"boundary,omitempty"`
 }
 
 // OptimizationUsage accumulates exact local measurements for provider-facing

@@ -185,3 +185,37 @@ func TestCacheBetaHeaderMatchesRetention(t *testing.T) {
 		t.Fatalf("none retention beta = %q, want empty", got)
 	}
 }
+
+// TestParseCacheUsagePinsAnthropicNormalization pins the keep-alive cold
+// detector: a non-streaming Anthropic response's message.usage normalizes the
+// cache-creation tokens out of input (matching the Stream contract), so a
+// zero-cache-read keep-alive is detectable.
+func TestParseCacheUsagePinsAnthropicNormalization(t *testing.T) {
+	raw := []byte(`{"message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":1100,"cache_creation_input_tokens":100}}}`)
+	usage := parseCacheUsage(raw)
+	if usage == nil {
+		t.Fatal("parseCacheUsage returned nil")
+	}
+	if usage.InputTokens != 1100 {
+		t.Fatalf("input = %d, want 1100 (creation 100 normalized out)", usage.InputTokens)
+	}
+	if usage.CacheReadTokens != 1100 {
+		t.Fatalf("cache read = %d, want 1100", usage.CacheReadTokens)
+	}
+	if usage.CacheWriteTokens != 100 {
+		t.Fatalf("cache write = %d, want 100", usage.CacheWriteTokens)
+	}
+	// A warm keep-alive that reported zero cache reads is a cold prefix.
+	if usage.CacheReadTokens == 0 {
+		t.Fatal("this response has cache reads; the cold path must not fire")
+	}
+	// Cold response: only creation tokens, no reads.
+	cold := parseCacheUsage([]byte(`{"message":{"usage":{"input_tokens":200,"cache_creation_input_tokens":200}}}`))
+	if cold == nil || cold.CacheReadTokens != 0 {
+		t.Fatalf("cold response not detected: %+v", cold)
+	}
+	// Unparseable -> nil (no cold signal, no false halving).
+	if usage := parseCacheUsage([]byte(`not json`)); usage != nil {
+		t.Fatal("unparseable response should return nil")
+	}
+}

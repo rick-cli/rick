@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"rick/internal/budget"
 	"rick/internal/compress"
@@ -27,6 +28,7 @@ import (
 	"rick/internal/permission"
 	"rick/internal/plugin"
 	"rick/internal/provider"
+	"rick/internal/session"
 	"rick/internal/tokens"
 	"rick/internal/tools"
 	"rick/pkg/contextbudget"
@@ -51,6 +53,7 @@ const (
 	EvAgentReattached                  // result surfaced to a parent
 	EvAgentMessage                     // live chat or steering message injected
 	EvCacheDivergence                  // provider-prefix byte divergence vs the previous turn
+	EvCacheBoundary                    // deliberate cache boundary committed (prune/distill/compact)
 )
 
 // ToolEvent describes a tool execution.
@@ -88,10 +91,15 @@ type OptimizationStats struct {
 // full or partial re-bill. Kind is "system", "tools", or "message"; Index is
 // the first divergent message position (Kind "message"), else -1. Reason is
 // the best-effort cause inferred from the runner's own transforms.
+// CachedPrefixTokens is the estimated size (in provider cache blocks, ~256
+// tokens each, rounded down) of the prefix this request still shares with the
+// previous one — the part the provider will serve from cache — so telemetry
+// can distinguish a total cold re-bill from a partial one.
 type CacheDivergence struct {
-	Kind   string `json:"kind,omitempty"`
-	Index  int    `json:"index,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Kind               string `json:"kind,omitempty"`
+	Index              int    `json:"index,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+	CachedPrefixTokens int    `json:"cached_prefix_tokens,omitempty"`
 }
 
 // Event is one item on the agent's output stream.
@@ -101,11 +109,36 @@ type Event struct {
 	Tool       *ToolEvent
 	Usage      *provider.Usage
 	Divergence *CacheDivergence
+	Boundary   *CacheBoundary
 	// ReasoningTokens is the token size of the reasoning echo sent with this
 	// request; it rides the EvUsage event so telemetry rows can measure the
 	// deep-reasoning fresh-tail cost per request.
 	ReasoningTokens int
 	Err             error
+}
+
+// CacheBoundary describes one deliberate cache-boundary commit (or deferral)
+// on a turn: which transform fired (prune, distill, compact, reasoning-cut),
+// what provider-facing bytes it reclaimed, and the shadow price that was
+// considered. Persisted per request so the economics of each deliberate
+// invalidation are auditable.
+type CacheBoundary struct {
+	Transform string `json:"transform"`
+	// Committed is true when the rewrite was applied, false when deferred.
+	Committed bool `json:"committed"`
+	// Reason is why the boundary committed or was deferred.
+	Reason string `json:"reason,omitempty"`
+	// SavedBytes is the provider-facing byte reduction when committed.
+	SavedBytes int `json:"saved_bytes,omitempty"`
+	// ShadowPriceTokens is the estimated still-warm prefix the rewrite would
+	// invalidate (0 when no prior view existed).
+	ShadowPriceTokens int `json:"shadow_price_tokens,omitempty"`
+	// Originals is the durable per-node shadow-price ledger of a tool-prune
+	// commit: the content address and sizes of every replaced tool result,
+	// so the session can persist the reclaim and keep the original
+	// replayable from the content-addressed store (harness-style
+	// compaction/prune event).
+	Originals []contextbudget.PruneOriginal `json:"originals,omitempty"`
 }
 
 // PermissionDecision is the user's answer to an approval prompt.
@@ -164,6 +197,10 @@ type Config struct {
 	// DistillModel is the fast model used for the background summary call.
 	// Empty falls back to the primary model.
 	DistillModel string
+	// DistillThresholdPercent overrides the share of the context window at
+	// which the oldest stable prefix folds into a summary (0 = package
+	// default 55). Resolved from the per-model policy table by the caller.
+	DistillThresholdPercent int
 	// DistillSummarizer overrides the background summarizer; tests inject a
 	// stub here.
 	DistillSummarizer distill.Summarizer
@@ -191,6 +228,12 @@ type Config struct {
 	// CacheRetention is the prompt-cache policy for every request of this
 	// run: "" = provider default, "long" = extended TTL, "none" = disabled.
 	CacheRetention provider.CacheRetention
+	// CacheStrategy, when set, is the pluggable prompt-cache policy for the
+	// whole run. It overrides the flat cache knobs below (CacheRetention,
+	// CacheTTLSeconds, WarmCache, WarmTurn, PassbackReasoning,
+	// MaxReasoningTurns, and the divergence reason). Leave nil to use the
+	// flat knobs via provider.DefaultStrategy.
+	CacheStrategy provider.CacheStrategy
 	// CacheTTLSeconds overrides the provider's assumed prompt-cache lifetime
 	// for idle-gap pre-warm decisions. Zero uses the per-vendor table.
 	CacheTTLSeconds int
@@ -200,6 +243,18 @@ type Config struct {
 	// turn. A cache-warm provider call in this package must remain optional;
 	// a provider that doesn't implement CacheWarmber is skipped.
 	WarmCache bool
+	// WarmTurn, when true, primes the full provider-facing prefix before
+	// every real turn (not just session start). Providers whose cache
+	// evicts mid-session never pay a full uncached re-bill; the cost is one
+	// cheap non-streaming request per turn. Requires WarmCache to be
+	// enabled in the runner (WarmTurn only changes how often it fires).
+	WarmTurn bool
+	// PassbackReasoning, when true, drops reasoning_content from
+	// tool-call-free turns on DeepSeek-line providers. The cached prefix is
+	// never rewritten (the drop lands at the append-only tail), but the
+	// fresh-tail cost of long reasoning chains shrinks. Defaults to false
+	// (keep every reasoning block for a byte-identical prefix).
+	PassbackReasoning bool
 	// CacheScopeKey, when set, is used as the prompt-cache key scope for
 	// every request of this run, replacing the session id. Non-interactive
 	// runs (cron, rickserve one-shots, CI) each mint a fresh session id that
@@ -207,6 +262,13 @@ type Config struct {
 	// from the stable prompt content instead lets identical runs share a
 	// warm bucket while separate conversations never collide.
 	CacheScopeKey string
+	// PriorEpoch, when set, is the durable request-header identity of a
+	// resumed session (session.EpochHeader). The runner verifies its own
+	// freshly built header against it: a drift (repo-map block changed with
+	// cwd, model switched, tools changed) is detected up front and surfaced
+	// as a divergence event so the resume re-primes instead of silently
+	// cold-starting a new cache bucket mid-session.
+	PriorEpoch *session.EpochHeader
 	// MaxReasoningTurns caps the prior-turn reasoning echoed back to
 	// DeepSeek-line providers (0 = keep all, byte-stable prefix).
 	MaxReasoningTurns int
@@ -214,6 +276,10 @@ type Config struct {
 	// (0 = default 16 KiB) so a single turn's fresh tail stays small and the
 	// provider prefix cache stays hot.
 	MaxToolResultBytes int
+	// SpillBytes, when positive, is the tool-result size above which the
+	// full output is persisted to the content-addressed store and the model
+	// sees a bounded preview plus retrieval locator (spill). 0 disables.
+	SpillBytes int
 	// PinnedToolSchemas fixes the provider-facing tool list for the whole
 	// run, so mid-session tool toggles or plugin churn never change the
 	// cached prefix bytes. When nil the registry + ToolFilter are used.
@@ -256,11 +322,34 @@ type Runner struct {
 	systemOnce   sync.Once
 	pinnedSystem string
 
+	// schemasOnce/frozenSchemas freeze the provider-facing tool schema list
+	// once per run (the request-header half of the cache prefix). A mid-run
+	// registry change cannot rewrite the cached prefix bytes; the frozen
+	// list is what the epoch hash is derived from.
+	schemasOnce    sync.Once
+	frozenSchemas  []provider.ToolSchema
+
+	// epochHash is the content-addressed identity of this run's frozen
+	// header (model + stable system prefix + canonical tool list), computed
+	// once from the first built request. It routes the prompt-cache key and
+	// session-affinity hints, and survives resume: a restarted session with
+	// an identical header derives the same hash and rides the same warm
+	// bucket (mirrors the harness's request-header epoch). The runner
+	// exposes it on every request so the provider never sees a different
+	// cache scope across turns.
+	epochHash     string
+	epochHashOnce sync.Once
+
 	// Prefix-divergence tracking: hashes of the last sent view, used to
 	// detect (and attribute) any byte change before the previous tail.
 	prevSystemHash string
 	prevToolsHash  string
 	prevMsgHashes  []string
+	// pendingBoundary carries the deliberate cache-boundary decision made
+	// while building the current request (prune/distill commit or shadow-
+	// price deferral). It rides the EvUsage event so telemetry rows can
+	// audit each deliberate invalidation.
+	pendingBoundary *CacheBoundary
 	// lastMutation names the runner's own transform that fired on the
 	// current turn ("head-trim", "distill"), to attribute divergences.
 	lastMutation string
@@ -279,15 +368,68 @@ type Runner struct {
 	// was dispatched, used to spot idle gaps past the provider cache TTL so
 	// the next turn can re-prime the full prefix before streaming (P1c).
 	lastRequest time.Time
+	// gapBeforeTurn is the idle gap between the previous dispatch and the
+	// current turn's dispatch. When a provider eviction is observed on this
+	// turn's usage, that gap is the cause; recording it lets the warm
+	// threshold adapt to the endpoint's real eviction point.
+	gapBeforeTurn time.Duration
+	// observedEvictionGap is the shortest idle gap that has provably
+	// evicted the provider's prefix cache this run (0 = none observed).
+	// cacheTTL() tightens the warm threshold to just below it, so a
+	// provider that evicts at minutes-scale (free flash tiers) gets re-warmed
+	// before the eviction point instead of at the vendor table's day-long
+	// assumption.
+	observedEvictionGap time.Duration
 	// lastViewBytes is the serialized size of the provider view sent last
 	// turn; the per-turn growth feeds the prune-rearm accumulator so a
 	// disarmed prune commits again only after the history regrows a
 	// trigger-sized runway.
 	lastViewBytes int
+	// lastUsageTokens is the provider-reported footprint of the previous
+	// request (input + cache read + cache write), the usage-anchored
+	// baseline for budget/distillation decisions. It is authoritative where
+	// byte estimates are not: a provider that reports cache reads knows the
+	// real cached region, so compaction fires on measured occupancy instead
+	// of a heuristic byte estimate.
+	lastUsageTokens int
+	// lastCacheReadTokens is the provider-reported cache-read (hit) tokens
+	// of the previous request. A provider that reports zero cache reads may
+	// simply omit the field (DeepSeek reports no cache-write metric; some
+	// gateways report no cache at all), so usage-anchored distillation must
+	// only trust occupancy when cache reads were actually reported — a
+	// garbage zero would otherwise fire distillation on turn one.
+	lastCacheReadTokens int
+	// lastPlannedPrefixTokens is the most recent pre-flight estimate of how
+	// many provider cache-block tokens this request still shares with the
+	// previous one (see cachePrefixTokens). It is the shadow price of a
+	// distill fold: the estimated cost of the warm prefix that a fold would
+	// rewrite. Zero means "no prior view to compare" (first request).
+	lastPlannedPrefixTokens int
+	// usageRing is a bounded ring of the most recent per-turn usage records
+	// (prompt footprint + cache-read tokens), used to infer the eviction
+	// point of a partial (not total) prefix-cache drop. DeepSeek-style
+	// bounded-LRU caches evict in waves: a turn that reads far less than
+	// the previous turn sent, but more than zero, marks where the eviction
+	// cut — the re-warm must fire just before that point on the next gap.
+	usageRing   [usageRingDepth]usageSample
+	usageRingAt int
+	usageRingN  int
 	// warmErrWarned dedupes warming-failure notices to one per distinct
 	// error message per run, so a broken warm is surfaced without spamming.
 	warmErrWarned string
 }
+
+// usageSample is one turn's provider-reported prompt accounting.
+type usageSample struct {
+	prompt     int // input + cache read + cache write
+	cacheRead  int // cache-read (hit) tokens
+	gapBefore  time.Duration
+	reasoning  int // client-side reasoning echo size this request
+}
+
+// usageRingDepth bounds the per-turn usage ring used for eviction-point
+// inference (the last few turns are enough to spot a wave).
+const usageRingDepth = 8
 
 // New builds a Runner.
 func New(cfg Config) *Runner {
@@ -360,12 +502,39 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 	if len(schemas) == 0 {
 		schemas = r.cfg.Tools.Schemas(r.cfg.ToolFilter)
 	}
+	// Structural freeze (harness-style): the tool schema list and the system
+	// prompt are the request-header half of the cache prefix. Freeze them
+	// once at run start so a mid-run registry change (plugin churn, /tools
+	// toggle, subagent re-registration) can never silently rewrite the
+	// cached prefix bytes. The epoch hash is derived from this frozen
+	// snapshot, so any drift would change the cache bucket — fail closed
+	// rather than cold-start every later turn.
+	schemas = r.freezeSchemas(schemas)
+
+	// Resume header-drift guard (harness-style request/header event): when
+	// this run resumed a session whose durable header no longer matches the
+	// bytes the next request will send (repo-map block changed with cwd,
+	// model switched, tools changed), surface it as a divergence once before
+	// the first turn so the caller can re-warm — never silently pay a cold
+	// re-bill under a stale cache scope. The drift also latches the P1c
+	// re-warm (see the warm gate below): the new header must be primed
+	// before the first real turn streams, even when general warming is off,
+	// because the drift itself invalidated the prefix the session had warm.
+	var resumeDrifted bool
+	if prior := r.checkPriorEpoch(r.systemBlock(msgs, schemas), r.cfg.SystemStable, schemas); prior != "" {
+		resumeDrifted = true
+		emit(Event{Kind: EvCacheDivergence, Divergence: &CacheDivergence{
+			Kind:   "epoch",
+			Index:  -1,
+			Reason: "resume-header-drift:" + prior,
+		}})
+	}
 
 	// P1: session-start prompt-cache warm. Submit a small best-effort request
 	// so the provider populates its cache for the frozen system+tools prefix
 	// before the first real turn. Only providers that implement
 	// provider.CacheWarmber are warmed; failures are never fatal.
-	if r.cfg.WarmCache {
+	if r.cfg.WarmCache || (r.cfg.CacheStrategy != nil && r.cfg.CacheStrategy.WarmCache()) {
 		if warmer, ok := r.cfg.Provider.(provider.CacheWarmber); ok {
 			warmReq := r.buildRequest(msgs, schemas)
 			// D1: prime only the stable prefix. The system prompt + tool
@@ -376,6 +545,7 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 			// non-empty messages array.
 			warmReq.Messages = stableWarmHead(warmReq.Messages)
 			warmReq.CacheBoundaries = nil
+			warmReq.Purpose = provider.PurposeWarm
 			if warmReq.CacheRetention == "" {
 				warmReq.CacheRetention = provider.CacheRetentionLong
 			}
@@ -419,9 +589,42 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 
 		req := r.buildRequest(msgs, schemas)
 		r.lastReasoningTokens = countThinkingTokens(req.Messages, r.requestEncoding())
+		if !r.lastRequest.IsZero() {
+			r.gapBeforeTurn = time.Since(r.lastRequest)
+		} else {
+			r.gapBeforeTurn = 0
+		}
+		// Surface any deliberate cache-boundary decision this request's
+		// build made (prune/distill commit or shadow-price deferral) before
+		// the stream starts, so the TUI and telemetry can audit it.
+		if r.pendingBoundary != nil {
+			boundary := r.pendingBoundary
+			r.pendingBoundary = nil
+			if !emit(Event{Kind: EvCacheBoundary, Boundary: boundary}) {
+				return appended, ctx.Err()
+			}
+		}
 		if div := r.trackPrefix(req); div != nil {
 			if !emit(Event{Kind: EvCacheDivergence, Divergence: div}) {
 				return appended, ctx.Err()
+			}
+			// Pre-send structural invariant (harness-style): within one run
+			// the provider view may only ever grow at the tail. A mid-prefix
+			// rewrite that none of the runner's declared transforms accounts
+			// for is a cache-correctness bug — the provider would re-bill the
+			// whole tail cold and every later turn would too. Fail closed
+			// instead of silently paying the re-bill. The deliberate
+			// at-most-once rewrites (head-trim, distill, reasoning-cut,
+			// tool-prune, dedup, previous compaction summary) are already
+			// re-warmed by P1c below and are allowed through.
+			if div.Reason == "unexpected" {
+				at := ""
+				if div.Index >= 0 {
+					at = fmt.Sprintf(" at message %d", div.Index)
+				}
+				err := fmt.Errorf("agent: provider view diverged mid-prefix with no declared transform (%s%s); refusing to re-bill the cache cold", div.Kind, at)
+				emit(Event{Kind: EvError, Err: err})
+				return appended, err
 			}
 		}
 
@@ -434,6 +637,9 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		// the prefix back from cache instead of re-billing it cold. Errors
 		// are surfaced once instead of swallowed.
 		//
+		// WarmTurn primes before every real turn: providers whose cache evicts
+		// mid-session (short-TTL free tiers) never pay a full uncached re-bill.
+		//
 		// A head-trim rewrites the provider-facing prefix by definition (the
 		// trim sentinel replaces the dropped head), so the next request is a
 		// guaranteed cold re-bill unless the new prefix is primed first. That
@@ -441,12 +647,22 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 		// only way to avoid a re-bill the trim itself caused, and it costs
 		// one small request per trim (trims are rare, once per long session).
 		if warmer, ok := r.cfg.Provider.(provider.CacheWarmber); ok {
+			strategy := r.cacheStrategy()
+			// A partial eviction (bounded-LRU wave) that dropped a mid-prefix
+			// region without zeroing the whole cache: re-warm before this
+			// request so the stream re-reads the surviving prefix instead of
+			// re-billing the dropped wave cold.
+			partialEvicted := r.inferredEvictionPoint() > 0
 			warmNeeded := strings.HasPrefix(r.lastMutation, "head-trim") ||
-				(r.cfg.WarmCache && (cacheEvicted ||
+				resumeDrifted ||
+				(strategy.WarmCache() && (strategy.WarmTurn() ||
+					cacheEvicted ||
+					partialEvicted ||
 					(turn == 0 && len(req.Messages) > 1) ||
 					(!r.lastRequest.IsZero() && time.Since(r.lastRequest) > r.cacheTTL())))
 			if warmNeeded {
 				warmReq := req
+				warmReq.Purpose = provider.PurposeWarm
 				if warmReq.CacheRetention == "" {
 					warmReq.CacheRetention = provider.CacheRetentionLong
 				}
@@ -534,11 +750,36 @@ func (r *Runner) Run(ctx context.Context, history []provider.Message, out chan<-
 					if prevCacheRead > 0 && prompt > 0 &&
 						ev.Usage.CacheReadTokens < min(prevPrompt, prompt)-cacheMissNoiseFloor {
 						cacheEvicted = true
+						// Learn the endpoint's real eviction point: the idle
+						// gap before this turn is what caused the provider to
+						// drop the prefix. The shortest provable eviction gap
+						// tightens cacheTTL() so the next idle-gap re-warm
+						// fires before the eviction instead of after it.
+						if r.gapBeforeTurn > 0 && (r.observedEvictionGap == 0 || r.gapBeforeTurn < r.observedEvictionGap) {
+							r.observedEvictionGap = r.gapBeforeTurn
+						}
 					}
 					prevPrompt = prompt
 					if ev.Usage.CacheReadTokens+ev.Usage.CacheWriteTokens > 0 {
 						prevCacheRead = ev.Usage.CacheReadTokens + ev.Usage.CacheWriteTokens
 					}
+					// Usage-anchored baseline: the provider's own footprint (miss
+					// + hit + write) is the authoritative occupancy for the next
+					// compaction decision. Byte estimates are only a proxy; a
+					// provider that reports cache reads knows the real cached
+					// region, so shouldDistill can fire on measured occupancy.
+					r.lastUsageTokens = prompt
+					r.lastCacheReadTokens = ev.Usage.CacheReadTokens
+					// Ring the per-turn usage so a partial eviction (a wave
+					// that drops a mid-prefix region but not the whole cache)
+					// can be inferred from the last few turns' read/prompt
+					// ratio, not just the immediately previous one.
+					r.recordUsageSample(usageSample{
+						prompt:    prompt,
+						cacheRead: ev.Usage.CacheReadTokens,
+						gapBefore: r.gapBeforeTurn,
+						reasoning: r.lastReasoningTokens,
+					})
 					// Enforce the active goal's token budget, if any.
 					if r.cfg.Goals != nil {
 						if g, _ := r.cfg.Goals.GetActive(); g != nil && g.Status == "active" {
@@ -921,6 +1162,17 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 			retained = pruned.View
 			boundaries = r.budget.ChooseBoundaries(retained)
 			r.lastMutation = "tool-prune"
+			r.pendingBoundary = &CacheBoundary{
+				Transform:  "tool-prune",
+				Committed:  true,
+				Reason:     "reclaim-gated episodic prune",
+				SavedBytes: pruned.SavedBytes,
+				// Durable per-node shadow-price ledger: each replaced tool
+				// result's content address + sizes ride the boundary so the
+				// session persists the reclaim and the original stays
+				// replayable from the content-addressed store.
+				Originals: append([]contextbudget.PruneOriginal(nil), pruned.Originals...),
+			}
 			// A prune rewrites the old head; reset the stable-head sentinel
 			// so the new head stays fixed and the view resumes append-only
 			// growth (same contract as distill).
@@ -934,20 +1186,49 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 	// State distillation: when the transcript approaches the context budget,
 	// collapse the oldest stable prefix into a structured summary placed just
 	// after the cache breakpoint. Best-effort: every failure keeps the view.
+	// The summarizer receives this request's system+tools so its auxiliary
+	// call replays the exact cached prefix (see providerSummarizer).
 	if r.shouldDistill(plan, contextWindow) {
-		if result := distill.Distill(retained, boundaries, r.distillOptions()); result.Replaced {
+		opts := r.distillOptions()
+		opts.System = system
+		opts.Tools = schemas
+		// Shadow price: the planned cache prefix this request would still
+		// share with the previous one. When it covers more than the region
+		// being folded, deferring avoids rewriting warm bytes for no gain.
+		opts.PlannedPrefixTokens = r.lastPlannedPrefixTokens
+		result := distill.Distill(retained, boundaries, opts)
+		if result.Replaced {
 			retained = result.Messages
 			boundaries = r.budget.ChooseBoundaries(retained)
 			r.lastMutation = "distill"
+			r.pendingBoundary = &CacheBoundary{
+				Transform:         "distill",
+				Committed:         true,
+				Reason:            "budget-threshold fold",
+				SavedBytes:        result.BeforeBytes - result.AfterBytes,
+				ShadowPriceTokens: r.lastPlannedPrefixTokens,
+			}
 			// Distillation rebuilds the head (the one deliberate, whole-prefix
 			// cache invalidation). Reset the stable-head sentinel so the new
 			// head stays fixed and the view resumes append-only growth.
 			r.trimEngaged = false
 			r.trimStart = 0
 			r.trimHead = provider.Message{}
+		} else if result.Err != nil && errors.Is(result.Err, distill.ErrPlannedPrefixStillWarm) {
+			// Shadow-price deferral is a deliberate non-event worth
+			// recording: the warm prefix outweighed the fold, so the
+			// session kept its bytes. Telemetry can verify the shadow
+			// price saved a re-bill instead of guessing.
+			r.pendingBoundary = &CacheBoundary{
+				Transform:         "distill",
+				Committed:         false,
+				Reason:            "planned prefix still warm",
+				ShadowPriceTokens: r.lastPlannedPrefixTokens,
+			}
 		}
 	}
 
+	strategy := r.cacheStrategy()
 	return provider.Request{
 		Model:             r.cfg.Model,
 		System:            system,
@@ -958,11 +1239,22 @@ func (r *Runner) buildRequest(messages []provider.Message, schemas []provider.To
 		Temperature:       r.cfg.Temperature,
 		Reasoning:         r.cfg.Reasoning,
 		CacheBoundaries:   boundaries,
-		CacheRetention:    r.cfg.CacheRetention,
+		CacheRetention:    strategy.Retention(),
 		MaxReasoningTurns: r.wireReasoningTurns(),
+		PassbackReasoning: r.passbackReasoning(),
 		SessionID:         r.cfg.SessionID,
 		CacheScopeKey:     r.cacheScopeKey(),
+		EpochHash:         r.runEpochHash(system, r.cfg.SystemStable, schemas),
 	}
+}
+
+// passbackReasoning resolves the DeepSeek reasoning-passback rule for the
+// run: the strategy wins when set; otherwise the flat cfg knob.
+func (r *Runner) passbackReasoning() bool {
+	if r.cfg.CacheStrategy != nil {
+		return r.cfg.CacheStrategy.PassbackReasoning()
+	}
+	return r.cfg.PassbackReasoning
 }
 
 // cacheScopeKey returns the prompt-cache routing scope for this run. An
@@ -991,16 +1283,107 @@ func (r *Runner) cacheScopeKey() string {
 	return ""
 }
 
+// runEpochHash returns the content-addressed identity of this run's frozen
+// request header: the model, the byte-stable system prefix, and the
+// canonical tool list. It is computed once from the first built request and
+// pinned for the whole run, so every turn (and every warm/keep-alive replay)
+// routes to the same provider cache bucket. A resumed session that derives
+// the identical header reuses the same hash and rides the warm prefix instead
+// of cold-writing a fresh bucket under a new session id.
+func (r *Runner) runEpochHash(system, stable string, schemas []provider.ToolSchema) string {
+	r.epochHashOnce.Do(func() {
+		stableSystem := stable
+		if stableSystem == "" {
+			stableSystem = system
+		}
+		r.epochHash = CacheScopeKeyFor(r.cfg.Model, stableSystem, schemas)
+	})
+	return r.epochHash
+}
+
+// epochHeader returns the durable provider-request header identity of this
+// run (harness-style request/header event): the frozen model, system prompt
+// bytes, canonical tool list, and the derived epoch hash. It is persisted on
+// the session at save time so a resumed session can prove its header is
+// byte-identical (or detect drift) instead of recomputing from config.
+func (r *Runner) epochHeader(system, stable string, schemas []provider.ToolSchema) session.EpochHeader {
+	return session.EpochHeader{
+		Model:        r.cfg.Model,
+		System:       system,
+		SystemStable: stable,
+		Tools:        append([]provider.ToolSchema(nil), schemas...),
+		Hash:         r.runEpochHash(system, stable, schemas),
+	}
+}
+
+// checkPriorEpoch verifies a resumed session's durable header against this
+// run's freshly built one. A drift — the repo-map block changed with cwd, the
+// model switched, the tool list changed — means the provider prefix this
+// session last warmed no longer matches the bytes the next request will send;
+// the provider would re-bill the whole tail cold. Detecting it up front (and
+// letting the caller re-warm) is strictly better than silently building a
+// different request and paying the miss. Returns the divergence reason, or ""
+// when the headers match or no prior header exists.
+func (r *Runner) checkPriorEpoch(system, stable string, schemas []provider.ToolSchema) string {
+	prior := r.cfg.PriorEpoch
+	if prior == nil || prior.Hash == "" {
+		return ""
+	}
+	current := r.epochHeader(system, stable, schemas)
+	if current.Hash == prior.Hash {
+		return ""
+	}
+	// Named cause: which header field drifted.
+	switch {
+	case prior.Model != "" && current.Model != prior.Model:
+		return "model:" + prior.Model + "->" + current.Model
+	case prior.System != "" && current.System != prior.System:
+		return "system"
+	case prior.SystemStable != "" && current.SystemStable != prior.SystemStable:
+		return "system-stable"
+	case len(prior.Tools) != len(current.Tools):
+		return "tools:" + itoa(len(prior.Tools)) + "->" + itoa(len(current.Tools))
+	default:
+		return "header-drift"
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
 // wireReasoningTurns is what the provider adapter sees. The one-shot cap
 // already rewritten the message list structurally (cappedMessages), so the
 // wire must retain everything it now holds: a rotating strip would slide the
 // kept window every turn and re-bill the provider cache. 0 = the adapter's
 // retain-all behaviour.
 func (r *Runner) wireReasoningTurns() int {
-	if r.cfg.MaxReasoningTurns > 0 {
+	max := r.cfg.MaxReasoningTurns
+	if r.cfg.CacheStrategy != nil {
+		max = r.cfg.CacheStrategy.MaxReasoningTurns()
+	}
+	if max > 0 {
 		return 0
 	}
-	return r.cfg.MaxReasoningTurns
+	return max
 }
 
 // cappedMessages returns the provider-visible message list after applying the
@@ -1009,12 +1392,16 @@ func (r *Runner) wireReasoningTurns() int {
 // byte-pinned: the prefix changes once and afterwards only grows, so the
 // provider cache is never re-billed by a rotating reasoning window.
 func (r *Runner) cappedMessages(messages []provider.Message, encoding tokens.Encoding) []provider.Message {
-	if r.cfg.MaxReasoningTurns <= 0 {
+	max := r.cfg.MaxReasoningTurns
+	if r.cfg.CacheStrategy != nil {
+		max = r.cfg.CacheStrategy.MaxReasoningTurns()
+	}
+	if max <= 0 {
 		return messages
 	}
 	if !r.reasoningCutSet {
 		r.reasoningCutSet = true
-		r.reasoningCutIndex = reasoningCutIndex(messages, r.cfg.MaxReasoningTurns)
+		r.reasoningCutIndex = reasoningCutIndex(messages, max)
 		r.lastMutation = "reasoning-cut"
 	}
 	cut := r.reasoningCutIndex
@@ -1084,6 +1471,17 @@ func countThinkingTokens(messages []provider.Message, encoding tokens.Encoding) 
 // systemBlock returns the full system prompt for the run, frozen after the
 // first build: env block, Repo map, and tool manifest are computed once so
 // their bytes can never drift between turns and cold-start the prefix cache.
+// freezeSchemas returns the frozen provider-facing tool schema list for the
+// run. The first call pins the schemas; every later call returns the same
+// byte-identical slice, so the epoch hash and the wire prefix never see a
+// mid-run schema change.
+func (r *Runner) freezeSchemas(schemas []provider.ToolSchema) []provider.ToolSchema {
+	r.schemasOnce.Do(func() {
+		r.frozenSchemas = append([]provider.ToolSchema(nil), schemas...)
+	})
+	return r.frozenSchemas
+}
+
 func (r *Runner) systemBlock(messages []provider.Message, schemas []provider.ToolSchema) string {
 	r.systemOnce.Do(func() {
 		system := r.cfg.System
@@ -1116,12 +1514,16 @@ func (r *Runner) trackPrefix(req provider.Request) *CacheDivergence {
 	toolsHash := hashBytes(marshalBytes(req.Tools))
 
 	if r.prevSystemHash != "" || len(r.prevMsgHashes) > 0 {
+		// Snapshot the previous view before capturePrefix refreshes it, so
+		// the pre-flight estimate compares against the bytes the provider
+		// actually has cached.
+		prevSystemHash, prevToolsHash, prevMsgHashes := r.prevSystemHash, r.prevToolsHash, r.prevMsgHashes
 		d := &CacheDivergence{Index: -1}
 		switch {
-		case sysHash != r.prevSystemHash:
+		case sysHash != prevSystemHash:
 			d.Kind = "system"
 			d.Reason = "system-prompt"
-		case toolsHash != r.prevToolsHash:
+		case toolsHash != prevToolsHash:
 			d.Kind = "tools"
 			d.Reason = "tool-schema"
 		default:
@@ -1129,10 +1531,9 @@ func (r *Runner) trackPrefix(req provider.Request) *CacheDivergence {
 			for i := range req.Messages {
 				cur[i] = hashBytes(marshalBytes(req.Messages[i]))
 			}
-			prev := r.prevMsgHashes
 			mismatch := -1
-			for i := 0; i < len(cur) && i < len(prev); i++ {
-				if cur[i] != prev[i] {
+			for i := 0; i < len(cur) && i < len(prevMsgHashes); i++ {
+				if cur[i] != prevMsgHashes[i] {
 					mismatch = i
 					break
 				}
@@ -1142,15 +1543,26 @@ func (r *Runner) trackPrefix(req provider.Request) *CacheDivergence {
 				d.Kind = "message"
 				d.Index = mismatch
 				d.Reason = r.inferReason(req, mismatch)
-			case len(cur) < len(prev):
+			case len(cur) < len(prevMsgHashes):
 				d.Kind = "message"
 				d.Index = len(cur)
 				d.Reason = r.inferReason(req, -1)
 			}
 		}
+		if d.Kind != "" {
+			// Pre-flight estimate of what still hits: the common prefix in
+			// provider cache blocks.
+			d.CachedPrefixTokens = cachePrefixTokens(req, prevSystemHash, prevToolsHash, prevMsgHashes, r.requestEncoding())
+			r.lastPlannedPrefixTokens = d.CachedPrefixTokens
+		}
 		// Refresh the previous view regardless of the outcome.
 		r.capturePrefix(sysHash, toolsHash, &req)
 		if d.Kind == "" {
+			// No divergence: the whole stable head still matches, so the
+			// planned prefix is the shared bytes (system + tools + common
+			// messages), floored to cache blocks. Record it for the shadow
+			// price even though no divergence event is emitted.
+			r.lastPlannedPrefixTokens = cachePrefixTokens(req, prevSystemHash, prevToolsHash, prevMsgHashes, r.requestEncoding())
 			return nil
 		}
 		return d
@@ -1158,6 +1570,44 @@ func (r *Runner) trackPrefix(req provider.Request) *CacheDivergence {
 	r.capturePrefix(sysHash, toolsHash, &req)
 	return nil
 }
+
+// cachePrefixTokens estimates how many tokens of this request's provider
+// prefix will still be served from cache, given the previous request's
+// serialized hashes. The estimate counts the byte-identical system + tool
+// schema + message prefix (the parts that survived) and floors it to the
+// provider's cache-block granularity (~256 tokens), because DeepSeek-line
+// caches round down to the last full block. A zero result means the rewrite
+// sits at or before the first byte of the shared head (a total cold re-bill).
+func cachePrefixTokens(req provider.Request, prevSystemHash, prevToolsHash string, prevMsgHashes []string, encoding tokens.Encoding) int {
+	if len(req.Messages) == 0 && req.System == "" && len(req.Tools) == 0 {
+		return 0
+	}
+	// System and tools are stable for a run; a mismatch there kills the whole
+	// head before the first message token.
+	if prevSystemHash != "" && hashBytes(marshalBytes([]byte(req.System))) != prevSystemHash {
+		return 0
+	}
+	if prevToolsHash != "" && hashBytes(marshalBytes(req.Tools)) != prevToolsHash {
+		return 0
+	}
+	prefixTokens := countTokens(req.System, encoding) + countJSONValues(req.Tools, encoding)
+	for i := 0; i < len(req.Messages) && i < len(prevMsgHashes); i++ {
+		if hashBytes(marshalBytes(req.Messages[i])) != prevMsgHashes[i] {
+			break
+		}
+		prefixTokens += countMessages(req.Messages[i:i+1], encoding)
+	}
+	return (prefixTokens / cacheBlockTokens) * cacheBlockTokens
+}
+
+// cacheBlockTokens is the provider's prompt-cache block granularity (~256
+// tokens, rounded down to the last full block per deepseek-harness probe_5).
+const cacheBlockTokens = 256
+
+// CachePrefixWarnTokens is the minimum cached prefix (in tokens) whose loss
+// is worth surfacing as a warning on a divergence event. Below it the
+// re-bill is small enough to ignore in telemetry.
+const CachePrefixWarnTokens = 4 << 10
 
 func (r *Runner) capturePrefix(sysHash, toolsHash string, req *provider.Request) {
 	r.prevSystemHash = sysHash
@@ -1177,6 +1627,11 @@ func (r *Runner) capturePrefix(sysHash, toolsHash string, req *provider.Request)
 // allowed to make are the head-trim sentinel, the one-shot distill fold,
 // and the one-shot reasoning cap cut.
 func (r *Runner) inferReason(req provider.Request, index int) string {
+	if r.cfg.CacheStrategy != nil {
+		if reason := r.cfg.CacheStrategy.DivergenceReason(); reason != "" {
+			return reason
+		}
+	}
 	switch {
 	case r.lastMutation == "head-trim" || strings.HasPrefix(r.lastMutation, "head-trim+"):
 		return "head-trim"
@@ -1558,6 +2013,27 @@ func (r *Runner) toolResultMaxBytes() int {
 // reversible live-zone pass. The pre-live-zone payload is stored under the
 // call id so the model can retrieve it via retrieve_uncompressed_context.
 func (r *Runner) capToolOutput(call provider.ToolCall, output string, isError bool) (string, *OptimizationStats) {
+	// Spill (harness-style tool-output spill): when the raw output is huge
+	// and spilling is enabled, persist the full bytes under their content
+	// address and send only a bounded preview plus a retrieval locator. The
+	// model can pull the whole blob back with retrieve_uncompressed_context,
+	// so the fresh tail stays small without losing data. Error output and
+	// already-small results are never spilled.
+	if r.cfg.SpillBytes > 0 && !isError && len(output) > r.cfg.SpillBytes {
+		if key := r.budget.StorePayload(output); key != "" {
+			preview := spillPreview(output, r.toolResultMaxBytes())
+			modelOutput := fmt.Sprintf("[spilled %d bytes; retrieve with retrieve_uncompressed_context key=%s]\n\n%s",
+				len(output), key, preview)
+			return modelOutput, &OptimizationStats{
+				Stage:            "spill",
+				OriginalBytes:    len(output),
+				CompressedBytes:  len(modelOutput),
+				OriginalTokens:   countTokens(output, tokens.EncodingCl100kBase),
+				CompressedTokens: countTokens(modelOutput, tokens.EncodingCl100kBase),
+				SavedTokens:      maxInt(0, countTokens(output, tokens.EncodingCl100kBase)-countTokens(modelOutput, tokens.EncodingCl100kBase)),
+			}
+		}
+	}
 	modelOutput, stats := capToolOutputStatic(call, output, isError, r.toolResultMaxBytes())
 	if r.budget != nil && r.budget.Enabled() && !isError && len(modelOutput) > 0 {
 		key := call.ID
@@ -1580,6 +2056,51 @@ func (r *Runner) capToolOutput(call provider.ToolCall, output string, isError bo
 		}
 	}
 	return modelOutput, stats
+}
+
+// spillPreview renders a bounded head+marker+tail preview of a spilled tool
+// result, mirroring the deterministic truncation in compress.finish so the
+// model still sees the beginning and the diagnostic tail. The full output is
+// retrievable by its content-address key.
+func spillPreview(output string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = maxModelToolResultBytes
+	}
+	if len(output) <= maxBytes {
+		return output
+	}
+	omitted := len(output) - maxBytes
+	marker := fmt.Sprintf("\n… <spilled output truncated; %d bytes omitted — use retrieve_uncompressed_context for the full payload>", omitted)
+	remaining := maxBytes - len(marker)
+	if remaining <= 0 {
+		return marker
+	}
+	headBytes := remaining / 2
+	tailBytes := remaining - headBytes
+	return safeHead(output, headBytes) + marker + safeTail(output, tailBytes)
+}
+
+func safeHead(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	s = s[:n]
+	for n > 0 && !utf8.RuneStart(s[n-1]) {
+		n--
+		s = s[:n]
+	}
+	return s
+}
+
+func safeTail(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 func capToolOutputStatic(call provider.ToolCall, output string, isError bool, maxBytes int) (string, *OptimizationStats) {
@@ -1847,13 +2368,75 @@ func oneLine(s string) string {
 	return s
 }
 
-// cacheTTL bounds how long a warm prefix is assumed to survive at the
-// provider before an idle gap forces a re-warm. The vendor table replaces
-// the old fixed 5-minute default: DeepSeek-line endpoints keep their prefix
-// cache for a day, so re-warming after every idle gap was pure waste. A
-// positive CacheTTLSeconds overrides the table for gateways whose real
-// retention is far shorter (free flash tiers expire in minutes, not days).
-func (r *Runner) cacheTTL() time.Duration {
+// cacheStrategy returns the run's pluggable cache strategy, or a
+// DefaultStrategy carrying the flat knobs when none is configured.
+func (r *Runner) cacheStrategy() provider.CacheStrategy {
+	if r.cfg.CacheStrategy != nil {
+		return r.cfg.CacheStrategy
+	}
+	return provider.DefaultStrategy{
+		RetentionVal:    r.cfg.CacheRetention,
+		TTLVal:          r.cacheTTLFromKnobs(),
+		WarmVal:         r.cfg.WarmCache,
+		WarmTurnVal:     r.cfg.WarmTurn,
+		MaxReasoningVal: r.cfg.MaxReasoningTurns,
+		PassbackVal:     r.cfg.PassbackReasoning,
+	}
+}
+
+// recordUsageSample pushes a turn's usage into the bounded ring.
+func (r *Runner) recordUsageSample(s usageSample) {
+	r.usageRing[r.usageRingAt] = s
+	r.usageRingAt = (r.usageRingAt + 1) % usageRingDepth
+	if r.usageRingN < usageRingDepth {
+		r.usageRingN++
+	}
+}
+
+// inferredEvictionPoint returns the cache-prefix position (in tokens) at
+// which the last few turns suggest the provider's cache was dropped, or 0
+// when no partial eviction is evident. It scans the ring for the newest
+// sample whose cache-read share of its own prompt fell well below the
+// previous sample's share: a bounded-LRU (DeepSeek-style) cache evicts the
+// oldest region first, so the read/prompt ratio collapses when the provider
+// drops a wave. The re-warm must fire before the next request's gap reaches
+// the point where the drop happened.
+func (r *Runner) inferredEvictionPoint() int {
+	if r.usageRingN < 2 {
+		return 0
+	}
+	n := r.usageRingN
+	// Iterate oldest → newest.
+	oldest := (r.usageRingAt - n + usageRingDepth) % usageRingDepth
+	prevRatio := -1.0
+	for i := 0; i < n; i++ {
+		s := r.usageRing[(oldest+i)%usageRingDepth]
+		if s.prompt <= 0 {
+			continue
+		}
+		ratio := float64(s.cacheRead) / float64(s.prompt)
+		if prevRatio >= 0 && ratio < prevRatio-0.5 && s.cacheRead > 0 {
+			// The read share collapsed from the previous turn to this one
+			// while still reading something: a partial eviction cut the
+			// cached region between them. The eviction point is roughly the
+			// prompt size this turn still read — anything beyond it is gone.
+			return s.cacheRead
+		}
+		prevRatio = ratio
+	}
+	return 0
+}
+
+// cacheTTLFromKnobs is the flat-knob TTL resolution (the pre-strategy
+// cacheTTL behaviour); cacheStrategy wraps it so a strategy can override.
+func (r *Runner) cacheTTLFromKnobs() time.Duration {
+	if r.observedEvictionGap > 0 {
+		threshold := time.Duration(float64(r.observedEvictionGap) * 0.9)
+		if threshold < time.Second {
+			threshold = time.Second
+		}
+		return threshold
+	}
 	if r.cfg.CacheTTLSeconds > 0 {
 		return time.Duration(r.cfg.CacheTTLSeconds) * time.Second
 	}
@@ -1861,10 +2444,41 @@ func (r *Runner) cacheTTL() time.Duration {
 	if r.cfg.Provider != nil {
 		name = r.cfg.Provider.Name()
 	}
-	// Model-aware refinement: OpenAI GPT-5.6+ guarantees a 30-minute cache
-	// minimum, pre-5.6 in-memory evicts after 5-10 minutes. All other
-	// providers fall back to the vendor table.
 	return provider.CacheTTLForModel(name, r.cfg.Model, r.cfg.CacheRetention)
+}
+
+// cacheTTL bounds how long a warm prefix is assumed to survive at the
+// provider before an idle gap forces a re-warm. The vendor table replaces
+// the old fixed 5-minute default: DeepSeek-line endpoints keep their prefix
+// cache for a day, so re-warming after every idle gap was pure waste. A
+// positive CacheTTLSeconds overrides the table for gateways whose real
+// retention is far shorter (free flash tiers expire in minutes, not days).
+//
+// An observed eviction gap wins over both: once this run provably evicted
+// the prefix after a gap of G, the warm threshold drops to just below G, so
+// a provider that evicts at minutes-scale (despite the vendor table assuming
+// a day) is re-warmed before the eviction point instead of after it.
+func (r *Runner) cacheTTL() time.Duration {
+	if r.cfg.CacheStrategy != nil {
+		ttl := r.cfg.CacheStrategy.CacheTTL()
+		// The observed eviction gap still tightens below the strategy's TTL:
+		// a provider that provably evicts earlier than the strategy assumed
+		// must be re-warmed before the real eviction point.
+		if r.observedEvictionGap > 0 {
+			threshold := time.Duration(float64(r.observedEvictionGap) * 0.9)
+			if threshold < time.Second {
+				threshold = time.Second
+			}
+			if ttl <= 0 || threshold < ttl {
+				return threshold
+			}
+		}
+		if ttl > 0 {
+			return ttl
+		}
+		return r.cacheTTLFromKnobs()
+	}
+	return r.cacheTTLFromKnobs()
 }
 
 // warnWarmOnce surfaces a warm failure once per distinct error message per

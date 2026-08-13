@@ -32,6 +32,7 @@ func (m *Model) cmdHelp() (tea.Model, tea.Cmd) {
 		{"/sessions", "resume an earlier session"},
 		{"/undo  /redo", "step file changes back and forward"},
 		{"/compact", "summarise the history to free context"},
+		{"/ref", "load context from another session (query or id)"},
 		{"/export", "write the transcript to a file"},
 		{"/exit", "quit rick"},
 	})

@@ -1659,7 +1659,11 @@ func (m *Model) reloadProviders() {
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
 			}
-			provs[id] = anthropic.New(p.APIKey, p.BaseURL)
+			c := anthropic.New(p.APIKey, p.BaseURL)
+			c.SetKeepaliveAdaptive(
+				time.Duration(cfg.CacheKeepaliveSeconds)*time.Second,
+				provider.KeepaliveAdaptiveFloor(cfg.CacheKeepaliveSeconds, cfg.CacheTTLSeconds))
+			provs[id] = c
 		default:
 			if p.APIKey == "" && p.BaseURL == "" {
 				continue
@@ -1672,7 +1676,9 @@ func (m *Model) reloadProviders() {
 					}
 				})
 			}
-			c.SetKeepalive(time.Duration(cfg.CacheKeepaliveSeconds) * time.Second)
+			c.SetKeepaliveAdaptive(
+				time.Duration(cfg.CacheKeepaliveSeconds)*time.Second,
+				provider.KeepaliveAdaptiveFloor(cfg.CacheKeepaliveSeconds, cfg.CacheTTLSeconds))
 			if cred, ok := creds[id]; ok && len(cred.Models) > 0 {
 				infos := make([]provider.ModelInfo, 0, len(cred.Models))
 				for _, mid := range cred.Models {

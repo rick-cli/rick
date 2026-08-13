@@ -123,7 +123,7 @@ func TestGPT56BreakpointEmission(t *testing.T) {
 	}
 
 	// GPT-5.6: stable system message + boundary at message index 1.
-	gpt56 := toWireWithStableMarkedGPT56("stable sys\nvolatile tail", "stable sys", msgs, false, false, false, true, map[int]bool{1: true})
+	gpt56 := toWireWithStableMarkedGPT56("stable sys\nvolatile tail", "stable sys", msgs, false, false, false, true, false, map[int]bool{1: true})
 	sysBreakpoints := 0
 	boundaryBreakpoints := 0
 	for _, wm := range gpt56 {
@@ -145,7 +145,7 @@ func TestGPT56BreakpointEmission(t *testing.T) {
 	}
 
 	// Pre-5.6: no breakpoints at all.
-	legacy := toWireWithStableMarkedGPT56("stable sys\nvolatile tail", "stable sys", msgs, false, false, false, false, map[int]bool{1: true})
+	legacy := toWireWithStableMarkedGPT56("stable sys\nvolatile tail", "stable sys", msgs, false, false, false, false, false, map[int]bool{1: true})
 	for _, wm := range legacy {
 		if wm.CacheBreakpoint != nil {
 			t.Fatal("pre-5.6 model emitted a prompt_cache_breakpoint")

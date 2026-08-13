@@ -40,6 +40,8 @@ func (m *Model) runSlash(text string) (tea.Model, tea.Cmd) {
 			return m.cmdSessionsArgs(args)
 		}
 		return m.cmdSessions()
+	case "ref", "reference", "references":
+		return m.cmdRef(args)
 	case "model":
 		if args == "" {
 			return m.cmdModels()

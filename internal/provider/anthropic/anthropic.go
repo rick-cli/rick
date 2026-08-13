@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"rick/internal/provider"
@@ -44,6 +45,30 @@ type Client struct {
 	APIKey  string
 	BaseURL string
 	HTTP    *http.Client
+
+	// Keep-alive state (SetKeepalive): per-session record of the last
+	// non-streaming warm body so an idle gap can refresh the provider's
+	// prompt cache with the exact prefix the next real request extends.
+	// Anthropic's cache_control TTL is 5m (default) or 1h (extended beta),
+	// so an idle session beyond that pays a full cache write on the next
+	// turn; the keep-alive loop refreshes before the eviction. Zero interval
+	// leaves all of this inert.
+	kaMu              sync.Mutex
+	kaSessions        map[string]*kaSession
+	kaStop            chan struct{}
+	kaOnce            sync.Once
+	kaInterval        time.Duration
+	kaMinInterval     time.Duration
+	kaColdKeepalives  int64
+	kaConsecutiveCold int
+}
+
+// kaSession remembers the last stream-shaped wire body per session so the
+// keep-alive loop can re-send the same prompt prefix while the user idles.
+type kaSession struct {
+	body     wireRequest
+	last     time.Time
+	inFlight bool
 }
 
 // New builds a client. baseURL may be empty for the public API.
@@ -351,6 +376,9 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 		emit(provider.Event{Kind: provider.EventError, Err: err})
 		return
 	}
+	// Record the stream body so the keep-alive loop can refresh the exact
+	// prefix this stream will extend (Anthropic's cache_control TTL is short).
+	c.noteKeepalive(req, body)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/messages", bytes.NewReader(raw))
 	if err != nil {
@@ -380,6 +408,7 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	}
 
 	c.readSSE(ctx, resp.Body, emit)
+	c.finishKeepalive(req.SessionID)
 }
 
 // Warm implements provider.CacheWarmber. It submits a tiny non-streaming
@@ -427,7 +456,317 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		return fmt.Errorf("anthropic: warm http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
+	// A successful warm just primed this session's prefix; let the keep-alive
+	// loop know so it does not also fire during the same idle gap.
+	c.touchKeepalive(req.SessionID)
 	return nil
+}
+
+// SetKeepalive enables the prompt-cache keep-alive loop with the given idle
+// interval. After a session has been silent for the interval, the exact last
+// warm body is re-sent so the provider keeps the session's prefix cached
+// across idle gaps (Anthropic's cache_control TTL is 5m default / 1h with
+// the extended-cache-ttl beta, so an idle session past that pays a full
+// cache write on the next turn). Zero disables it; the loop is best-effort
+// and never surfaces errors.
+func (c *Client) SetKeepalive(interval time.Duration) {
+	c.SetKeepaliveAdaptive(interval, 0)
+}
+
+// SetKeepaliveAdaptive enables the keep-alive loop with an optional adaptive
+// floor. When keep-alive POSTs observe a cold prefix (the provider evicted
+// the cache despite the loop), the effective interval halves toward
+// minInterval so the next refresh fires before the endpoint's real eviction
+// point. A zero minInterval keeps the interval fixed.
+func (c *Client) SetKeepaliveAdaptive(interval, minInterval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	c.kaInterval = interval
+	c.kaMinInterval = minInterval
+	c.ensureKeepalive()
+}
+
+// KaInterval returns the current effective keep-alive interval (after any
+// adaptive halving). Exposed for tests and diagnostics.
+func (c *Client) KaInterval() time.Duration {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	return c.kaInterval
+}
+
+// ColdKeepalives returns how many keep-alive POSTs observed a cold prefix
+// (zero cache-read tokens), i.e. the provider evicted the session's cache
+// despite the keep-alive loop. Implements provider.KeepaliveColdCounter.
+func (c *Client) ColdKeepalives() int64 {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	return c.kaColdKeepalives
+}
+
+func (c *Client) ensureKeepalive() {
+	c.kaOnce.Do(func() {
+		c.kaSessions = map[string]*kaSession{}
+		c.kaStop = make(chan struct{})
+		go c.keepaliveLoop()
+	})
+}
+
+// stopKeepalive halts the loop. Production relies on process lifetime; tests
+// call this to avoid leaking the ticker goroutine.
+func (c *Client) stopKeepalive() {
+	c.kaOnce.Do(func() {}) // mark the once so no new loop starts
+	if c.kaStop != nil {
+		close(c.kaStop)
+	}
+}
+
+func (c *Client) keepaliveLoop() {
+	period := c.kaInterval / 2
+	if period < time.Second {
+		period = time.Second
+	}
+	t := time.NewTicker(period)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.kaStop:
+			return
+		case <-t.C:
+			c.keepaliveTick()
+		}
+	}
+}
+
+// kaPruneIdle is how long a session can sit untouched before the keep-alive
+// map drops it (mirrors the openai adapter).
+const kaPruneIdle = 24 * time.Hour
+
+// kaMaxSessions bounds the keep-alive map so a process that churns through
+// many one-shot sessions cannot accumulate an unbounded number of tracked
+// entries.
+const kaMaxSessions = 256
+
+// kaColdHalveAfter is how many consecutive cold keep-alive POSTs must be
+// observed before the interval halves toward the adaptive floor.
+const kaColdHalveAfter = 2
+
+// keepaliveTick re-sends stale session bodies. Only sessions idle past the
+// interval with no stream in flight are touched, so an active turn never
+// races a keep-alive.
+func (c *Client) keepaliveTick() {
+	c.kaMu.Lock()
+	now := time.Now()
+	type due struct {
+		sessionID string
+		s         *kaSession
+	}
+
+	// Pass 1: prune long-dead sessions.
+	for sid, s := range c.kaSessions {
+		if idle := now.Sub(s.last); idle > kaPruneIdle {
+			delete(c.kaSessions, sid)
+		}
+	}
+
+	// Pass 2: size cap (evict the oldest idle beyond the bound).
+	if over := len(c.kaSessions) - kaMaxSessions; over > 0 {
+		type age struct {
+			sid string
+			s   *kaSession
+		}
+		candidates := make([]age, 0, len(c.kaSessions))
+		for sid, s := range c.kaSessions {
+			if !s.inFlight {
+				candidates = append(candidates, age{sid, s})
+			}
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].s.last.Before(candidates[j].s.last)
+		})
+		for i := 0; i < len(candidates) && over > 0; i++ {
+			delete(c.kaSessions, candidates[i].sid)
+			over--
+		}
+	}
+
+	// Pass 3: select stale sessions to keep alive.
+	var toSend []due
+	for sid, s := range c.kaSessions {
+		if idle := now.Sub(s.last); idle > c.kaInterval && !s.inFlight {
+			s.inFlight = true
+			toSend = append(toSend, due{sid, s})
+		}
+	}
+	c.kaMu.Unlock()
+	for _, d := range toSend {
+		c.keepaliveSend(d.sessionID, d.s)
+	}
+}
+
+// keepaliveSend re-POSTs a session's last warm body reshaped to a minimal
+// non-streaming request: same messages/tools/model and cache_control
+// breakpoints, tiny output budget, so it rides (and refreshes) the exact
+// prompt-cache entry the next real stream will extend. Success bumps the
+// session's last-activity time; any failure clears in-flight so the next
+// tick retries. A cold response (cache_read == 0) is counted so a
+// chronically cold keep-alive is measurable (KeepaliveColdCounter) and the
+// interval halves toward the adaptive floor.
+func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
+	body := s.body
+	body.Stream = false
+	body.MaxTokens = 1
+	raw, err := json.Marshal(body)
+	if err != nil {
+		c.finishKeepaliveFor(sessionID, s)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/messages", bytes.NewReader(raw))
+	if err != nil {
+		c.finishKeepaliveFor(sessionID, s)
+		return
+	}
+	httpReq.Header.Set("x-api-key", c.APIKey)
+	httpReq.Header.Set("anthropic-version", apiVersion)
+	httpReq.Header.Set("content-type", "application/json")
+	if beta := cacheBetaHeader(provider.CacheRetentionLong); beta != "" {
+		httpReq.Header.Set("anthropic-beta", beta)
+	}
+	resp, err := c.HTTP.Do(httpReq)
+	if err != nil {
+		c.finishKeepaliveFor(sessionID, s)
+		return
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.finishKeepaliveFor(sessionID, s)
+		return
+	}
+	// A warm keep-alive's message_start usage carries cache_read_input_tokens;
+	// zero means the prefix was evicted despite the loop.
+	if usage := parseCacheUsage(bodyBytes); usage != nil && usage.CacheReadTokens == 0 {
+		c.kaMu.Lock()
+		c.kaColdKeepalives++
+		c.kaConsecutiveCold++
+		if c.kaMinInterval > 0 && c.kaConsecutiveCold >= kaColdHalveAfter && c.kaInterval > c.kaMinInterval {
+			half := c.kaInterval / 2
+			if half < c.kaMinInterval {
+				half = c.kaMinInterval
+			}
+			c.kaInterval = half
+			c.kaConsecutiveCold = 0
+		}
+		c.kaMu.Unlock()
+	} else if usage != nil {
+		c.kaMu.Lock()
+		c.kaConsecutiveCold = 0
+		c.kaMu.Unlock()
+	}
+	c.finishKeepaliveFor(sessionID, s)
+}
+
+// parseCacheUsage extracts the cache-read/creation input tokens from a raw
+// Anthropic non-streaming response's message.usage. nil when unparseable.
+func parseCacheUsage(raw []byte) *provider.Usage {
+	var d struct {
+		Message struct {
+			Usage struct {
+				InputTokens              int `json:"input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil
+	}
+	creation := d.Message.Usage.CacheCreationInputTokens
+	input := d.Message.Usage.InputTokens - creation
+	if input < 0 {
+		input = 0
+	}
+	return &provider.Usage{
+		InputTokens:      input,
+		CacheReadTokens:  d.Message.Usage.CacheReadInputTokens,
+		CacheWriteTokens: creation,
+	}
+}
+
+// finishKeepaliveFor clears the in-flight flag when the map still holds the
+// captured session, so a stale keep-alive completing after a newer stream
+// replaced the entry cannot clear the live stream's in-flight marker.
+func (c *Client) finishKeepaliveFor(sessionID string, s *kaSession) {
+	c.kaMu.Lock()
+	if cur, ok := c.kaSessions[sessionID]; ok && cur == s {
+		s.inFlight = false
+		s.last = time.Now()
+	}
+	c.kaMu.Unlock()
+}
+
+// noteKeepalive records the warm body just sent so the keep-alive loop can
+// re-send the same prefix later. Local endpoints have no provider cache, and
+// retention "none" explicitly opted out. Auxiliary calls (distill) replay a
+// prefix, so only the real stream body may own the keep-alive slot.
+func (c *Client) noteKeepalive(req provider.Request, body wireRequest) {
+	if c.kaInterval <= 0 || req.SessionID == "" ||
+		req.CacheRetention == provider.CacheRetentionNone || isLocalAnthropic(c.BaseURL) {
+		return
+	}
+	if req.Purpose == provider.PurposeDistill {
+		return
+	}
+	c.ensureKeepalive()
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	s, ok := c.kaSessions[req.SessionID]
+	if !ok {
+		s = &kaSession{}
+		c.kaSessions[req.SessionID] = s
+	}
+	s.body = body
+	s.inFlight = true
+}
+
+// finishKeepalive marks the session idle again after a stream completes.
+func (c *Client) finishKeepalive(sessionID string) {
+	if c.kaInterval <= 0 || sessionID == "" {
+		return
+	}
+	c.kaMu.Lock()
+	if s, ok := c.kaSessions[sessionID]; ok {
+		s.inFlight = false
+		s.last = time.Now()
+	}
+	c.kaMu.Unlock()
+}
+
+// touchKeepalive bumps the session's last-activity time without replacing the
+// recorded body (used after a successful pre-turn warm).
+func (c *Client) touchKeepalive(sessionID string) {
+	if c.kaInterval <= 0 || sessionID == "" {
+		return
+	}
+	c.kaMu.Lock()
+	if s, ok := c.kaSessions[sessionID]; ok {
+		s.last = time.Now()
+	}
+	c.kaMu.Unlock()
+}
+
+// isLocalAnthropic reports whether the endpoint is a local/dev server with no
+// provider prompt cache to keep warm.
+func isLocalAnthropic(baseURL string) bool {
+	lower := strings.ToLower(baseURL)
+	return strings.Contains(lower, "localhost") ||
+		strings.Contains(lower, "127.0.0.1") ||
+		strings.Contains(lower, "0.0.0.0") ||
+		strings.Contains(lower, "local.host")
 }
 
 // toolAccum accumulates streamed partial JSON for one tool_use block.

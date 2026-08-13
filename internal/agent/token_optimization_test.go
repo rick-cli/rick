@@ -119,7 +119,7 @@ type stubDistillSummarizer struct {
 	calls   int
 }
 
-func (s *stubDistillSummarizer) Summarize(context.Context, []provider.Message) (string, error) {
+func (s *stubDistillSummarizer) Summarize(context.Context, distill.SummaryInput) (string, error) {
 	s.calls++
 	return s.summary, nil
 }

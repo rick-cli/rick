@@ -512,3 +512,72 @@ func reasoningEchoClientCapped(t *testing.T, providerID, model string, messages 
 	}
 	return request
 }
+
+// TestDeepSeekPassbackReasoningDropsToolCallFreeTurns pins the passback rule:
+// with PassbackReasoning set, reasoning_content is echoed only for assistant
+// turns that carried tool calls. The decision is per-message and stable
+// (history never gains or loses a tool call), so the cached prefix is never
+// rewritten while the fresh tail shrinks.
+func TestDeepSeekPassbackReasoningDropsToolCallFreeTurns(t *testing.T) {
+	toolTurn := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "tool-turn reasoning"},
+		{Type: "tool_use", ID: "call-1", Name: "read", Input: json.RawMessage(`{"path":"a"}`)},
+	}}
+	plainTurn := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "plain reasoning"},
+		{Type: "text", Text: "the answer"},
+	}}
+	wire := toWireWithStableMarkedGPT56("sys", "", []provider.Message{plainTurn, toolTurn},
+		true, true, false, false, true, nil)
+
+	seenPlain := false
+	seenTool := false
+	for _, wm := range wire {
+		if wm.Role != "assistant" {
+			continue
+		}
+		if wm.ReasoningContent != nil && strings.Contains(*wm.ReasoningContent, "tool-turn reasoning") {
+			seenTool = true
+		}
+		// Plain (tool-call-free) turn reasoning must be dropped under passback.
+		if wm.ReasoningContent != nil && strings.Contains(*wm.ReasoningContent, "plain reasoning") {
+			seenPlain = true
+		}
+	}
+	if !seenTool {
+		t.Fatalf("passback dropped tool-call turn reasoning; wire: %#v", wire)
+	}
+	if seenPlain {
+		t.Fatalf("passback kept tool-call-free turn reasoning; wire: %#v", wire)
+	}
+}
+
+// TestDeepSeekPassbackIsAppendStable verifies the per-message passback decision
+// is stable across requests: a prefix that carries the passback decision never
+// flips a message's reasoning on/off as the conversation grows, so the bytes
+// before the previous tail stay identical.
+func TestDeepSeekPassbackIsAppendStable(t *testing.T) {
+	toolTurn := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "tool reasoning"},
+		{Type: "tool_use", ID: "call-1", Name: "read", Input: json.RawMessage(`{"path":"a"}`)},
+	}}
+	plainTurn := provider.Message{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+		{Type: "thinking", Text: "plain reasoning"},
+		{Type: "text", Text: "answer"},
+	}}
+	base := []provider.Message{toolTurn, provider.UserText("turn 2"), plainTurn}
+	baseWire := toWireWithStableMarkedGPT56("sys", "", base, true, true, false, false, true, nil)
+	grown := append(append([]provider.Message(nil), base...), provider.UserText("turn 3"))
+	grownWire := toWireWithStableMarkedGPT56("sys", "", grown, true, true, false, false, true, nil)
+
+	if len(baseWire) != len(grownWire)-1 {
+		t.Fatalf("grown wire added %d messages, want exactly the one new tail", len(grownWire)-len(baseWire))
+	}
+	for i := range baseWire {
+		bm, _ := json.Marshal(baseWire[i])
+		gm, _ := json.Marshal(grownWire[i])
+		if string(bm) != string(gm) {
+			t.Fatalf("wire message %d diverged under passback:\nbase=%s\ngrown=%s", i, bm, gm)
+		}
+	}
+}

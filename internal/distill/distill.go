@@ -12,14 +12,39 @@ import (
 
 // Summarizer produces a distilled summary of an old conversation prefix. It is
 // normally backed by a fast provider round-trip; tests use a stub.
+//
+// The summarizer receives the exact system/tools/messages of the live request
+// (the "replayed prefix") so a provider-backed implementation can extend it
+// with a trailing instruction instead of flattening to a bespoke transcript:
+// the auxiliary call then shares the warm request's leading tokens and the
+// provider serves the prefix from cache instead of re-billing it cold exactly
+// when the conversation is largest.
 type Summarizer interface {
-	Summarize(ctx context.Context, messages []provider.Message) (string, error)
+	Summarize(ctx context.Context, input SummaryInput) (string, error)
+}
+
+// SummaryInput is the conversation prefix a summarizer replays. System, Tools,
+// and Messages must reproduce the routed request's provider-facing bytes so a
+// provider-backed summarizer can append a trailing instruction and reuse the
+// cached prefix. Messages are the oldest stable region to be distilled (already
+// redacted and bounded by the caller).
+type SummaryInput struct {
+	System   string
+	Tools    []provider.ToolSchema
+	Messages []provider.Message
 }
 
 // Options configures Distill.
 type Options struct {
 	// Summarizer performs the background LLM call. Nil disables distillation.
 	Summarizer Summarizer
+	// System is the routed request's system prompt, replayed verbatim to the
+	// summarizer so a provider-backed one extends the warm prefix instead of
+	// cold-starting a bespoke prompt.
+	System string
+	// Tools are the routed request's tool schemas, replayed verbatim for the
+	// same reason (dropping them would misalign the cached token sequence).
+	Tools []provider.ToolSchema
 	// MaxMessages caps the number of messages distilled in one step.
 	MaxMessages int
 	// MaxSummaryBytes bounds the serialized summary message.
@@ -38,9 +63,34 @@ type Options struct {
 	MinCacheBreakBytes int
 	// LiveZoneTurns is how many newest logical turns are never distilled.
 	LiveZoneTurns int
+	// LiveZoneTokens, when positive, prices the retained live tail in tokens
+	// (4 chars/token heuristic, harness-style token-meter): the fold boundary
+	// is placed so the newest messages kept after the summary cost at most
+	// this many tokens. A message-count-only ratio can keep a tail whose
+	// token cost still spans the provider's cache-block granularity and cuts
+	// a cached block; the token budget keeps the surviving tail inside the
+	// cached region. Zero falls back to the ratio-based boundary.
+	LiveZoneTokens int
 	// DistillRatio is the share of the newest history left untouched: the
 	// oldest (1-ratio) share is distilled. Default 0.5 (oldest half).
 	DistillRatio float64
+	// PlannedPrefixTokens is the estimated size (in provider cache blocks,
+	// ~256 tokens each) of the cache prefix this request would still share
+	// with the previous one if it were sent right now. It is the shadow
+	// price of NOT distilling: when it is tiny, most of the context is
+	// already cold and a distill fold can only help; when it is large, the
+	// warm prefix covers most of the window and distillation would rewrite
+	// bytes the provider would otherwise serve from cache. Zero disables the
+	// planned-price check (distill on usage/bytes alone).
+	PlannedPrefixTokens int
+	// CacheBlockTokens is the provider's prompt-cache block granularity in
+	// tokens. The summary insert point (cut) is aligned so the fold never
+	// splits a provider cache block: the cut moves to the nearest boundary
+	// whose serialized token offset is a whole cache-block multiple, so the
+	// bytes the provider still has cached stay inside full blocks and the
+	// next request re-reads them from cache instead of re-billing a partial
+	// block cold. Zero uses the provider default (256).
+	CacheBlockTokens int
 }
 
 func (o Options) withDefaults() Options {
@@ -68,6 +118,9 @@ func (o Options) withDefaults() Options {
 	if o.DistillRatio <= 0 {
 		o.DistillRatio = 0.4
 	}
+	if o.CacheBlockTokens <= 0 {
+		o.CacheBlockTokens = 256
+	}
 	return o
 }
 
@@ -83,6 +136,10 @@ type Result struct {
 
 var errCacheBreakNotStable = errors.New("cache breakpoint prefix is not stable")
 var errSummarizerFailed = errors.New("summarizer failed")
+
+// ErrPlannedPrefixStillWarm reports that the planned cache prefix is still
+// large enough that folding would rewrite warm bytes for no gain.
+var ErrPlannedPrefixStillWarm = errors.New("planned cache prefix still warm; distill deferred")
 
 // Distill collapses the oldest portion of history into a single structured
 // summary message placed just after the cache breakpoint. It never splits a
@@ -108,8 +165,16 @@ func Distill(messages []provider.Message, breakpoints map[int]bool, opts Options
 	if cut >= len(messages) {
 		return Result{Messages: messages, Err: errCacheBreakNotStable}
 	}
+	// Cache-block alignment (harness-style): move the insert point to the
+	// nearest message boundary whose serialized token offset is a whole
+	// cache-block multiple. Splitting a provider cache block at the fold
+	// re-bills a partial block cold on the very next request; aligning keeps
+	// the surviving prefix inside full blocks so the provider serves it from
+	// cache. Walk cut back (never forward past the breakpoint) to the
+	// closest aligned boundary.
+	cut = alignCutToCacheBlock(messages, cut, opts.CacheBlockTokens)
 
-	candidate, end := distillablePrefix(messages, cut, opts.MaxMessages, opts.LiveZoneTurns, opts.DistillRatio)
+	candidate, end := distillablePrefix(messages, cut, opts.MaxMessages, opts.LiveZoneTurns, opts.LiveZoneTokens, opts.DistillRatio)
 	if candidate == nil {
 		return Result{Messages: messages}
 	}
@@ -121,12 +186,32 @@ func Distill(messages []provider.Message, breakpoints map[int]bool, opts Options
 	if oldTokens < opts.MinHistoryTokens {
 		return Result{Messages: messages}
 	}
+
+	// Shadow price: when the planned (estimated) cached prefix still covers
+	// most of the window, folding would rewrite bytes the provider would
+	// otherwise serve from cache. Only fold when the surviving cache prefix
+	// is small enough that the rewrite is cheaper than the re-bill it avoids
+	// (the summary itself becomes the new warm prefix). Zero disables.
+	if opts.PlannedPrefixTokens > 0 && oldTokens < opts.PlannedPrefixTokens {
+		return Result{Messages: messages, Err: ErrPlannedPrefixStillWarm}
+	}
 	if float64(oldTokens) < opts.MinRatio*float64(providerJSONBytesAll(messages)) {
 		return Result{Messages: messages}
 	}
 
-	// Summarize first: a summarizer failure must not replace history.
-	summary, err := opts.Summarizer.Summarize(context.Background(), candidate)
+	// Summarize first: a summarizer failure must not replace history. The
+	// summarizer receives the full replayed prefix (system + tools + ALL
+	// messages up to the fold point, including the cached head before the
+	// breakpoint) so a provider-backed implementation appends a trailing
+	// instruction and the auxiliary call is a genuine byte-prefix-extension
+	// of the last routed request — the shared head rides the provider's warm
+	// prefix cache instead of re-billing the whole conversation cold.
+	replay := append([]provider.Message(nil), messages[:end]...)
+	summary, err := opts.Summarizer.Summarize(context.Background(), SummaryInput{
+		System:   opts.System,
+		Tools:    opts.Tools,
+		Messages: replay,
+	})
 	if err != nil {
 		return Result{Messages: messages, Err: fmt.Errorf("%w: %v", errSummarizerFailed, err)}
 	}
@@ -180,13 +265,23 @@ func Distill(messages []provider.Message, breakpoints map[int]bool, opts Options
 // the slice after the cache breakpoint up to the middle of the chat (clamped
 // to the live zone). It always includes complete tool_use/tool_result pairs.
 // The second return is the end index.
-func distillablePrefix(messages []provider.Message, cut, maxMessages, liveTurns int, ratio float64) ([]provider.Message, int) {
+func distillablePrefix(messages []provider.Message, cut, maxMessages, liveTurns, liveZoneTokens int, ratio float64) ([]provider.Message, int) {
 	liveStart := len(messages)
 	if groups := logicalGroups(messages); len(groups) > liveTurns {
 		liveStart = groups[len(groups)-liveTurns].start
 	}
 
 	end := int(float64(len(messages)) * ratio)
+	// Token-priced live tail (harness-style token-meter): when a live-zone
+	// token budget is set it REPLACES the ratio boundary — the foldable
+	// region ends so the newest messages retained after the summary cost at
+	// least liveZoneTokens (4 chars/token heuristic, the harness's
+	// selectCompactableRange floor: keep at least retainTokens of tail). The
+	// message-count live zone still caps the fold so the newest liveTurns
+	// are never distilled.
+	if liveZoneTokens > 0 {
+		end = tokenPricedFoldEnd(messages, liveZoneTokens)
+	}
 	if end < cut {
 		return nil, end
 	}
@@ -201,6 +296,87 @@ func distillablePrefix(messages []provider.Message, cut, maxMessages, liveTurns 
 		return nil, end
 	}
 	return messages[cut:end], end
+}
+
+// tokenPricedFoldEnd walks the newest messages backward, pricing each at the
+// harness token-meter density (4 chars/token plus framing overhead), until
+// the accumulated token cost of the retained tail reaches liveZoneTokens —
+// the harness's selectCompactableRange semantics: keep the newest messages
+// summing to at least the retain budget verbatim. The returned index is the
+// fold boundary (messages before it are distillable). Falls back to the
+// whole-tail boundary when the budget exceeds the entire transcript.
+func tokenPricedFoldEnd(messages []provider.Message, liveZoneTokens int) int {
+	if liveZoneTokens <= 0 || len(messages) == 0 {
+		return len(messages)
+	}
+	accumulated := 0
+	boundary := len(messages) // first index NOT retained (foldable region ends here)
+	for index := len(messages) - 1; index >= 0 && accumulated < liveZoneTokens; index-- {
+		accumulated += 4 + priceMessageTokens(messages[index])
+		boundary = index
+	}
+	if accumulated < liveZoneTokens {
+		// The whole transcript is cheaper than the budget: nothing is
+		// distillable by token price (the message-count live zone still
+		// applies upstream).
+		return len(messages)
+	}
+	return boundary
+}
+
+// alignCutToCacheBlock walks the fold insert point back toward the nearest
+// message boundary whose serialized token offset (4 chars/token heuristic) is
+// a whole multiple of the provider's cache block size. A cut that lands
+// mid-block leaves a partially-written cache block at the fold; the provider
+// re-bills that partial block cold on the next request even though most of
+// the prefix is stable. The walk covers at most one block's residual and
+// never moves the cut below 1 (the anchored first message after the system
+// is never folded), so correctness of the fold is never traded for alignment.
+func alignCutToCacheBlock(messages []provider.Message, cut, blockTokens int) int {
+	if blockTokens <= 0 || cut <= 1 || cut > len(messages) {
+		return cut
+	}
+	tokens := 0
+	for i := 0; i < cut; i++ {
+		tokens += priceMessageTokens(messages[i])
+	}
+	residual := tokens % blockTokens
+	if residual == 0 {
+		return cut
+	}
+	// Walk back exactly the residual (at most one block), never below cut=1.
+	// When a single message costs more than the remaining residual, walking
+	// further would overshoot past the aligned boundary (and past the
+	// previous full block) — stop at the current position, which is the
+	// nearest reachable one.
+	for cut > 1 && residual > 0 {
+		cost := priceMessageTokens(messages[cut-1])
+		if cost > residual {
+			break
+		}
+		cut--
+		residual -= cost
+	}
+	return cut
+}
+
+// priceMessageTokens prices one message's text at the harness token-meter
+// density: 4 chars per token plus a small structural overhead.
+func priceMessageTokens(m provider.Message) int {
+	total := 0
+	for _, block := range m.Content {
+		switch block.Type {
+		case "text", "thinking":
+			total += len(block.Text)/4 + 1
+		case "tool_use":
+			total += len(block.Name)/4 + len(block.Input)/4 + 1
+		case "tool_result":
+			total += len(block.Content)/4 + 1
+		default:
+			total += len(block.Text)/4 + 1
+		}
+	}
+	return total
 }
 
 // walkPairs advances end from start toward limit, always including complete

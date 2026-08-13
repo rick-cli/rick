@@ -50,10 +50,18 @@ type Client struct {
 	kaStop     chan struct{}
 	kaOnce     sync.Once
 	kaInterval time.Duration
+	// kaMinInterval is the adaptive floor: when keep-alive POSTs keep
+	// observing a cold prefix, the interval halves toward this bound so the
+	// loop refreshes before the provider's real eviction point. Zero keeps
+	// the configured interval fixed (opt out of adaptation).
+	kaMinInterval time.Duration
 	// kaColdKeepalives counts keep-alive POSTs whose response reported zero
 	// cache-read tokens — evidence the provider evicted the prefix despite
 	// the loop, surfaced so the effective keep-alive interval can be tuned.
 	kaColdKeepalives int64
+	// kaConsecutiveCold counts cold keep-alive POSTs in a row; a burst (not
+	// a one-off) halves the interval so the next refresh fires earlier.
+	kaConsecutiveCold int
 
 	// Response-cache state (OpenRouter): when enabled, requests carry
 	// X-OpenRouter-Cache (+ optional TTL) so byte-identical repeated requests
@@ -109,6 +117,16 @@ func New(id, apiKey, baseURL string) *Client {
 // loop is best-effort and never surfaces errors (same contract as Warm).
 // Must be called before the first request for the interval to take effect.
 func (c *Client) SetKeepalive(interval time.Duration) {
+	c.SetKeepaliveAdaptive(interval, 0)
+}
+
+// SetKeepaliveAdaptive enables the prompt-cache keep-alive loop with the given
+// idle interval and an optional adaptive floor. When keep-alive POSTs observe
+// a cold prefix (the provider evicted the cache despite the loop), the
+// effective interval halves toward minInterval so the next refresh fires
+// before the endpoint's real eviction point. A zero minInterval keeps the
+// interval fixed.
+func (c *Client) SetKeepaliveAdaptive(interval, minInterval time.Duration) {
 	if interval <= 0 {
 		return
 	}
@@ -117,7 +135,18 @@ func (c *Client) SetKeepalive(interval time.Duration) {
 	if c.Codex != nil {
 		return
 	}
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
 	c.kaInterval = interval
+	c.kaMinInterval = minInterval
+}
+
+// KaInterval returns the current effective keep-alive interval (after any
+// adaptive halving). Exposed for tests and diagnostics.
+func (c *Client) KaInterval() time.Duration {
+	c.kaMu.Lock()
+	defer c.kaMu.Unlock()
+	return c.kaInterval
 }
 
 // ColdKeepalives returns how many keep-alive POSTs observed a cold prefix
@@ -145,6 +174,14 @@ func (c *Client) SetOpenRouterResponseCache(enabled bool, ttlSeconds int) {
 func (c *Client) noteKeepalive(req provider.Request, body wireRequest, headers http.Header) {
 	if c.kaInterval <= 0 || req.SessionID == "" ||
 		req.CacheRetention == provider.CacheRetentionNone || isLocal(c.BaseURL) {
+		return
+	}
+	// Auxiliary calls (distill) replay a *prefix* of the real stream with a
+	// trailing instruction, so recording their body would make the keep-alive
+	// refresh the wrong bytes (the instruction tail) instead of the exact
+	// prefix the next real turn extends. Warm requests go through Warm, not
+	// Stream, so only the real stream body may own the keep-alive slot.
+	if req.Purpose == provider.PurposeDistill {
 		return
 	}
 	c.ensureKeepalive()
@@ -340,9 +377,14 @@ func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
 		c.finishKeepaliveFor(sessionID, s)
 		return
 	}
+	headers := http.Header{}
+	if s.headers != nil {
+		headers = s.headers.Clone()
+	}
+	headers.Set("x-rick-purpose", "keepalive")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := c.doCompletions(ctx, raw, s.headers)
+	resp, err := c.doCompletions(ctx, raw, headers)
 	if err != nil {
 		c.finishKeepaliveFor(sessionID, s)
 		return
@@ -355,10 +397,34 @@ func (c *Client) keepaliveSend(sessionID string, s *kaSession) {
 	if usage := parseUsageFields(bodyBytes); usage != nil && usage.CacheReadTokens == 0 {
 		c.kaMu.Lock()
 		c.kaColdKeepalives++
+		c.kaConsecutiveCold++
+		// A burst of cold keep-alives means the provider evicts faster than
+		// the interval refreshes. Halve the interval (floored at the
+		// configured minimum) so the next refresh fires before the real
+		// eviction point; a warm keep-alive resets the burst so a one-off
+		// cold never shrinks the cadence permanently.
+		if c.kaMinInterval > 0 && c.kaConsecutiveCold >= kaColdHalveAfter &&
+			c.kaInterval > c.kaMinInterval {
+			half := c.kaInterval / 2
+			if half < c.kaMinInterval {
+				half = c.kaMinInterval
+			}
+			c.kaInterval = half
+			c.kaConsecutiveCold = 0
+		}
+		c.kaMu.Unlock()
+	} else if usage != nil {
+		c.kaMu.Lock()
+		c.kaConsecutiveCold = 0
 		c.kaMu.Unlock()
 	}
 	c.finishKeepaliveFor(sessionID, s)
 }
+
+// kaColdHalveAfter is how many consecutive cold keep-alive POSTs must be
+// observed before the interval halves toward the adaptive floor. One cold is
+// noise; a burst is a real eviction-rate signal.
+const kaColdHalveAfter = 2
 
 // parseUsageFields extracts the cache/input token fields from a raw
 // chat-completions payload: either a plain JSON body or an SSE stream whose
@@ -663,14 +729,17 @@ func promptCacheKey(model, sessionID, scopeKey string) string {
 }
 
 // promptCacheScope picks the routing-key scope for a request. An explicit
-// CacheScopeKey wins (non-interactive runs); otherwise the byte-stable system
-// head is used so every session sharing a frozen system+tools prefix (same
-// cwd/model chain) derives the same key and routes to the same OpenAI cache
-// machine — the cross-session warm reuse rick already gets from
-// sessionSystemParts now also pins routing. Falls back to the session id.
+// CacheScopeKey wins (non-interactive runs); otherwise the epoch hash (the
+// content identity of the frozen system+tools header) is used so every
+// session — including a resumed one with a new session id — sharing the same
+// header derives the same key and routes to the same OpenAI cache machine.
+// Falls back to the byte-stable system head, then the session id.
 func promptCacheScope(req provider.Request) string {
 	if req.CacheScopeKey != "" {
 		return req.CacheScopeKey
+	}
+	if req.EpochHash != "" {
+		return req.EpochHash
 	}
 	if strings.TrimSpace(req.SystemStable) != "" {
 		return req.SystemStable
@@ -759,7 +828,15 @@ func (c *Client) wireReasoning(req provider.Request) (style provider.ReasoningSt
 	// byte-identical across turns so the provider's automatic prefix cache hits,
 	// instead of re-billing the whole tail every turn. Other reasoning
 	// providers keep the token-saving strip.
-	retainAll := req.MaxReasoningTurns <= 0 &&
+	//
+	// The passback rule (req.PassbackReasoning) relaxes retain-all for
+	// tool-call-free turns: DeepSeek only requires the previous turn's
+	// reasoning_content echoed back while a tool-call exchange is open, so
+	// reasoning on turns that never called a tool is dropped — the bytes
+	// land at the append-only tail and never rewrite the cached prefix, and
+	// the fresh-tail cost of long reasoning chains shrinks. This mirrors the
+	// reference deepseek-harness adapter's "reasoning passback rule".
+	retainAll := req.MaxReasoningTurns <= 0 && !req.PassbackReasoning &&
 		(c.ID == "opencode-zen" || c.ID == "opencode-go" ||
 			style == provider.ReasoningStyleDeepSeek ||
 			(hasThinkingBlocks(req.Messages) && (c.ID == "deepseek" || c.ID == "openrouter")))
@@ -778,16 +855,22 @@ func toWireWithStable(system, stable string, msgs []provider.Message, includeRea
 // marker (Qwen on opencode-go, Kimi/Moonshot, MiniMax) keep the stable prefix
 // cached explicitly; others ignore the field.
 func toWireWithStableMarked(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning, cacheMarked bool) []wireMessage {
-	return toWireWithStableMarkedGPT56(system, stable, msgs, includeReasoning, retainAllReasoning, cacheMarked, false, nil)
+	return toWireWithStableMarkedGPT56(system, stable, msgs, includeReasoning, retainAllReasoning, cacheMarked, false, false, nil)
 }
 
 // toWireWithStableMarkedGPT56 is toWireWithStableMarked with optional GPT-5.6+
-// prompt-cache breakpoints. When gpt56 is true, the stable system message
 // carries a prompt_cache_breakpoint (explicit end of the cached prefix) and
 // each message index in boundaries also gets one, mirroring Anthropic's
 // cache_control boundary placement. Pre-5.6 models reject the field, so it is
 // only ever emitted behind the isGPT56 gate.
-func toWireWithStableMarkedGPT56(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning, cacheMarked, gpt56 bool, boundaries map[int]bool) []wireMessage {
+//
+// passback enables the DeepSeek reasoning-passback rule: reasoning_content is
+// echoed only for assistant turns that carried tool calls (the exchange the
+// API demands it for); reasoning from tool-call-free turns is dropped. The
+// per-message decision is stable — history never gains or loses a tool call —
+// so the serialized prefix stays byte-identical and the automatic cache is
+// unaffected while the fresh tail shrinks.
+func toWireWithStableMarkedGPT56(system, stable string, msgs []provider.Message, includeReasoning, retainAllReasoning, cacheMarked, gpt56, passback bool, boundaries map[int]bool) []wireMessage {
 	var out []wireMessage
 	if strings.TrimSpace(stable) != "" && strings.HasPrefix(system, stable) {
 		stableMsg := wireMessage{Role: "system", Content: stable}
@@ -846,7 +929,21 @@ func toWireWithStableMarkedGPT56(system, stable string, msgs []provider.Message,
 		var results []wireMessage
 		var imageBlocks []wireImageContent
 
-		keeper := includeReasoning && (retainAllReasoning || i == lastThinking)
+		keeper := includeReasoning && retainAllReasoning
+		if !retainAllReasoning && !passback {
+			// Token-saving strip (non-DeepSeek reasoning providers): only the
+			// most recent thinking turn keeps its value.
+			keeper = includeReasoning && i == lastThinking
+		} else if passback {
+			// Passback rule (DeepSeek official guides/thinking_mode.mdx):
+			// reasoning_content must be echoed for every assistant turn that
+			// carried tool calls — the immediately previous tool-call turn is
+			// what a continuing exchange demands, and a message never gains or
+			// loses a tool call, so the per-message decision is stable and the
+			// cached prefix is never rewritten. Reasoning from tool-call-free
+			// turns is dropped entirely (the endpoint ignores it there).
+			keeper = includeReasoning && m.Role == provider.RoleAssistant && containsToolUse(m.Content)
+		}
 
 		for _, b := range m.Content {
 			switch b.Type {
@@ -936,6 +1033,18 @@ func toWireWithStableMarkedGPT56(system, stable string, msgs []provider.Message,
 	return out
 }
 
+// containsToolUse reports whether a message's content carries a tool_use
+// block. The DeepSeek reasoning-passback rule uses it to decide which
+// assistant turns need reasoning_content echoed back (only tool-call turns).
+func containsToolUse(blocks []provider.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == "tool_use" {
+			return true
+		}
+	}
+	return false
+}
+
 func toWireTools(ts []provider.ToolSchema) []wireTool {
 	ts = provider.CanonicalToolSchemas(ts)
 	out := make([]wireTool, 0, len(ts))
@@ -994,6 +1103,23 @@ func retryBackoff(attempt int) time.Duration {
 		return 250 * time.Millisecond
 	}
 	return time.Second
+}
+
+// requestPurposeHeader maps a request purpose to a wire attribution header.
+// The header never changes the request body, so the cached prefix is
+// unaffected; it lets providers and gateway logs attribute traffic classes
+// (warm / keepalive / distill) separately from real turns.
+func requestPurposeHeader(purpose provider.RequestPurpose) string {
+	switch purpose {
+	case provider.PurposeWarm:
+		return "warm"
+	case provider.PurposeKeepalive:
+		return "keepalive"
+	case provider.PurposeDistill:
+		return "distill"
+	default:
+		return ""
+	}
 }
 
 // doCompletions POSTs raw to the chat/completions endpoint, rebuilding the
@@ -1096,6 +1222,9 @@ func (c *Client) Warm(ctx context.Context, req provider.Request) error {
 		return err
 	}
 	extraHeaders := http.Header{}
+	if purpose := requestPurposeHeader(req.Purpose); purpose != "" {
+		extraHeaders.Set("x-rick-purpose", purpose)
+	}
 	if req.SessionID != "" {
 		switch {
 		case c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai"):
@@ -1150,7 +1279,7 @@ func (c *Client) buildWireBody(req provider.Request, streaming, includeUsage boo
 	if c.ID == "openai" || c.deepseekWire(req.Model) || c.cacheControlMarked() {
 		gpt56 := c.ID == "openai" && isGPT56(req.Model) &&
 			req.CacheRetention != provider.CacheRetentionNone
-		body.Messages = toWireWithStableMarkedGPT56(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning, c.cacheControlMarked(), gpt56, req.CacheBoundaries)
+		body.Messages = toWireWithStableMarkedGPT56(req.System, req.SystemStable, req.Messages, preserveReasoning, retainAllReasoning, c.cacheControlMarked(), gpt56, req.PassbackReasoning, req.CacheBoundaries)
 	}
 	if c.ID != "openai" {
 		// OpenAI-compatible gateways do not all accept OpenAI's cache-routing
@@ -1300,20 +1429,32 @@ func (c *Client) Stream(ctx context.Context, req provider.Request, ch chan<- pro
 	}
 
 	extraHeaders := http.Header{"accept": {"text/event-stream"}}
+	if purpose := requestPurposeHeader(req.Purpose); purpose != "" {
+		extraHeaders.Set("x-rick-purpose", purpose)
+	}
 	// Session-affinity hints keep the prompt cache warm on the provider's
 	// router: direct OpenAI uses session_id/x-client-request-id (plus the
 	// legacy x-session-affinity), OpenRouter uses x-session-id. One-off calls
 	// (retention none) skip the hints so they never ride a session's cache.
+	//
+	// The epoch hash is the stable routing identity: a resumed session with
+	// an identical frozen header derives the same hash and rides the same
+	// cache bucket even though the session id changed. It is preferred over
+	// the raw session id so a restart never cold-writes a fresh bucket.
 	if req.CacheRetention != provider.CacheRetentionNone && req.SessionID != "" {
+		affinity := req.EpochHash
+		if affinity == "" {
+			affinity = req.SessionID
+		}
 		switch {
 		case c.ID == "openrouter" || strings.Contains(c.BaseURL, "openrouter.ai"):
-			extraHeaders.Set("x-session-id", req.SessionID)
+			extraHeaders.Set("x-session-id", affinity)
 		case c.ID == "openai" || strings.Contains(c.BaseURL, "api.openai.com") ||
 			c.ID == "opencode-zen" || c.ID == "opencode-go" ||
 			strings.Contains(c.BaseURL, "opencode.ai"):
-			extraHeaders.Set("session_id", req.SessionID)
-			extraHeaders.Set("x-client-request-id", req.SessionID)
-			extraHeaders.Set("x-session-affinity", req.SessionID)
+			extraHeaders.Set("session_id", affinity)
+			extraHeaders.Set("x-client-request-id", affinity)
+			extraHeaders.Set("x-session-affinity", affinity)
 		}
 	}
 

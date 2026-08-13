@@ -2,6 +2,9 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -13,6 +16,7 @@ import (
 	"rick/internal/agent"
 	"rick/internal/config"
 	"rick/internal/goal"
+
 	"rick/internal/plugin"
 	"rick/internal/provider"
 	"rick/internal/session"
@@ -408,6 +412,7 @@ func (m *Model) cmdNew() (tea.Model, tea.Cmd) {
 	m.compactionRunID++
 	m.compactionActive = false
 	m.autoCompactPending = false
+	m.compactQueued = false
 	m.lastAutoCompact = time.Time{}
 	m.agentCh = nil
 	m.agentCancel = nil
@@ -441,6 +446,7 @@ func (m *Model) doResume(id string) {
 	m.compactionRunID++
 	m.compactionActive = false
 	m.autoCompactPending = false
+	m.compactQueued = false
 	m.lastAutoCompact = time.Time{}
 	m.compactIneffectiveStrikes = 0
 	m.resetSwarmRuntime()
@@ -465,6 +471,10 @@ func (m *Model) doResume(id string) {
 	m.resetStats()
 	m.restoreRunError(sess)
 	m.usage = sess.Usage
+	// Restore the durable whole-log projection so resumed turns keep
+	// accumulating the cumulative totals (a resumed session's /stats and
+	// analyzer rows include the pre-resume history).
+	m.billed = sess.TotalUsage
 	m.optimization = sess.Optimization
 	if sess.Model != "" {
 		m.modelID = sess.Model
@@ -595,13 +605,27 @@ func (m *Model) saveSession() error {
 	m.sess.Agent = m.agentName
 	m.sess.RunError = m.lastRunError
 	m.sess.Usage = m.usage
+	// Durable whole-log projection: cumulative totals (m.billed) survive
+	// compaction and resume, so /stats and the analyzer see the true
+	// whole-session cache hit rate instead of the latest request's occupancy.
+	m.sess.TotalUsage = m.billed
 	m.sess.Optimization = m.optimization
+	// Durable request-header epoch: freeze the exact model/system/tools this
+	// session routes with so a resume can prove the provider prefix is
+	// byte-identical (or detect drift) instead of recomputing silently.
+	if m.sessionEpoch.Model != "" && m.sessionEpoch.Hash != "" {
+		m.sess.Epoch = m.sessionEpoch
+	}
 	if m.deps.Snapshots != nil && m.deps.Snapshots.Enabled() {
 		m.sess.Snapshots = m.deps.Snapshots.History()
 	}
 	if m.sess.Title == "" {
 		m.sess.Title = session.Title(m.sess.Messages)
 	}
+	// Cross-session cache reuse: derive the deterministic goal-state snapshot
+	// from this session's transcript and pin it for the next session on the
+	// same (project, model, agent) route. Best-effort.
+	m.persistCrossSessionSnapshot()
 	if err := m.deps.Store.Save(m.sess); err != nil {
 		return err
 	}
@@ -711,12 +735,20 @@ func (m *Model) cancelCompaction() {
 
 func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	if m.running {
-		m.setStatus("cannot compact while working")
+		// Queue-safe compaction (harness-style): a /compact during an active
+		// turn is not rejected and lost — it is queued and runs the moment
+		// the turn finishes, so the user's intent survives the busy window
+		// and the compact never races the live stream.
+		m.compactQueued = true
+		m.setStatus("compact queued — runs when the current turn finishes")
 		return m, nil
 	}
 	if m.compactionActive {
 		m.setStatus("compaction already in progress")
 		return m, nil
+	}
+	if m.compactQueued {
+		m.compactQueued = false
 	}
 	if len(m.history) < 4 {
 		m.setStatus("nothing to compact")
@@ -740,6 +772,14 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 	if len(m.history) <= keep {
 		return m, nil
 	}
+	// Surface-stability snapshot (harness-style SurfaceChangedError): the
+	// compaction input and its replacement span are captured synchronously
+	// here. If the conversation grows while the summarizer runs, the span
+	// this summary was built from is no longer the one it would replace —
+	// committing against a stale span rewrites the provider prefix at the
+	// wrong position. The done handler re-checks this snapshot against the
+	// live history and rejects the compact if they differ.
+	stableSnapshot := compactSurfaceSnapshot(m.history)
 	head := append([]provider.Message(nil), m.history[:len(m.history)-keep]...)
 	tail := append([]provider.Message(nil), m.history[len(m.history)-keep:]...)
 	// Bound + redact the compaction input: the summary persists and re-enters
@@ -776,12 +816,12 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 			var ok bool
 			select {
 			case <-ctx.Done():
-				return compactDoneMsg{runID: runID, err: ctx.Err(), modelID: modelID, usage: usage}
+				return compactDoneMsg{runID: runID, err: ctx.Err(), modelID: modelID, usage: usage, snapshot: stableSnapshot}
 			case ev, ok = <-ch:
 				if !ok {
 					return compactDoneMsg{
 						runID: runID, err: fmt.Errorf("compaction provider stream ended without a completion event"),
-						modelID: modelID, usage: usage,
+						modelID: modelID, usage: usage, snapshot: stableSnapshot,
 					}
 				}
 			}
@@ -796,12 +836,63 @@ func (m *Model) cmdCompact() (tea.Model, tea.Cmd) {
 				if ev.Err == nil {
 					ev.Err = fmt.Errorf("compaction provider returned an unspecified error")
 				}
-				return compactDoneMsg{runID: runID, err: ev.Err, modelID: modelID, usage: usage}
+				return compactDoneMsg{runID: runID, err: ev.Err, modelID: modelID, usage: usage, snapshot: stableSnapshot}
 			case provider.EventDone:
-				return compactDoneMsg{runID: runID, summary: sb.String(), tail: tail, modelID: modelID, usage: usage}
+				return compactDoneMsg{runID: runID, summary: sb.String(), tail: tail, modelID: modelID, usage: usage, snapshot: stableSnapshot}
 			}
 		}
 	}
+}
+
+// compactSurfaceSnapshot captures the byte identity of the conversation head
+// that a compaction will replace: the serialized hash of the oldest
+// (len-keep) messages at snapshot time, stored as "spanLen:hex" so the done
+// handler re-hashes the SAME fixed leading span of the live history —
+// append-only growth (new messages at the tail) keeps the span stable, while
+// a mid-history rewrite mismatches and rejects the compact (harness-style
+// SurfaceChangedError).
+func compactSurfaceSnapshot(history []provider.Message) string {
+	const keep = 4
+	if len(history) <= keep {
+		return ""
+	}
+	spanLen := len(history) - keep
+	sum := sha256.New()
+	for _, m := range history[:spanLen] {
+		raw, err := json.Marshal(m)
+		if err != nil {
+			raw = []byte(m.Text())
+		}
+		sum.Write(raw)
+	}
+	return strconv.Itoa(spanLen) + ":" + hex.EncodeToString(sum.Sum(nil))
+}
+
+// compactSurfaceStable reports whether the conversation head a compaction was
+// built from is still the live head: the live history's leading span of the
+// CAPTURED length hashes to the snapshot. A mismatch rejects the compact —
+// the span the summary would replace moved while the summarizer ran.
+func compactSurfaceStable(snapshot string, history []provider.Message) bool {
+	if snapshot == "" {
+		return true // no snapshot taken (tiny history); nothing to verify
+	}
+	colon := strings.IndexByte(snapshot, ':')
+	if colon <= 0 {
+		return false
+	}
+	spanLen, err := strconv.Atoi(snapshot[:colon])
+	if err != nil || spanLen <= 0 || spanLen > len(history) {
+		return false
+	}
+	sum := sha256.New()
+	for _, m := range history[:spanLen] {
+		raw, err := json.Marshal(m)
+		if err != nil {
+			raw = []byte(m.Text())
+		}
+		sum.Write(raw)
+	}
+	return hex.EncodeToString(sum.Sum(nil)) == snapshot[colon+1:]
 }
 
 type compactDoneMsg struct {
@@ -810,7 +901,12 @@ type compactDoneMsg struct {
 	tail    []provider.Message
 	modelID string
 	usage   provider.Usage
-	err     error
+	// snapshot is the surface-stability fingerprint of the compaction
+	// input's head, captured when the compact started. The handler rejects
+	// the commit when the live history no longer matches (the conversation
+	// grew while the summarizer ran).
+	snapshot string
+	err      error
 }
 
 // ---------- goal commands ----------

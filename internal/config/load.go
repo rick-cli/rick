@@ -209,6 +209,18 @@ func loadUncached(cwd string) (*Loaded, error) {
 	if err := ValidateCacheRetention(cfg.CacheRetention); err != nil {
 		return nil, err
 	}
+	// Cross-session memory is on by default: the snapshot is deterministic
+	// and LLM-free, so the only cost is a fixed small leading prefix.
+	if cfg.CrossSessionMemory == nil {
+		yes := true
+		cfg.CrossSessionMemory = &yes
+	}
+	// Validate per-route cache strategies' retention values.
+	for route, strategy := range cfg.CacheStrategies {
+		if err := ValidateCacheRetention(strategy.Retention); err != nil {
+			return nil, fmt.Errorf("cache_strategies[%q]: %w", route, err)
+		}
+	}
 	if cfg.MaxBackground <= 0 {
 		cfg.MaxBackground = 8
 	}
@@ -312,6 +324,12 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 	if has(p, "cache_warm") {
 		dst.WarmCache = src.WarmCache
 	}
+	if has(p, "cache_warm_turn") {
+		dst.CacheWarmTurn = src.CacheWarmTurn
+	}
+	if has(p, "cache_passback_reasoning") {
+		dst.CachePassbackReasoning = src.CachePassbackReasoning
+	}
 	if has(p, "cache_max_reasoning_turns") {
 		dst.CacheMaxReasoningTurns = src.CacheMaxReasoningTurns
 	}
@@ -371,6 +389,12 @@ func mergeConfig(dst *Config, src Config, p map[string]json.RawMessage) {
 			}
 			if v.WarmCache != nil {
 				cur.WarmCache = v.WarmCache
+			}
+			if v.WarmTurn != nil {
+				cur.WarmTurn = v.WarmTurn
+			}
+			if v.PassbackReasoning != nil {
+				cur.PassbackReasoning = v.PassbackReasoning
 			}
 			dst.Providers[k] = cur
 		}

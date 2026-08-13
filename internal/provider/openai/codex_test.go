@@ -322,3 +322,55 @@ func TestCodexStreamDoesNotDuplicateText(t *testing.T) {
 		t.Fatalf("streamed text = %q, want %q (the full item text was re-emitted)", got, "one two")
 	}
 }
+
+// TestGenerateImageStreamsImageResult verifies the image_generation_call
+// result is parsed from the Responses-API SSE stream and returned as base64.
+func TestGenerateImageStreamsImageResult(t *testing.T) {
+	var mu sync.Mutex
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotBody = map[string]any{}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(`data: {"type":"response.output_item.done","item":{"type":"image_generation_call","result":"data:image/png;base64,aGVsbG8="}}` + "\n\n"))
+		w.Write([]byte(`data: {"type":"response.completed","response":{"id":"r1"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	c := codexTestClient(t, server)
+	results, err := c.GenerateImage(context.Background(), CodexImageRequest{Prompt: "a cat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].Base64 != "aGVsbG8=" {
+		t.Errorf("base64 = %q, want aGVsbG8= (data URI prefix stripped)", results[0].Base64)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotBody["model"] != codexImageModel {
+		t.Errorf("model = %v, want %s", gotBody["model"], codexImageModel)
+	}
+	tools, _ := gotBody["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one image_generation tool", gotBody["tools"])
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "image_generation" || tool["model"] != "gpt-image-2" {
+		t.Errorf("tool = %#v, want image_generation/gpt-image-2", tool)
+	}
+}
+
+// TestGenerateImageRequiresCodex ensures the tool errors clearly when the
+// client is not the Codex backend.
+func TestGenerateImageRequiresCodex(t *testing.T) {
+	c := New("openai", "sk-x", "")
+	if _, err := c.GenerateImage(context.Background(), CodexImageRequest{Prompt: "x"}); err == nil {
+		t.Fatal("expected an error for a non-codex client")
+	}
+}

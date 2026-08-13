@@ -239,6 +239,22 @@ func (b *Budget) StoredPayload(hash string) (string, bool) {
 	return payload, ok
 }
 
+// StorePayload persists one payload under its content address so the model
+// can retrieve it later via retrieve_uncompressed_context. It is the spill
+// path: oversized tool output is stored here (bounded by MaxCABPayloads) and
+// the model sees a preview instead. Returns the content-address key. No-op
+// when the budget is disabled.
+func (b *Budget) StorePayload(payload string) string {
+	if b == nil || !b.opts.Enabled || payload == "" {
+		return ""
+	}
+	hash := Hash(payload)
+	b.mu.Lock()
+	b.storeCABLocked(hash, payload)
+	b.mu.Unlock()
+	return hash
+}
+
 // DedupResult reports what ApplyDedup changed.
 type DedupResult struct {
 	View       []provider.Message
@@ -289,6 +305,24 @@ type PruneResult struct {
 	SavedBytes int
 	Summarized int
 	Committed  bool
+	// Originals is the durable per-node shadow-price ledger of every
+	// replaced tool result: the content address of the original payload,
+	// its size, and the size of the summary that replaced it. A consumer
+	// (session save, telemetry) persists this so a pruned tool result stays
+	// replay-safe — the original bytes are recoverable from the
+	// content-addressed store and the reclaim is auditable per node,
+	// exactly like the harness's compaction/prune shadow-price event.
+	Originals []PruneOriginal
+}
+
+// PruneOriginal is one durable prune record: the content address of the
+// original tool-result payload, its size, and the provider-facing size of
+// the summary that replaced it.
+type PruneOriginal struct {
+	ToolUseID   string `json:"tool_use_id,omitempty"`
+	ContentHash string `json:"content_hash,omitempty"`
+	OriginalLen int    `json:"original_len,omitempty"`
+	SummaryLen  int    `json:"summary_len,omitempty"`
 }
 
 // PruneOldToolResults deterministically shrinks old, bulky tool results in
@@ -377,9 +411,21 @@ func (b *Budget) PruneOldToolResults(messages []provider.Message) PruneResult {
 				if len(summary) >= len(block.Content) {
 					continue
 				}
-				b.storeCABLocked(Hash(block.Content), block.Content)
+				hash := Hash(block.Content)
+				b.storeCABLocked(hash, block.Content)
 				saved += len(block.Content) - len(summary)
 				summarized++
+				// Durable per-node shadow-price ledger (harness-style
+				// compaction/prune event): the original's content address,
+				// its size, and the summary's size ride the result so the
+				// consumer can persist the reclaim and keep the original
+				// replayable from the content-addressed store.
+				result.Originals = append(result.Originals, PruneOriginal{
+					ToolUseID:   block.ToolUseID,
+					ContentHash: hash,
+					OriginalLen: len(block.Content),
+					SummaryLen:  len(summary),
+				})
 				block.Content = summary
 				b.mu.Lock()
 				b.summarizedIDs[block.ToolUseID] = true

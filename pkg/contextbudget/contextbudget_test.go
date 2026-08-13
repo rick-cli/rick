@@ -461,3 +461,81 @@ func TestSummarizeToolResultDeterministic(t *testing.T) {
 		t.Fatalf("summary missing leading hint: %q", a)
 	}
 }
+
+// TestStorePayloadSpillRoundTrip verifies the spill path: a payload stored
+// under its content address is retrievable via StoredPayload, and the store
+// is bounded by MaxCABPayloads.
+func TestStorePayloadSpillRoundTrip(t *testing.T) {
+	store := New(Options{Enabled: true, MaxCABPayloads: 2})
+	payload := repeatString("spill-me-", 5000) // > 40 KiB, spill-worthy
+	key := store.StorePayload(payload)
+	if key == "" {
+		t.Fatal("StorePayload returned empty key")
+	}
+	got, ok := store.StoredPayload(key)
+	if !ok {
+		t.Fatalf("payload %q not found", key)
+	}
+	if got != payload {
+		t.Fatal("stored payload does not round-trip")
+	}
+	// Bound: a third store evicts the oldest.
+	store.StorePayload(repeatString("b-", 100))
+	store.StorePayload(repeatString("c-", 100))
+	if _, ok := store.StoredPayload(key); ok {
+		t.Fatal("oldest spilled payload should have been evicted by the bound")
+	}
+}
+
+func repeatString(s string, n int) string {
+	out := make([]byte, 0, len(s)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, s...)
+	}
+	return string(out)
+}
+
+// TestPruneOriginalsLedgerPinsReplaySafety pins the durable per-node
+// shadow-price ledger: a committed prune reports the content address and
+// sizes of every replaced tool result, and the original payload is
+// recoverable from the content-addressed store under that hash.
+func TestPruneOriginalsLedgerPinsReplaySafety(t *testing.T) {
+	b := New(Options{
+		Enabled:            true,
+		PruneMinResultBytes: 40,
+		PruneMinReclaimBytes: 30,
+		PruneLiveZoneTurns:  1,
+		MaxCABPayloads:      32,
+	})
+	// One old bulky tool result beyond the live zone.
+	messages := []provider.Message{
+		toolUse("call-1"),
+		toolResult("call-1", strings.Repeat("bulky output ", 20)),
+		toolUse("call-2"),
+		toolResult("call-2", "fresh"),
+		provider.UserText("recent"),
+	}
+	result := b.PruneOldToolResults(messages)
+	if !result.Committed {
+		t.Fatal("prune did not commit")
+	}
+	if len(result.Originals) == 0 {
+		t.Fatal("prune result carries no shadow-price ledger")
+	}
+	original := result.Originals[0]
+	if original.ContentHash == "" || original.ToolUseID != "call-1" {
+		t.Fatalf("ledger entry = %+v, want call-1 with a content hash", original)
+	}
+	if original.OriginalLen <= original.SummaryLen {
+		t.Fatalf("ledger reclaim = %d -> %d, want a real reduction", original.OriginalLen, original.SummaryLen)
+	}
+	// Replay safety: the original payload is retrievable from the
+	// content-addressed store under the ledger's hash.
+	payload, ok := b.StoredPayload(original.ContentHash)
+	if !ok {
+		t.Fatal("pruned original not stored under its content address")
+	}
+	if !strings.Contains(payload, "bulky output") {
+		t.Fatalf("stored payload does not contain the original bytes: %q", payload)
+	}
+}
